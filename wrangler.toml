@@ -1,0 +1,17 @@
+name = "edge-pp"
+main = "_worker.js"
+compatibility_date = "2024-02-08"
+
+# For local development only - in production, bindings are set by deployer
+# [vars]
+# ADMIN = "your-admin-password"
+
+# Uncomment for local dev with wrangler:
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "your-kv-namespace-id"
+
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "edge-pp-db"
+# database_id = "your-d1-database-id"
