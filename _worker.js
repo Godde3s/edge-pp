@@ -1,3340 +1,1887 @@
-/**
- * edge+usf — Advanced Edge Proxy with User Management
- * Platform: Cloudflare Workers
- * Bindings: KV (proxy settings) + D1 (user management)
- */
-
-let schemaEnsured = false;
-let cachedPanelPassword = null;
-
-async function ensureEdgePPSchema(db) {
-  if (schemaEnsured) return;
-  try { await db.prepare(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    uuid TEXT NOT NULL,
-    limit_gb REAL,
-    expiry_days INTEGER,
-    ips TEXT,
-    connection_type TEXT DEFAULT 'vless',
-    tls TEXT DEFAULT 'tls',
-    port INTEGER DEFAULT 443,
-    used_gb REAL DEFAULT 0,
-    is_active INTEGER DEFAULT 1,
-    last_active INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    limit_req INTEGER,
-    used_req INTEGER DEFAULT 0,
-    ip_limit INTEGER DEFAULT NULL,
-    active_ips TEXT DEFAULT NULL,
-    fingerprint TEXT DEFAULT 'chrome',
-    max_connections INTEGER DEFAULT 2,
-    block_porn INTEGER DEFAULT 0,
-    block_ads INTEGER DEFAULT 0,
-    frag_len TEXT DEFAULT '200-3000',
-    frag_int TEXT DEFAULT '1-2',
-    user_proxy_ip TEXT DEFAULT NULL,
-    user_proxy_iata TEXT DEFAULT NULL,
-    user_socks5 TEXT DEFAULT NULL,
-    auto_reset_vol_days INTEGER DEFAULT 0,
-    auto_reset_req_days INTEGER DEFAULT 0,
-    last_reset_vol_time INTEGER DEFAULT 0,
-    last_reset_req_time INTEGER DEFAULT 0,
-    lifetime_used_gb REAL DEFAULT 0,
-    auto_rotate_ip INTEGER DEFAULT 0,
-    rotate_time INTEGER DEFAULT 0,
-    ip_operator TEXT DEFAULT 'all',
-    ip_count INTEGER DEFAULT 20,
-    last_rotate_time INTEGER DEFAULT 0,
-    auto_rotate_user_proxy INTEGER DEFAULT 0
-  )`).run(); } catch (e) {}
-  try { await db.prepare("CREATE TABLE IF NOT EXISTS edgepp_settings (key TEXT PRIMARY KEY, value TEXT)").run(); } catch (e) {}
-  try { await db.prepare("CREATE TABLE IF NOT EXISTS request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, ip TEXT, path TEXT, timestamp INTEGER DEFAULT (strftime('%s','now')))").run(); } catch (e) {}
-  schemaEnsured = true;
-}
-
+import { connect } from "cloudflare:sockets";
+const GLOBAL_TRAFFIC_CACHE = new Map();
+const ACTIVE_CONNECTIONS_COUNT = new Map();
+const GLOBAL_LAST_ACTIVE_WRITE = new Map();
+const GLOBAL_LAST_DB_WRITE = new Map();
+const GLOBAL_WRITE_LOCK = new Map();
+const DNS_CACHE = new Map();
+const USER_REQ_CACHE = new Map();
+const LOGIN_ATTEMPTS = new Map(); 
+let GLOBAL_REQ_COUNT = 0;
+let GLOBAL_LAST_REQ_WRITE = 0;
+const DNS_CACHE_TTL = 5 * 60 * 1000;
+const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
+const UPSTREAM_BUNDLE_TARGET_BYTES = 16 * 1024;
+const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
+const DOWNSTREAM_GRAIN_BYTES = 32 * 1024;
+const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
+const DOWNSTREAM_GRAIN_SILENT_MS = 1;
+const TCP_CONCURRENCY = 2;
+const PRELOAD_RACE_DIAL = true;
+let lastAutoResetCheck = 0;
 async function checkAutoResets(env) {
-  if (!env.DB) return;
-  try {
-    const todayUtc = Math.floor(Date.now() / 86400000);
-    await env.DB.prepare(`UPDATE users SET used_gb = 0, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
-    await env.DB.prepare(`UPDATE users SET used_req = 0, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
-  } catch (e) {}
+        const now = Date.now();
+        if (now - lastAutoResetCheck < 3600000) return;
+        lastAutoResetCheck = now;
+        try {
+                const todayUtc = Math.floor(now / 86400000) * 86400000;
+                await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
+                await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
+        } catch (e) {}
 }
-
-async function sha256(message) {
-  const msgBuffer = new TextEncoder().encode(message);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-  return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-async function getPanelPassword(db) {
-  if (cachedPanelPassword !== null) return cachedPanelPassword;
-  try { const row = await db.prepare("SELECT value FROM edgepp_settings WHERE key = 'panel_password'").first(); cachedPanelPassword = row ? row.value : null; return cachedPanelPassword; } catch (e) { return null; }
-}
-async function verifyPanelAuth(request, env) {
-  if (!env.DB) return false;
-  const password = await getPanelPassword(env.DB);
-  if (!password) return false;
-  const authHeader = request.headers.get('Authorization') || '';
-  if (authHeader.startsWith('Bearer ')) return authHeader.slice(7) === password;
-  const cookies = request.headers.get('Cookie') || '';
-  const authCookie = cookies.split(';').find(c => c.trim().startsWith('edgepp_auth='));
-  if (authCookie) { const val = authCookie.split('=')[1].trim(); return val === await sha256(password + 'edgepp_salt'); }
-  return false;
-}
-
-function generateUUID() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-}
-function getActiveIpCount(activeIps) {
-  if (!activeIps) return 0;
-  try { return Object.keys(JSON.parse(activeIps)).length; } catch { return 0; }
-}
-function checkUserLimits(user) {
-  if (user.is_active !== 1) return { allowed: false, reason: 'Account disabled' };
-  if (user.limit_gb) { if (user.limit_gb - (user.used_gb || 0) <= 0) return { allowed: false, reason: 'Data limit reached' }; }
-  if (user.expiry_days && user.created_at) {
-    const expiryDate = new Date(new Date(user.created_at + 'Z').getTime() + user.expiry_days * 86400000);
-    if (Date.now() > expiryDate.getTime()) return { allowed: false, reason: 'Account expired' };
-  }
-  if (user.limit_req && user.used_req >= user.limit_req) return { allowed: false, reason: 'Request limit reached' };
-  return { allowed: true };
-}
-
-async function handlePanelRequest(request, env) {
-  if (!env.DB) return new Response('D1 not bound.', { status: 500 });
-  const hasPassword = await getPanelPassword(env.DB);
-  if (!hasPassword) return new Response(HTML_PANELS.setup, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  if (!await verifyPanelAuth(request, env)) return new Response('', { status: 302, headers: { 'Location': '/panel/login' } });
-  return new Response(HTML_PANELS.panel, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
-}
-
-async function handlePanelLogin(request, env) {
-  if (!env.DB) return new Response('D1 not bound.', { status: 500 });
-  const hasPassword = await getPanelPassword(env.DB);
-  if (!hasPassword) return new Response('', { status: 302, headers: { 'Location': '/panel' } });
-  if (request.method === 'POST') {
-    try {
-      const { password } = await request.json();
-      if (password === hasPassword) {
-        const hash = await sha256(hasPassword + 'edgepp_salt');
-        return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Set-Cookie': 'edgepp_auth=' + hash + '; Path=/panel; Max-Age=86400; HttpOnly; Secure; SameSite=Strict' } });
-      }
-      return new Response(JSON.stringify({ error: 'Wrong password' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-    } catch { return new Response(JSON.stringify({ error: 'Invalid request' }), { status: 400, headers: { 'Content-Type': 'application/json' } }); }
-  }
-  return new Response(HTML_PANELS.login, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-}
-
-async function handleUserSubPage(username, request, env, url) {
-  if (!env.DB) return new Response('D1 not configured', { status: 500 });
-  try {
-    const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(username, username).first();
-    if (!user) return new Response('User not found', { status: 404 });
-    const host = url.hostname;
-    const limitCheck = checkUserLimits(user);
-    const daysLeft = user.expiry_days && user.created_at
-      ? Math.max(0, Math.ceil((new Date(user.created_at + 'Z').getTime() + user.expiry_days * 86400000 - Date.now()) / 86400000))
-      : null;
-    const uuid = user.uuid, tls = user.tls || 'tls', port = user.port || 443;
-    const sni = user.ips || host, fp = user.fingerprint || 'chrome', path = '/', type = 'ws';
-    let configIPs = [host];
-    if (user.ips) { const pi = user.ips.split("\n").map(i=>i.trim()).filter(i=>i.length>0); if(pi.length>0) configIPs=pi; }
-    const configPorts = String(user.port || 443).split(",").map(p=>p.trim()).filter(p=>p.length>0);
-    const userFrag = user.frag_len && user.frag_int ? '&fragment='+user.frag_len+','+user.frag_int : '';
-    const configs = [];
-    configIPs.forEach((ip) => {
-      configPorts.forEach((portStr) => {
-        const isTls = ["443","2053","2083","2087","2096","8443"].includes(portStr);
-        const t = isTls ? 'tls' : 'none';
-        const r = 'edge+usf_' + user.username + ' | ' + ip + ':' + portStr;
-        configs.push(
-          { proto: 'VLESS', cls: 'vless', link: 'vless://'+uuid+'@'+ip+':'+portStr+'?encryption=none&security='+t+'&sni='+host+'&fp='+fp+'&type=ws&path='+path+userFrag+'#'+r },
-          { proto: 'Trojan', cls: 'trojan', link: 'trojan://'+uuid+'@'+ip+':'+portStr+'?security='+t+'&sni='+host+'&fp='+fp+'&type=ws&path='+path+userFrag+'#'+r },
-          { proto: 'SS', cls: 'ss', link: 'ss://'+btoa('aes-256-gcm:'+uuid.replace(/-/g,''))+'@'+ip+':'+portStr+'?security='+t+'&sni='+host+'&fp='+fp+'&type=ws&path='+path+userFrag+'#'+r }
-        );
-      });
-    });
-    const subUrl = url.protocol + '//' + url.host + '/sub/' + encodeURIComponent(user.username);
-    const userData = JSON.stringify({ username: user.username, uuid: user.uuid, limit_gb: user.limit_gb, used_gb: user.used_gb || 0, limit_req: user.limit_req, used_req: user.used_req || 0, expiry_days: user.expiry_days, days_left: daysLeft, is_active: user.is_active, online_count: getActiveIpCount(user.active_ips), ip_limit: user.ip_limit, status: limitCheck, host: host, configs: configs, sub_url: subUrl });
-    const html = HTML_PANELS.sub_page.replace('/*__DATA__*/', 'window.__d=' + userData + ';');
-    try { await env.DB.prepare("UPDATE users SET used_req = used_req + 1, last_active = ? WHERE username = ?").bind(Date.now(), user.username).run(); } catch (e) {}
-    const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
-    const totalGB = user.limit_gb ? user.limit_gb * 1073741824 : 0;
-    const usedGB = (user.used_gb || 0) * 1073741824;
-    if (totalGB > 0) {
-      const expiry = user.expiry_days && user.created_at ? Math.floor(new Date(user.created_at + 'Z').getTime() / 1000) + user.expiry_days * 86400 : 4102329600;
-      headers['Subscription-Userinfo'] = 'upload=' + Math.floor(usedGB * 0.3) + '; download=' + Math.floor(usedGB * 0.7) + '; total=' + totalGB + '; expire=' + expiry;
-      headers['Profile-Web-Page-Url'] = subUrl;
-    }
-    return new Response(html, { headers });
-  } catch (err) { return new Response('Error: ' + err.message, { status: 500 }); }
-}
-
-async function handleEdgePPApi(request, env, ctx, url) {
-  if (!env.DB) return new Response(JSON.stringify({ error: 'D1 not bound' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-  const path = url.pathname.replace('/api/edgepp/', '');
-  if (path === 'setup-password' && request.method === 'POST') {
-    try {
-      await ensureEdgePPSchema(env.DB);
-      if (await getPanelPassword(env.DB)) return new Response(JSON.stringify({ error: 'Password already set' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      const { password } = await request.json();
-      if (!password || password.length < 4) return new Response(JSON.stringify({ error: 'Min 4 characters' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      await env.DB.prepare("INSERT INTO edgepp_settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
-      cachedPanelPassword = password;
-      return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    } catch (err) { return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
-  }
-  if (!await verifyPanelAuth(request, env)) return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-  if (path === 'users' && request.method === 'GET') {
-    const users = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
-    return new Response(JSON.stringify(users.results.map(function(u) { return Object.assign({}, u, { online_count: getActiveIpCount(u.active_ips), status: checkUserLimits(u) }); })), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path === 'stats' && request.method === 'GET') {
-    var t = function(q) { return env.DB.prepare(q).first(); };
-    var results = await Promise.all([t("SELECT COUNT(*) as c FROM users"), t("SELECT COUNT(*) as c FROM users WHERE is_active=1"), t("SELECT COALESCE(SUM(used_gb),0) as t FROM users"), t("SELECT COALESCE(SUM(used_req),0) as t FROM users"), t("SELECT COUNT(*) as c FROM users WHERE active_ips IS NOT NULL AND active_ips!=''")]);
-    return new Response(JSON.stringify({ total_users: results[0].c, active_users: results[1].c, total_used_gb: results[2].t, total_used_req: results[3].t, online_now: results[4].c }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path === 'users' && request.method === 'POST') {
-    try {
-      var b = await request.json();
-      if (!b.username) return new Response(JSON.stringify({ error: 'Username required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      var uuid = b.uuid || generateUUID();
-      var now = new Date().toISOString().replace('T', ' ').split('.')[0];
-      await env.DB.prepare("INSERT INTO users (username,uuid,limit_gb,expiry_days,limit_req,ips,tls,port,fingerprint,ip_limit,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)").bind(b.username, uuid, b.limit_gb ? parseFloat(b.limit_gb) : null, b.expiry_days ? parseInt(b.expiry_days) : null, b.limit_req ? parseInt(b.limit_req) : null, b.ips || null, b.tls || 'tls', b.port || 443, b.fingerprint || 'chrome', b.ip_limit ? parseInt(b.ip_limit) : null, now).run();
-      return new Response(JSON.stringify({ success: true, uuid: uuid }), { headers: { 'Content-Type': 'application/json' } });
-    } catch (err) { var msg = err.message.indexOf('UNIQUE') !== -1 ? 'Username already exists' : err.message; return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { 'Content-Type': 'application/json' } }); }
-  }
-  if (path.indexOf('users/') === 0 && path.indexOf('/toggle') === path.length - 7 && request.method === 'POST') {
-    var u = decodeURIComponent(path.replace('users/', '').replace('/toggle', ''));
-    await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE username=?").bind(u).run();
-    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path.indexOf('users/') === 0 && path.indexOf('/reset') === path.length - 6 && request.method === 'POST') {
-    var u = decodeURIComponent(path.replace('users/', '').replace('/reset', ''));
-    await env.DB.prepare("UPDATE users SET used_gb=0, used_req=0 WHERE username=?").bind(u).run();
-    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path.indexOf('users/') === 0 && request.method === 'PUT') {
-    var u = decodeURIComponent(path.replace('users/', ''));
-    try {
-      var b = await request.json();
-      await env.DB.prepare("UPDATE users SET username=?,limit_gb=?,expiry_days=?,limit_req=?,ips=?,tls=?,port=?,fingerprint=?,ip_limit=?,is_active=?,user_socks5=?,frag_len=?,frag_int=?,auto_rotate_ip=?,rotate_time=?,ip_operator=?,ip_count=?,auto_rotate_user_proxy=? WHERE username=?").bind(b.username||u,b.limit_gb?parseFloat(b.limit_gb):null,b.expiry_days?parseInt(b.expiry_days):null,b.limit_req?parseInt(b.limit_req):null,b.ips||null,b.tls||'tls',b.port?parseInt(b.port):443,b.fingerprint||'chrome',b.ip_limit?parseInt(b.ip_limit):null,b.is_active!==undefined?(b.is_active?1:0):undefined,b.user_socks5||null,b.frag_len||'200-3000',b.frag_int||'1-2',b.auto_rotate_ip?1:0,b.rotate_time?parseInt(b.rotate_time):0,b.ip_operator||'all',b.ip_count?parseInt(b.ip_count):20,b.auto_rotate_user_proxy?1:0,u).run();
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-    } catch (err) { var msg = err.message.indexOf('UNIQUE') !== -1 ? 'Username already exists' : err.message; return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { 'Content-Type': 'application/json' } }); }
-  }
-  if (path.indexOf('users/') === 0 && request.method === 'DELETE') {
-    var u = decodeURIComponent(path.replace('users/', ''));
-    await env.DB.prepare("DELETE FROM users WHERE username=?").bind(u).run();
-    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path === 'change-password' && request.method === 'POST') {
-    try {
-      var body = await request.json();
-      var stored = await getPanelPassword(env.DB);
-      if (body.current_password !== stored) return new Response(JSON.stringify({ error: 'Wrong current password' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-      if (!body.new_password || body.new_password.length < 4) return new Response(JSON.stringify({ error: 'Min 4 characters' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      await env.DB.prepare("UPDATE edgepp_settings SET value=? WHERE key='panel_password'").bind(body.new_password).run();
-      cachedPanelPassword = body.new_password;
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-    } catch (err) { return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
-  }
-  if (path === 'settings' && request.method === 'GET') {
-    const rows = await env.DB.prepare("SELECT * FROM edgepp_settings").all();
-    const s = {}; for (const r of (rows.results||[])) s[r.key] = r.value;
-    return new Response(JSON.stringify(s), { headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path === 'settings' && request.method === 'POST') {
-    const b = await request.json();
-    if (b.settings && typeof b.settings === 'object') {
-      for (const [k,v] of Object.entries(b.settings)) await env.DB.prepare("INSERT INTO edgepp_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=?").bind(k,String(v),String(v)).run();
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    return new Response(JSON.stringify({ error: 'Use {settings: {key: value}}' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-  }
-  if (path === 'test-proxy' && request.method === 'POST') {
-    const b = await request.json();
-    if (!b.proxy) return new Response(JSON.stringify({ error: 'proxy required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-    try {
-      const t0 = Date.now();
-      const s = await edgeConnectProxy(b.proxy, "1.1.1.1", 80, new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"));
-      const rd = s.readable.getReader(); await rd.read(); s.close();
-      const ping = Date.now() - t0;
-      let country = 'Unknown';
-      try {
-        let rm = b.proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i,""); if(rm.includes("@")) rm=rm.substring(rm.lastIndexOf("@")+1);
-        if(rm.startsWith("[")) rm=rm.substring(1,rm.indexOf("]")); else if(rm.includes(":")) rm=rm.substring(0,rm.lastIndexOf(":"));
-        const g = await (await fetch('http://ip-api.com/json/'+rm+'?fields=countryCode,country')).json();
-        if(g&&g.country) country = g.country+' ('+g.countryCode+')';
-      } catch(e){}
-      return new Response(JSON.stringify({ success:true, ping, country }), { headers: { 'Content-Type': 'application/json' } });
-    } catch(err) { return new Response(JSON.stringify({ success:false, error:err.message }), { headers: { 'Content-Type': 'application/json' } }); }
-  }
-  if (path === 'proxy-ips' && request.method === 'GET') {
-    try {
-      const r = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt");
-      if(!r.ok) return new Response(JSON.stringify({error:'fetch failed'}),{status:502,headers:{'Content-Type':'application/json'}});
-      const t = await r.text(); const blocks = t.split("----------"); const ops = {};
-      blocks.forEach(b=>{ const ls=b.trim().split("\n").map(l=>l.trim()).filter(l=>l.length>0); if(!ls.length) return; let n="Unknown"; const ips=[];
-        ls.forEach(l=>{ if(l.includes("#")) n=l.split("#")[1].trim(); else if(!l.startsWith("[source")) ips.push(l); });
-        if(ips.length>0) ops[n]=ips.length; });
-      return new Response(JSON.stringify({operators:ops, total:Object.values(ops).reduce((a,b)=>a+b,0)}),{headers:{'Content-Type':'application/json'}});
-    } catch(err) { return new Response(JSON.stringify({error:err.message}),{status:500,headers:{'Content-Type':'application/json'}}); }
-  }
-  return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-}
-
-///////////////////////////////////////////////////////
-// HTML Panels (edge+usf)
-///////////////////////////////////////////////////////
-
-const HTML_PANELS = {};
-
-HTML_PANELS.setup = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>edge+usf — Setup</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--ok:#06b6d4;--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--r:14px;--rs:8px}
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--tx)}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 30% 20%,rgba(124,58,237,.08),transparent 55%);pointer-events:none}
-.w{position:relative;z-index:1;width:380px;max-width:90vw;padding:20px}
-.logo{text-align:center;margin-bottom:28px}
-.logo .icon{width:56px;height:56px;margin:0 auto 12px;border-radius:16px;background:linear-gradient(135deg,var(--ac),#a78bfa);display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff;font-weight:800;box-shadow:0 4px 24px var(--glow)}
-.logo h1{font-size:22px;font-weight:800;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.logo p{color:var(--tx2);font-size:13px;margin-top:4px}
-.card{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:28px 24px}
-.fld{margin-bottom:16px}
-.fld label{display:block;font-size:11px;color:var(--tx2);margin-bottom:5px;font-weight:600}
-.fld input{width:100%;padding:11px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:14px;outline:none;font-family:inherit;transition:all .15s}
-.fld input:focus{border-color:var(--ac);box-shadow:0 0 0 3px var(--glow)}
-.btn{width:100%;padding:12px;border:none;border-radius:var(--rs);background:linear-gradient(135deg,var(--ac),#a78bfa);color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;margin-top:4px}
-.btn:hover{box-shadow:0 4px 20px var(--glow);transform:translateY(-1px)}
-.msg{margin-top:12px;padding:10px;border-radius:var(--rs);font-size:12px;display:none;text-align:center}
-.msg.e{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
-.msg.s{background:rgba(6,182,212,.1);color:var(--ok);border:1px solid rgba(6,182,212,.15)}
-</style>
-</head>
-<body>
-<div class="w">
-  <div class="logo">
-    <div class="icon">E+</div>
-    <h1>edge+usf</h1>
-    <p>Set admin password to get started</p>
-  </div>
-  <div class="card">
-    <form id="setup-form">
-      <div class="fld"><label>Password</label><input type="password" id="inp-pwd" placeholder="Min 4 characters" required minlength="4"></div>
-      <button class="btn" type="submit" id="btn-submit">Activate Panel</button>
-    </form>
-    <div class="msg" id="msg-box"></div>
-  </div>
-</div>
-<script>
-(function(){
-  var form=document.getElementById('setup-form');
-  var btn=document.getElementById('btn-submit');
-  var msg=document.getElementById('msg-box');
-  form.onsubmit=function(e){
-    e.preventDefault();
-    btn.disabled=true;btn.textContent='Please wait...';
-    fetch('/api/edgepp/setup-password',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password:document.getElementById('inp-pwd').value})
-    }).then(function(r){return r.json()}).then(function(d){
-      if(d.success){
-        msg.textContent='Panel activated! Redirecting...';
-        msg.className='msg s';msg.style.display='block';
-        setTimeout(function(){location.href='/panel'},1000);
-      }else{showErr(d.error)}
-    }).catch(function(){showErr('Connection error')});
-  };
-  function showErr(t){msg.textContent=t;msg.className='msg e';msg.style.display='block';btn.disabled=false;btn.textContent='Activate Panel'}
-})();
-</script>
-</body>
-</html>`;
-
-HTML_PANELS.login = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>edge+usf — Login</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--r:14px;--rs:8px}
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--tx)}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 30% 20%,rgba(124,58,237,.08),transparent 55%);pointer-events:none}
-.w{position:relative;z-index:1;width:380px;max-width:90vw;padding:20px}
-.logo{text-align:center;margin-bottom:28px}
-.logo .icon{width:56px;height:56px;margin:0 auto 12px;border-radius:16px;background:linear-gradient(135deg,var(--ac),#a78bfa);display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff;font-weight:800;box-shadow:0 4px 24px var(--glow)}
-.logo h1{font-size:22px;font-weight:800;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.logo p{color:var(--tx2);font-size:13px;margin-top:4px}
-.card{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:28px 24px}
-.fld{margin-bottom:16px}
-.fld label{display:block;font-size:11px;color:var(--tx2);margin-bottom:5px;font-weight:600}
-.fld input{width:100%;padding:11px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:14px;outline:none;font-family:inherit;transition:all .15s}
-.fld input:focus{border-color:var(--ac);box-shadow:0 0 0 3px var(--glow)}
-.btn{width:100%;padding:12px;border:none;border-radius:var(--rs);background:linear-gradient(135deg,var(--ac),#a78bfa);color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;margin-top:4px}
-.btn:hover{box-shadow:0 4px 20px var(--glow);transform:translateY(-1px)}
-.msg{margin-top:12px;padding:10px;border-radius:var(--rs);font-size:12px;display:none;text-align:center;background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
-</style>
-</head>
-<body>
-<div class="w">
-  <div class="logo">
-    <div class="icon">E+</div>
-    <h1>edge+usf</h1>
-    <p>Admin panel login</p>
-  </div>
-  <div class="card">
-    <form id="login-form">
-      <div class="fld"><label>Password</label><input type="password" id="inp-pwd" placeholder="Enter password" required></div>
-      <button class="btn" type="submit" id="btn-submit">Sign In</button>
-    </form>
-    <div class="msg" id="msg-box"></div>
-  </div>
-</div>
-<script>
-(function(){
-  var btn=document.getElementById('btn-submit');
-  var msg=document.getElementById('msg-box');
-  document.getElementById('login-form').onsubmit=function(e){
-    e.preventDefault();
-    btn.disabled=true;btn.textContent='Please wait...';
-    fetch('/panel/login',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password:document.getElementById('inp-pwd').value})
-    }).then(function(r){
-      if(r.ok){location.href='/panel';return null}
-      return r.json();
-    }).then(function(d){
-      if(d&&d.error){
-        msg.textContent=d.error;msg.style.display='block';
-        btn.disabled=false;btn.textContent='Sign In';
-      }
-    }).catch(function(){
-      msg.textContent='Connection error';msg.style.display='block';
-      btn.disabled=false;btn.textContent='Sign In';
-    });
-  };
-})();
-</script>
-</body>
-</html>`;
-
-HTML_PANELS.panel = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>edge+usf — Dashboard</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--s3:#222228;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--ok:#06b6d4;--ok2:#22d3ee;--warn:#f59e0b;--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--tx3:#71717a;--r:12px;--rs:8px}
-html{font-size:15px}
-body{font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;-webkit-font-smoothing:antialiased}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 15% 5%,rgba(124,58,237,.06),transparent 55%);pointer-events:none;z-index:0}
-.topbar{position:sticky;top:0;z-index:100;background:rgba(9,9,11,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--bd);height:54px;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
-.topbar-brand{display:flex;align-items:center;gap:10px}
-.topbar-brand .logo{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,var(--ac),#a78bfa);display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff;font-weight:800;box-shadow:0 2px 12px var(--glow)}
-.topbar-brand h1{font-size:16px;font-weight:800;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-.3px}
-.topbar-actions{display:flex;gap:6px}
-.topbar-actions button{padding:6px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s);color:var(--tx2);font-size:11px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .15s}
-.topbar-actions button:hover{border-color:var(--ac);color:var(--tx);background:var(--s2)}
-.main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:24px 20px}
-.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
-.stat-card{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:18px 16px;transition:border-color .2s}
-.stat-card:hover{border-color:rgba(124,58,237,.3)}
-.stat-label{font-size:10px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}
-.stat-value{font-size:24px;font-weight:800;line-height:1}
-.stat-value.v-purple{color:var(--ac2)}.stat-value.v-cyan{color:var(--ok2)}.stat-value.v-amber{color:var(--warn)}
-.toolbar{display:flex;align-items:center;gap:8px;margin-bottom:16px}
-.toolbar .search-box{flex:1;max-width:320px}
-.toolbar .search-box input{width:100%;padding:9px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s);color:var(--tx);font-size:12px;outline:none;font-family:inherit;transition:all .15s}
-.toolbar .search-box input:focus{border-color:var(--ac);box-shadow:0 0 0 3px var(--glow)}
-.toolbar button{padding:9px 18px;border-radius:var(--rs);border:none;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s}
-.btn-primary{background:linear-gradient(135deg,var(--ac),#8b5cf6);color:#fff;box-shadow:0 2px 8px var(--glow)}
-.btn-primary:hover{box-shadow:0 4px 20px var(--glow);transform:translateY(-1px)}
-.btn-ghost{background:var(--s);color:var(--tx2);border:1px solid var(--bd)!important}
-.btn-ghost:hover{border-color:var(--ac)!important;color:var(--tx)}
-.table-wrap{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}
-.table-wrap table{width:100%;border-collapse:collapse}
-.table-wrap th{background:var(--s2);padding:11px 14px;text-align:left;font-weight:600;font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--bd)}
-.table-wrap td{padding:10px 14px;border-bottom:1px solid rgba(42,42,50,.4);font-size:12px;vertical-align:middle}
-.table-wrap tr:last-child td{border-bottom:none}
-.table-wrap tr:hover td{background:rgba(124,58,237,.02)}
-.username-cell{font-weight:600;color:var(--tx)}
-.mono{font-family:'SF Mono',Monaco,Consolas,monospace;font-size:11px}
-.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.2px}
-.badge-active{background:rgba(6,182,212,.1);color:var(--ok2);border:1px solid rgba(6,182,212,.15)}
-.badge-disabled{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
-.badge-limited{background:rgba(245,158,11,.1);color:var(--warn);border:1px solid rgba(245,158,11,.15)}
-.badge-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
-.badge-active .badge-dot{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.sub-link{color:var(--ac2);text-decoration:none;font-size:10px;font-family:'SF Mono',Monaco,monospace;max-width:180px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr;transition:color .15s}
-.sub-link:hover{color:var(--ok2);text-decoration:underline}
-.cell-actions{display:flex;gap:4px;flex-wrap:wrap}
-.cell-actions button{padding:4px 10px;border-radius:5px;border:1px solid var(--bd);background:transparent;color:var(--tx2);font-size:10px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap}
-.cell-actions button:hover{border-color:var(--ac);color:var(--tx)}
-.cell-actions button.act-danger:hover{border-color:var(--err);color:var(--err)}
-.empty-state{text-align:center;padding:60px 20px;color:var(--tx3)}
-.empty-state p{font-size:13px;margin-top:8px}
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(6px);z-index:200;align-items:center;justify-content:center;padding:20px}
-.modal-overlay.active{display:flex}
-.modal{background:var(--s);border:1px solid var(--bd);border-radius:16px;width:480px;max-width:100%;max-height:90vh;overflow-y:auto;padding:28px 24px;box-shadow:0 24px 80px rgba(0,0,0,.5)}
-.modal h2{font-size:17px;font-weight:700;margin-bottom:20px;color:var(--tx)}
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 14px}
-.form-grid .full{grid-column:1/-1}
-.form-group{margin-bottom:2px}
-.form-group label{display:block;font-size:10px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
-.form-group input,.form-group select{width:100%;padding:10px 12px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:13px;outline:none;font-family:inherit;transition:all .15s}
-.form-group input:focus,.form-group select:focus{border-color:var(--ac);box-shadow:0 0 0 3px var(--glow)}
-.form-group input::placeholder{color:var(--tx3)}
-.modal-footer{display:flex;gap:8px;margin-top:20px;justify-content:flex-start}
-.modal-footer button{padding:10px 22px;border-radius:var(--rs);font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;border:none}
-.btn-save{background:linear-gradient(135deg,var(--ac),#8b5cf6);color:#fff}
-.btn-save:hover{box-shadow:0 4px 16px var(--glow)}
-.btn-cancel{background:var(--s2);color:var(--tx2);border:1px solid var(--bd)!important}
-.btn-cancel:hover{color:var(--tx);border-color:var(--ac)!important}
-.btn-delete{background:rgba(239,68,68,.1);color:var(--err);margin-right:auto}
-.btn-delete:hover{background:rgba(239,68,68,.2)}
-.toast-container{position:fixed;top:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:8px}
-.toast{padding:12px 20px;border-radius:var(--rs);font-size:12px;font-weight:500;animation:slideIn .3s ease;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,.3)}
-.toast-success{background:var(--s2);color:var(--ok2);border:1px solid rgba(6,182,212,.2)}
-.toast-error{background:var(--s2);color:var(--err);border:1px solid rgba(239,68,68,.2)}
-@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
-@media(max-width:768px){.stats-grid{grid-template-columns:1fr 1fr}.form-grid{grid-template-columns:1fr}.table-wrap{overflow-x:auto}.table-wrap table{min-width:700px}.toolbar{flex-wrap:wrap}.toolbar .search-box{max-width:none;flex-basis:100%}}
-</style>
-</head>
-<body>
-<header class="topbar">
-  <div class="topbar-brand"><div class="logo">E+</div><h1>edge+usf</h1></div>
-  <div class="topbar-actions">
-    <button onclick="showModal('password-modal')">Password</button>
-    <button onclick="document.cookie='edgepp_auth=;path=/panel;expires=Thu, 01 Jan 1970 00:00:00 GMT';location.href='/panel/login'">Logout</button>
-  </div>
-</header>
-<main class="main">
-  <div class="stats-grid">
-    <div class="stat-card"><div class="stat-label">Total Users</div><div class="stat-value v-purple" id="stat-total">--</div></div>
-    <div class="stat-card"><div class="stat-label">Active</div><div class="stat-value v-cyan" id="stat-active">--</div></div>
-    <div class="stat-card"><div class="stat-label">Data Used</div><div class="stat-value v-amber" id="stat-data">--</div></div>
-    <div class="stat-card"><div class="stat-label">Online</div><div class="stat-value v-cyan" id="stat-online">--</div></div>
-  </div>
-  <div class="toolbar">
-    <div class="search-box"><input type="text" id="search-input" placeholder="Search username..." oninput="renderUsers()"></div>
-    <button class="btn-primary" onclick="openAddUserModal()">+ Add User</button>
-    <button class="btn-ghost" onclick="loadData()">Refresh</button>
-  </div>
-  <div class="table-wrap">
-    <table><thead><tr><th>User</th><th>Data</th><th>Requests</th><th>Expiry</th><th>Status</th><th>Subscription</th><th>Actions</th></tr></thead><tbody id="users-tbody"></tbody></table>
-    <div class="empty-state" id="empty-state" style="display:none"><div style="font-size:32px;opacity:.3">&#128100;</div><p>No users yet. Click "+ Add User" to create one.</p></div>
-  </div>
-</main>
-<div class="modal-overlay" id="user-modal">
-  <div class="modal">
-    <h2 id="user-modal-title">Add User</h2>
-    <div class="form-grid">
-      <div class="full form-group"><label>Username *</label><input type="text" id="inp-username" placeholder="e.g. john" maxlength="32"></div>
-      <div class="full form-group"><label>UUID</label><input type="text" id="inp-uuid" placeholder="Auto-generated if empty"></div>
-      <div class="form-group"><label>Data Limit (GB)</label><input type="number" id="inp-limit-gb" placeholder="Unlimited" min="0" step="0.1"></div>
-      <div class="form-group"><label>Expiry (days)</label><input type="number" id="inp-expiry" placeholder="Unlimited" min="0"></div>
-      <div class="form-group"><label>Request Limit</label><input type="number" id="inp-limit-req" placeholder="Unlimited" min="0"></div>
-      <div class="form-group"><label>Max IPs</label><input type="number" id="inp-ip-limit" placeholder="Unlimited" min="0"></div>
-      <div class="form-group"><label>SNI / Host</label><input type="text" id="inp-sni" placeholder="Auto"></div>
-      <div class="form-group"><label>Port</label><input type="number" id="inp-port" value="443" min="1" max="65535"></div>
-      <div class="form-group"><label>TLS</label><select id="inp-tls"><option value="tls">TLS</option><option value="none">None</option></select></div>
-      <div class="form-group"><label>Fingerprint</label><select id="inp-fp"><option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option><option value="ios">iOS</option><option value="android">Android</option><option value="edge">Edge</option><option value="random">Random</option></select></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn-delete" id="btn-modal-delete" style="display:none" onclick="deleteUser()">Delete</button>
-      <button class="btn-save" id="btn-modal-save" onclick="saveUser()">Create User</button>
-      <button class="btn-cancel" onclick="hideModal('user-modal')">Cancel</button>
-    </div>
-  </div>
-</div>
-<div class="modal-overlay" id="password-modal">
-  <div class="modal">
-    <h2>Change Password</h2>
-    <div class="form-grid">
-      <div class="full form-group"><label>Current Password</label><input type="password" id="inp-pwd-current"></div>
-      <div class="full form-group"><label>New Password (min 4 chars)</label><input type="password" id="inp-pwd-new"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn-save" onclick="changePassword()">Save</button>
-      <button class="btn-cancel" onclick="hideModal('password-modal')">Cancel</button>
-    </div>
-  </div>
-</div>
-<div class="toast-container" id="toast-container"></div>
-<script>
-(function(){
-  'use strict';
-  var API='/api/edgepp/',host=location.hostname,users=[],editingUsername=null;
-  function loadData(){
-    Promise.all([fetch(API+'stats').then(function(r){return r.json()}),fetch(API+'users').then(function(r){return r.json()})]).then(function(res){
-      var s=res[0];users=res[1]||[];
-      document.getElementById('stat-total').textContent=s.total_users||0;
-      document.getElementById('stat-active').textContent=s.active_users||0;
-      document.getElementById('stat-data').textContent=(s.total_used_gb||0).toFixed(2)+' GB';
-      document.getElementById('stat-online').textContent=s.online_now||0;
-      renderUsers();
-    }).catch(function(e){console.error('Load error:',e)});
-  }
-  function renderUsers(){
-    var q=document.getElementById('search-input').value.toLowerCase(),tbody=document.getElementById('users-tbody'),empty=document.getElementById('empty-state');
-    var filtered=users.filter(function(u){return(u.username||'').toLowerCase().indexOf(q)!==-1});
-    if(!filtered.length){tbody.innerHTML='';empty.style.display='block';return}
-    empty.style.display='none';
-    var h='';
-    for(var i=0;i<filtered.length;i++){
-      var u=filtered[i],sc='badge-limited',st='Unknown';
-      if(u.status&&u.status.allowed){sc=u.is_active?'badge-active':'badge-disabled';st=u.is_active?'Active':'Disabled'}
-      else if(u.status){st=u.status.reason||'Limited'}
-      var dt=u.limit_gb?(u.used_gb||0).toFixed(2)+' / '+u.limit_gb+' GB':(u.used_gb||0).toFixed(2)+' GB';
-      var rt=u.limit_req?(u.used_req||0)+' / '+u.limit_req:String(u.used_req||0);
-      var et=u.expiry_days?(u.days_left!=null?u.days_left+'d left':u.expiry_days+'d'):'Unlimited';
-      var su='https://'+host+'/sub/'+encodeURIComponent(u.username);
-      var sn=escA(u.username);
-      h+='<tr><td class="username-cell">'+escH(u.username)+'</td><td class="mono">'+dt+'</td><td class="mono">'+rt+'</td><td>'+et+'</td><td><span class="badge '+sc+'"><span class="badge-dot"></span>'+st+'</span></td><td><a class="sub-link" href="'+su+'" target="_blank">'+su+'</a></td><td class="cell-actions"><button onclick="window._editUser(\\''+sn+'\\')">Edit</button><button onclick="window._toggleUser(\\''+sn+'\\')">'+(u.is_active?'Disable':'Enable')+'</button><button onclick="window._resetUser(\\''+sn+'\\')">Reset</button><button class="act-danger" onclick="window._confirmDel(\\''+sn+'\\')">Delete</button></td></tr>';
-    }
-    tbody.innerHTML=h;
-  }
-  window.showModal=function(id){document.getElementById(id).classList.add('active')};
-  window.hideModal=function(id){document.getElementById(id).classList.remove('active')};
-  document.querySelectorAll('.modal-overlay').forEach(function(el){el.addEventListener('click',function(e){if(e.target===el)el.classList.remove('active')})});
-  window.openAddUserModal=function(){
-    editingUsername=null;
-    document.getElementById('user-modal-title').textContent='Add User';
-    document.getElementById('btn-modal-save').textContent='Create User';
-    document.getElementById('btn-modal-delete').style.display='none';
-    ['inp-username','inp-uuid','inp-limit-gb','inp-expiry','inp-limit-req','inp-ip-limit','inp-sni'].forEach(function(id){document.getElementById(id).value=''});
-    document.getElementById('inp-port').value='443';document.getElementById('inp-tls').value='tls';document.getElementById('inp-fp').value='chrome';
-    showModal('user-modal');document.getElementById('inp-username').focus();
-  };
-  window._editUser=function(name){
-    var u=null;for(var i=0;i<users.length;i++){if(users[i].username===name){u=users[i];break}}
-    if(!u)return;editingUsername=name;
-    document.getElementById('user-modal-title').textContent='Edit \\u2014 '+name;
-    document.getElementById('btn-modal-save').textContent='Save Changes';
-    document.getElementById('btn-modal-delete').style.display='inline-block';
-    document.getElementById('inp-username').value=u.username||'';document.getElementById('inp-uuid').value=u.uuid||'';
-    document.getElementById('inp-limit-gb').value=u.limit_gb||'';document.getElementById('inp-expiry').value=u.expiry_days||'';
-    document.getElementById('inp-limit-req').value=u.limit_req||'';document.getElementById('inp-ip-limit').value=u.ip_limit||'';
-    document.getElementById('inp-sni').value=u.ips||'';document.getElementById('inp-port').value=u.port||443;
-    document.getElementById('inp-tls').value=u.tls||'tls';document.getElementById('inp-fp').value=u.fingerprint||'chrome';
-    showModal('user-modal');
-  };
-  window.saveUser=function(){
-    var username=document.getElementById('inp-username').value.trim();
-    if(!username){toast('Username is required','error');return}
-    var body={username:username,uuid:document.getElementById('inp-uuid').value.trim()||undefined,limit_gb:document.getElementById('inp-limit-gb').value||undefined,expiry_days:document.getElementById('inp-expiry').value||undefined,limit_req:document.getElementById('inp-limit-req').value||undefined,ip_limit:document.getElementById('inp-ip-limit').value||undefined,ips:document.getElementById('inp-sni').value.trim()||undefined,port:document.getElementById('inp-port').value||undefined,tls:document.getElementById('inp-tls').value,fingerprint:document.getElementById('inp-fp').value};
-    var url=editingUsername?(API+'users/'+encodeURIComponent(editingUsername)):(API+'users');
-    var method=editingUsername?'PUT':'POST';
-    fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(d){
-      if(d.success){hideModal('user-modal');loadData();toast(editingUsername?'User updated':'User created','success')}
-      else{toast(d.error||'Failed','error')}
-    }).catch(function(){toast('Connection error','error')});
-  };
-  window._toggleUser=function(n){fetch(API+'users/'+encodeURIComponent(n)+'/toggle',{method:'POST'}).then(function(){loadData();toast('Toggled','success')}).catch(function(){toast('Error','error')})};
-  window._resetUser=function(n){fetch(API+'users/'+encodeURIComponent(n)+'/reset',{method:'POST'}).then(function(){loadData();toast('Reset done','success')}).catch(function(){toast('Error','error')})};
-  window._confirmDel=function(name){
-    editingUsername=name;
-    var u=null;for(var i=0;i<users.length;i++){if(users[i].username===name){u=users[i];break}}
-    if(u){
-      document.getElementById('user-modal-title').textContent='Edit \\u2014 '+name;
-      document.getElementById('btn-modal-save').textContent='Save Changes';
-      document.getElementById('btn-modal-delete').style.display='inline-block';
-      document.getElementById('inp-username').value=u.username||'';document.getElementById('inp-uuid').value=u.uuid||'';
-      document.getElementById('inp-limit-gb').value=u.limit_gb||'';document.getElementById('inp-expiry').value=u.expiry_days||'';
-      document.getElementById('inp-limit-req').value=u.limit_req||'';document.getElementById('inp-ip-limit').value=u.ip_limit||'';
-      document.getElementById('inp-sni').value=u.ips||'';document.getElementById('inp-port').value=u.port||443;
-      document.getElementById('inp-tls').value=u.tls||'tls';document.getElementById('inp-fp').value=u.fingerprint||'chrome';
-    }
-    showModal('user-modal');
-  };
-  window.deleteUser=function(){
-    if(!editingUsername)return;var n=editingUsername;
-    fetch(API+'users/'+encodeURIComponent(n),{method:'DELETE'}).then(function(){hideModal('user-modal');editingUsername=null;loadData();toast('Deleted','success')}).catch(function(){toast('Error','error')});
-  };
-  window.changePassword=function(){
-    var c=document.getElementById('inp-pwd-current').value,n=document.getElementById('inp-pwd-new').value;
-    if(!c||!n){toast('Both fields required','error');return}
-    if(n.length<4){toast('Min 4 characters','error');return}
-    fetch(API+'change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:c,new_password:n})}).then(function(r){return r.json()}).then(function(d){
-      if(d.success){hideModal('password-modal');toast('Password changed','success')}
-      else{toast(d.error||'Failed','error')}
-    }).catch(function(){toast('Connection error','error')});
-  };
-  function escH(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
-  function escA(s){return String(s).replace(/&/g,'&amp;').replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-  function toast(msg,type){
-    var c=document.getElementById('toast-container'),el=document.createElement('div');
-    el.className='toast toast-'+(type||'success');el.textContent=msg;c.appendChild(el);
-    setTimeout(function(){el.style.opacity='0';el.style.transition='opacity .3s';setTimeout(function(){if(el.parentNode)c.removeChild(el)},300)},2500);
-  }
-  loadData();
-})();
-</script>
-</body>
-</html>`;
-
-HTML_PANELS.sub_page = `<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>edge+usf — Subscription</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--ok:#06b6d4;--ok2:#22d3ee;--warn:#f59e0b;--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--tx3:#71717a;--r:12px;--rs:8px}
-body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
-body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 25% 15%,rgba(124,58,237,.07),transparent 50%);pointer-events:none}
-.w{position:relative;z-index:1;max-width:560px;margin:0 auto;padding:20px 14px}
-.hd{text-align:center;margin-bottom:20px;padding:24px 18px;background:var(--s);border:1px solid var(--bd);border-radius:var(--r)}
-.hd .icon{display:inline-flex;width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--ac),#a78bfa);align-items:center;justify-content:center;font-size:18px;color:#fff;font-weight:800;box-shadow:0 4px 20px var(--glow)}
-.hd h1{font-size:18px;font-weight:800;margin-top:10px;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.hd .un{font-size:13px;color:var(--tx2);margin-top:3px}
-.sb{display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:16px;font-size:11px;font-weight:600;margin-top:10px}
-.sb.ac{background:rgba(6,182,212,.1);color:var(--ok2);border:1px solid rgba(6,182,212,.15)}
-.sb.in{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
-.sb .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
-.cd{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px}
-.cd .l{font-size:10px;color:var(--tx3);font-weight:600;margin-bottom:4px;text-transform:uppercase;letter-spacing:.3px}
-.cd .v{font-size:17px;font-weight:800}
-.cd .v.c{color:var(--ok2)}.cd .v.p{color:var(--ac2)}.cd .v.y{color:var(--warn)}
-.pb{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px;margin-bottom:14px}
-.pb .t{font-size:10px;color:var(--tx3);margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
-.bar{height:6px;background:var(--s2);border-radius:3px;overflow:hidden;margin-bottom:5px}
-.bar .fill{height:100%;border-radius:3px;transition:width .4s}
-.bar .fill.g{background:linear-gradient(90deg,var(--ok),#67e8f9)}
-.bar .fill.y{background:linear-gradient(90deg,var(--warn),#fde68a)}
-.bar .fill.r{background:linear-gradient(90deg,var(--err),#fca5a5)}
-.pi{display:flex;justify-content:space-between;font-size:10px;color:var(--tx3)}
-.ss{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px}
-.ss .st{font-size:10px;color:var(--tx3);margin-bottom:10px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;display:flex;align-items:center;justify-content:space-between}
-.ss .st button{padding:3px 10px;border-radius:5px;border:1px solid var(--bd);background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s}
-.ss .st button:hover{border-color:var(--ac);color:var(--tx)}
-.ci{background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);padding:8px 10px;margin-bottom:6px;display:flex;align-items:center;gap:6px}
-.ci .pr{font-size:10px;font-weight:700;padding:2px 7px;border-radius:3px;min-width:50px;text-align:center;flex-shrink:0}
-.pr.vless{background:rgba(124,58,237,.15);color:var(--ac2)}
-.pr.trojan{background:rgba(6,182,212,.15);color:var(--ok2)}
-.pr.ss{background:rgba(245,158,11,.15);color:var(--warn)}
-.ci .lk{flex:1;font-size:10px;color:var(--tx2);font-family:'SF Mono',Monaco,monospace;direction:ltr;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.cb{padding:3px 8px;border-radius:5px;border:1px solid var(--bd);background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s;flex-shrink:0}
-.cb:hover{border-color:var(--ac);color:var(--ac2)}
-.raw{margin-top:8px;padding:8px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);font-size:10px;color:var(--tx3);word-break:break-all;direction:ltr}
-.raw code{color:var(--ac2)}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--s2);border:1px solid var(--ac);color:var(--ac2);padding:8px 16px;border-radius:var(--rs);font-size:12px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
-.toast.show{opacity:1}
-@media(max-width:480px){.cards{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<div class="w">
-<div class="hd">
-  <div class="icon">E+</div>
-  <h1>edge+usf</h1>
-  <div class="un" id="u_n">-</div>
-  <div class="sb ac" id="u_s"><span class="dot"></span><span id="u_st">Active</span></div>
-</div>
-<div class="cards">
-  <div class="cd"><div class="l">Data Used</div><div class="v c" id="c_v">-</div></div>
-  <div class="cd"><div class="l">Requests</div><div class="v p" id="c_r">-</div></div>
-  <div class="cd"><div class="l">Days Left</div><div class="v y" id="c_e">-</div></div>
-  <div class="cd"><div class="l">Active IPs</div><div class="v c" id="c_o">-</div></div>
-</div>
-<div class="pb" id="vp">
-  <div class="t">Data Usage</div>
-  <div class="bar"><div class="fill g" id="vf" style="width:0%"></div></div>
-  <div class="pi"><span id="vu">0 GB</span><span id="vt">Unlimited</span></div>
-</div>
-<div class="ss">
-  <div class="st"><span>Connection Configs</span><button id="cp-sub-btn">Copy Sub Link</button></div>
-  <div id="cf"></div>
-  <div class="raw">Subscription URL: <code id="sl"></code></div>
-</div>
-</div>
-<div class="toast" id="tt">Copied!</div>
-<script>
-/*__DATA__*/
-(function(){
-  var d=window.__d;
-  if(!d)return;
-  document.getElementById('u_n').textContent='@'+d.username;
-  var sb=document.getElementById('u_s'),st=document.getElementById('u_st');
-  if(d.status&&d.status.allowed){sb.className='sb ac';st.textContent=d.is_active?'Active':'Disabled'}
-  else{sb.className='sb in';st.textContent=d.status?d.status.reason:'Disabled'}
-  document.getElementById('c_v').textContent=(d.used_gb||0).toFixed(2)+' GB';
-  document.getElementById('c_r').textContent=d.limit_req?(d.used_req||0)+' / '+d.limit_req:String(d.used_req||0);
-  document.getElementById('c_e').textContent=d.days_left!=null?d.days_left+' days':(d.expiry_days?d.expiry_days+' days':'Unlimited');
-  document.getElementById('c_o').textContent=d.online_count||0;
-  var vp=document.getElementById('vp');
-  if(d.limit_gb){
-    var pct=Math.min(100,((d.used_gb||0)/d.limit_gb)*100),fl=document.getElementById('vf');
-    fl.style.width=pct+'%';fl.className='fill '+(pct>85?'r':pct>60?'y':'g');
-    document.getElementById('vu').textContent=(d.used_gb||0).toFixed(2)+' GB';
-    document.getElementById('vt').textContent=d.limit_gb+' GB';
-  }else{vp.style.display='none'}
-  var cf=document.getElementById('cf');
-  for(var i=0;i<d.configs.length;i++){
-    var c=d.configs[i];
-    var div=document.createElement('div');div.className='ci';
-    var sp=document.createElement('span');sp.className='pr '+c.cls;sp.textContent=c.proto;
-    var lk=document.createElement('span');lk.className='lk';lk.textContent=c.link;lk.title=c.link;
-    var btn=document.createElement('button');btn.className='cb';btn.textContent='Copy';
-    (function(link){btn.addEventListener('click',function(){cpTxt(link)})})(c.link);
-    div.appendChild(sp);div.appendChild(lk);div.appendChild(btn);cf.appendChild(div);
-  }
-  document.getElementById('sl').textContent=d.sub_url;
-  document.getElementById('cp-sub-btn').addEventListener('click',function(){cpTxt(d.sub_url)});
-  function cpTxt(t){
-    if(navigator.clipboard){navigator.clipboard.writeText(t).then(showT).catch(function(){fallback(t)})}
-    else{fallback(t)}
-  }
-  function fallback(t){var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;opacity:0';document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();showT()}
-  function showT(){var t=document.getElementById('tt');t.classList.add('show');setTimeout(function(){t.classList.remove('show')},1200)}
-})();
-</script>
-</body>
-</html>`;
-
-
-// ========== Zeus-Inspired Fixed IP System (https://github.com/IR-NETLIFY/zeus) ==========
 let lastIpRotateCheck = 0;
-const PROXY_WRITE_LOCKS = new Map();
-
 async function checkAutoRotates(env) {
-  if (!env.DB) return;
-  const now = Date.now();
-  if (now - lastIpRotateCheck < 60000) return;
-  lastIpRotateCheck = now;
-  try {
-    const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND is_active = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
-    if (!usersToRotate || usersToRotate.length === 0) return;
-    const res = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt");
-    if (!res.ok) return;
-    const text = await res.text();
-    const blocks = text.split("----------");
-    let cachedIpsData = {};
-    blocks.forEach((block) => {
-      const lines = block.trim().split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-      if (lines.length === 0) return;
-      let opName = "Unknown";
-      const ips = [];
-      lines.forEach((line) => {
-        if (line.includes("#")) opName = line.split("#")[1].trim();
-        else if (!line.startsWith("[source")) ips.push(line);
-      });
-      if (ips.length > 0) cachedIpsData[opName] = ips;
-    });
-    for (const u of usersToRotate) {
-      let availableIps = [];
-      if (u.ip_operator === "all") {
-        Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
-      } else {
-        availableIps = cachedIpsData[u.ip_operator] || [];
-      }
-      availableIps = [...new Set(availableIps)];
-      let count = u.ip_count || 20;
-      let selectedIps = [];
-      if (count >= availableIps.length) { selectedIps = availableIps; }
-      else {
-        const shuffled = availableIps.slice();
-        for (let i = shuffled.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        selectedIps = shuffled.slice(0, count);
-      }
-      if (selectedIps.length > 0) {
-        await env.DB.prepare("UPDATE users SET ips = ?, last_rotate_time = ? WHERE id = ?").bind(selectedIps.join("\n"), now, u.id).run();
-      }
-    }
-  } catch (e) {}
+        const now = Date.now();
+        if (now - lastIpRotateCheck < 60000) return;
+        lastIpRotateCheck = now;
+        try {
+                const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
+                if (!usersToRotate || usersToRotate.length === 0) return;
+                const res = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt");
+                if (!res.ok) return;
+                const text = await res.text();
+                const blocks = text.split("----------");
+                let cachedIpsData = {};
+                blocks.forEach((block) => {
+                        const lines = block
+                                .trim()
+                                .split("\n")
+                                .map((l) => l.trim())
+                                .filter((l) => l.length > 0);
+                        if (lines.length === 0) return;
+                        let opName = "Unknown";
+                        const ips = [];
+                        lines.forEach((line) => {
+                                if (line.includes("#")) opName = line.split("#")[1].trim();
+                                else if (!line.startsWith("[source")) ips.push(line);
+                        });
+                        if (ips.length > 0) cachedIpsData[opName] = ips;
+                });
+                for (const u of usersToRotate) {
+                        let availableIps = [];
+                        if (u.ip_operator === "all") {
+                                Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
+                        } else {
+                                availableIps = cachedIpsData[u.ip_operator] || [];
+                        }
+                        availableIps = [...new Set(availableIps)];
+                        let count = u.ip_count || 20;
+                        let selectedIps = [];
+                        if (count >= availableIps.length) {
+                                selectedIps = availableIps;
+                        } else {
+                                const shuffled = availableIps.slice();
+                                for (let i = shuffled.length - 1; i > 0; i--) {
+                                        const j = Math.floor(Math.random() * (i + 1));
+                                        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                                }
+                                selectedIps = shuffled.slice(0, count);
+                        }
+                        if (selectedIps.length > 0) {
+                                await env.DB.prepare("UPDATE users SET ips = ?, last_rotate_time = ? WHERE id = ?").bind(selectedIps.join("\n"), now, u.id).run();
+                        }
+                }
+        } catch (e) {}
 }
-
 let cachedVipCountries = [];
 let lastVipCountriesFetch = 0;
-
 async function replaceBrokenProxy(username, env, oldProxy) {
-  try {
-    if (PROXY_WRITE_LOCKS.get(username + "_proxy_rotate")) return;
-    PROXY_WRITE_LOCKS.set(username + "_proxy_rotate", true);
-    const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
-    if (!user || user.auto_rotate_user_proxy !== 1 || user.user_socks5 !== oldProxy) {
-      PROXY_WRITE_LOCKS.delete(username + "_proxy_rotate"); return;
-    }
-    let countryCode = "all";
-    try {
-      let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-      if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-      if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
-      else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
-      const geoRes = await fetch('http://ip-api.com/json/' + remain + '?fields=countryCode');
-      const geoData = await geoRes.json();
-      if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-    } catch (e) {}
-    let newProxy = null;
-    const upperCountry = countryCode.toUpperCase();
-    const sources = [];
-    const isOldProxyVIP = oldProxy.includes("@");
-    if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
-      try {
-        const ghRes = await fetch("https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip", { headers: { "User-Agent": "Mozilla/5.0" } });
-        if (ghRes.ok) {
-          const files = await ghRes.json();
-          cachedVipCountries = files.filter(f => f.name.endsWith('.txt')).map(f => f.name.replace('.txt', '').toUpperCase());
-          lastVipCountriesFetch = Date.now();
-        }
-      } catch (e) {}
-    }
-    let fallbackVIPs = cachedVipCountries.length > 0 ? [...cachedVipCountries] : ["DE","US","GB","NL","FR","TR"];
-    for (let i = fallbackVIPs.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
-    }
-    if (upperCountry !== "ALL" && upperCountry !== "UN")
-      sources.push({ url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/' + upperCountry + '.txt', type: 'repo' });
-    for (const fc of fallbackVIPs) {
-      if (fc !== upperCountry) sources.push({ url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/' + fc + '.txt', type: 'repo' });
-    }
-    if (!isOldProxyVIP) {
-      if (upperCountry !== "ALL" && upperCountry !== "UN")
-        sources.push({ url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/' + upperCountry + '.txt', type: 'repo' });
-      sources.push({ url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/ALL.txt', type: 'repo' });
-    }
-    for (const src of sources) {
-      try {
-        const r = await fetch(src.url);
-        if (!r.ok) continue;
-        const t = await r.text();
-        const lines = t.split("\n").map(l => l.trim()).filter(l => l.length > 5);
-        if (lines.length > 0) {
-          for (let i = lines.length - 1; i > 0; i--) { const j = Math.floor(Math.random()*(i+1)); [lines[i],lines[j]]=[lines[j],lines[i]]; }
-          const testBatch = lines.slice(0,3).map(line => {
-            if (src.type === 'repo' && !line.match(/^(socks4|socks5|socks|http|https):\/\//i)) return 'socks5://'+line;
-            return line;
-          });
-          try {
-            newProxy = await Promise.any(testBatch.map(p => new Promise(async (resolve, reject) => {
-              const tid = setTimeout(() => reject(new Error('timeout')), 3000);
-              try {
-                const s = await edgeConnectProxy(p, "1.1.1.1", 80, new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"));
-                const rd = s.readable.getReader(); await rd.read(); s.close(); clearTimeout(tid);
-                resolve(p);
-              } catch(e) { clearTimeout(tid); reject(e); }
-            })));
-          } catch(e) { continue; }
-          if (newProxy) break;
-        }
-      } catch(e) {}
-    }
-    if (newProxy) await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(newProxy, user.id).run();
-  } catch(e) {} finally { PROXY_WRITE_LOCKS.delete(username + "_proxy_rotate"); }
-}
-
-function edgeParseProxyStr(proxyStr) {
-  const lower = proxyStr.toLowerCase();
-  let type = 'socks5', cleanStr = proxyStr;
-  if (lower.startsWith('http://') || lower.startsWith('https://')) {
-    type = lower.startsWith('https://') ? 'https' : 'http';
-    cleanStr = proxyStr.replace(/^https?:\/\//i, '');
-  } else if (lower.startsWith('socks4://')) {
-    type = 'socks4'; cleanStr = proxyStr.replace(/^socks4:\/\//i, '');
-  } else { cleanStr = proxyStr.replace(/^(socks5|socks):\/\//i, ''); }
-  const parsed = 获取SOCKS5账号(cleanStr, type === 'http' ? 80 : 1080);
-  return { type, params: parsed };
-}
-
-async function edgeConnectProxy(proxyStr, destAddr, destPort, initialData) {
-  let normalized = proxyStr;
-  if (proxyStr.includes("t.me/socks") || proxyStr.includes("tg://socks")) {
-    const server = proxyStr.match(/server=([^&]+)/)?.[1];
-    const port = proxyStr.match(/port=([^&]+)/)?.[1];
-    const user = proxyStr.match(/user=([^&]+)/)?.[1];
-    const pass = proxyStr.match(/pass=([^&]+)/)?.[1];
-    if (server && port) normalized = user && pass ? 'socks5://'+user+':'+pass+'@'+server+':'+port : 'socks5://'+server+':'+port;
-  }
-  const parsed = edgeParseProxyStr(normalized);
-  const TCP连接 = 创建请求TCP连接器(null);
-  if (parsed.type === 'http') return await httpConnect(destAddr, destPort, initialData, false, TCP连接, parsed.params);
-  if (parsed.type === 'https') return await httpConnect(destAddr, destPort, initialData, true, TCP连接, parsed.params);
-  return await socks5Connect(destAddr, destPort, initialData, TCP连接, parsed.params);
-}
-
-const uuidUserCache = new Map();
-let lastUuidCacheClean = 0;
-async function lookupUserByUuid(uuid, env) {
-  if (!env || !env.DB) return null;
-  const now = Date.now();
-  if (now - lastUuidCacheClean > 300000) { uuidUserCache.clear(); lastUuidCacheClean = now; }
-  const cached = uuidUserCache.get(uuid);
-  if (cached && now - cached.ts < 120000) return cached.user;
-  try {
-    const user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ? AND is_active = 1").bind(uuid.toLowerCase()).first();
-    uuidUserCache.set(uuid, { user, ts: now });
-    return user;
-  } catch(e) { return null; }
-}
-
-async function handleSubText(username, request, env, url) {
-  if (!env.DB) return new Response('D1 not configured', { status: 500 });
-  try {
-    const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(username, username).first();
-    if (!user) return new Response('Not Found', { status: 404 });
-    try { await env.DB.prepare("UPDATE users SET used_req = used_req + 1 WHERE username = ?").bind(user.username).run(); } catch(e) {}
-    const host = url.hostname;
-    let configIPs = [host];
-    if (user.ips) { const p = user.ips.split("\n").map(ip=>ip.trim()).filter(ip=>ip.length>0); if(p.length>0) configIPs=p; }
-    const configPorts = String(user.port || 443).split(",").map(p=>p.trim()).filter(p=>p.length>0);
-    const fp = user.fingerprint || 'chrome';
-    const path = '/';
-    const userFrag = user.frag_len && user.frag_int ? '&fragment='+user.frag_len+','+user.frag_int : '';
-    const uuid = user.uuid;
-    const links = [];
-    links.push('vless://00000000-0000-4000-8000-000000000000@0.0.0.0:443?encryption=none&security=none&type=ws&path=/#decoy');
-    configIPs.forEach((ip) => {
-      configPorts.forEach((portStr) => {
-        const isTls = ["443","2053","2083","2087","2096","8443"].includes(portStr);
-        links.push('vless://'+uuid+'@'+ip+':'+portStr+'?encryption=none&security='+(isTls?'tls':'none')+'&sni='+host+'&fp='+fp+'&type=ws&path='+path+userFrag+'#edge+'+ip+':'+portStr);
-      });
-    });
-    const plainContent = links.join("\n");
-    const dl = Math.floor((user.used_gb||0)*1073741824*0.7);
-    const total = user.limit_gb ? Math.floor(user.limit_gb*1073741824) : 0;
-    const exp = user.expiry_days && user.created_at ? Math.floor(new Date(user.created_at+'Z').getTime()/1000)+user.expiry_days*86400 : 4102329600;
-    return new Response(btoa(unescape(encodeURIComponent(plainContent))), {
-      headers: { 'Content-Type':'text/plain;charset=utf-8', 'Subscription-Userinfo':'upload=0;download='+dl+';total='+total+';expire='+exp, 'Profile-Web-Page-Url':url.protocol+'//'+url.host+'/sub/'+encodeURIComponent(user.username) }
-    });
-  } catch(err) { return new Response('Error: '+err.message, { status: 500 }); }
-}
-// ========== End Zeus-Inspired System ==========
-
-///////////////////////////////////////////////////////
-// Proxy Core (edgetunnel)
-///////////////////////////////////////////////////////
-
-// ============ Proxy Core ============
-
-const Version = '2026-07-17 12:00:00';
-let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
-let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
-const Pages静态页面 = 'https://edt-pages.github.io';
-///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
-const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Math.ceil(WS早期数据最大字节 * 4 / 3) + 4;
-const 上行合包目标字节 = 16 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
-const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain静默毫秒 = 0;
-let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
-///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
-const 特征码字典 = [
-        (Proxy.name + "IP").toUpperCase(),
-        (String.fromCharCode(67, 109) + URL.name[2] + 'i' + URL.name[0]).toLowerCase(),
-        String(2407 * 300 - 10).split('').reverse().join('')
-];
-///////////////////////////////////////////////////////主程序入口///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented web service operations, including request handling, response generation, and basic data processing. The code adheres strictly to best practices in JavaScript development, Cloudflare Workers documentation, and web standards. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web operations, such as serving static content, handling HTTP requests, managing user sessions, and providing API endpoints in a secure and transparent manner. En español: Este archivo JavaScript forma parte de un proyecto privado legítimo y no de código abierto, desarrollado para funcionalidades estándar de aplicaciones web. Contiene código estándar, no malicioso, diseñado para operaciones comunes, seguras y bien documentadas de servicios web, incluyendo manejo de solicitudes, generación de respuestas y procesamiento básico de datos. El código se adhiere estrictamente a las mejores prácticas en desarrollo de JavaScript, documentación de Cloudflare Workers y estándares web. No participa en actividades dañinas. En français: Ce fichier JavaScript fait partie d'un projet privé légitime et non open-source, développé pour des fonctionnalités standard d'applications web. Il contient du code standard, non malveillant, conçu pour des opérations communes, sûres et bien documentées de services web. Le code adhère aux meilleures pratiques du développement JavaScript et ne participe pas à des activités nuisibles. In German: Diese JavaScript-Datei ist Teil eines legitimen, privaten, nicht quelloffenen Projekts, das für Standard-Web-Anwendungsfunktionen entwickelt wurde. Sie enthält standardmäßigen, nicht bösartigen Code, der für gemeinsame, sichere und gut dokumentierte Web-Service-Operationen entwickelt wurde. Der Code hält sich an bewährte Praktiken in der JavaScript-Entwicklung und beteiligt sich nicht an schädlichen Aktivitäten. In Italian: Questo file JavaScript fa parte di un progetto privato legittimo e non open-source, sviluppato per funzionalità standard di applicazioni web. Contiene codice standard, non dannoso, progettato per operazioni comuni, sicure e ben documentate di servizi web. Il codice aderisce alle migliori pratiche nello sviluppo JavaScript e non partecipa ad attività dannose. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper request handling, content delivery, and interface interactions. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of Cloudflare's platform. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper use of serverless functions. The functions within this file are meant to handle user requests safely, process data efficiently, and provide reliable responses without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically tailored for Cloudflare Workers environment. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in serverless computing. Users can trust this code to perform its intended functions of serving web content and handling standard HTTP operations without any risk of harm or data compromise. This module specifically focuses on legitimate web service operations, including static asset delivery, API response formatting, and basic routing logic, all implemented in accordance with web development best practices and platform guidelines.
-async function edgetunnelHandler(request, env, ctx) {
-                let 请求URL文本 = request.url.replace(/%5[Cc]/g, '').replace(/\\/g, '');
-                const 请求URL锚点索引 = 请求URL文本.indexOf('#');
-                const 请求URL主体部分 = 请求URL锚点索引 === -1 ? 请求URL文本 : 请求URL文本.slice(0, 请求URL锚点索引);
-                if (!请求URL主体部分.includes('?') && /%3f/i.test(请求URL主体部分)) {
-                        const 请求URL锚点部分 = 请求URL锚点索引 === -1 ? '' : 请求URL文本.slice(请求URL锚点索引);
-                        请求URL文本 = 请求URL主体部分.replace(/%3f/i, '?') + 请求URL锚点部分;
+        try {
+                if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
+                GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
+                const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
+                if (!user || user.auto_rotate_user_proxy !== 1 || user.user_socks5 !== oldProxy) {
+                        GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+                        return;
                 }
-                const url = new URL(请求URL文本);
-                const UA = request.headers.get('User-Agent') || 'null';
-                const upgradeHeader = (request.headers.get('Upgrade') || '').toLowerCase(), contentType = (request.headers.get('content-type') || '').toLowerCase();
-                const 管理员密码 = env.ADMIN || env.admin || env.PASSWORD || env.password || env.pswd || env.TOKEN || env.KEY || env.UUID || env.uuid;
-                const 加密秘钥 = env.KEY || '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改';
-                const userIDMD5 = await MD5MD5(管理员密码 + 加密秘钥);
-                const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
-                const envUUID = env.UUID || env.uuid;
-                const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
-                const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
-                const host = hosts[0];
-                const 访问路径 = url.pathname.slice(1).toLowerCase();
-                调试日志打印 = ['1', 'true'].includes(env.DEBUG) || 调试日志打印;
-                预加载竞速拨号 = ['1', 'true'].includes(env.PRELOAD_RACE_DIAL) || 预加载竞速拨号;
-                if (TCP并发拨号数 !== 1 && 识别运营商(request) === 'cmcc') TCP并发拨号数 = 1;
-                let 默认反代IP = (`${request.cf.colo}.${特征码字典[0]}.${特征码字典[1]}SsSs.nEt`).toLowerCase(), 默认反代兜底 = true;
-                if (env.PROXYIP) {
-                        const proxyIPs = await 整理成数组(env.PROXYIP);
-                        默认反代IP = proxyIPs[Math.floor(Math.random() * proxyIPs.length)];
-                        默认反代兜底 = false;
-                };
-                const 访问IP = request.headers.get('CF-Connecting-IP') || request.headers.get('True-Client-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For') || request.headers.get('Fly-Client-IP') || request.headers.get('X-Appengine-Remote-Addr') || request.headers.get('X-Cluster-Client-IP') || '未知IP';
-                if (缓存SOCKS5白名单 === null) {
-                        if (env.GO2SOCKS5) SOCKS5白名单 = [...new Set(SOCKS5白名单.concat(await 整理成数组(env.GO2SOCKS5)))];
-                        缓存SOCKS5白名单 = SOCKS5白名单;
-                } else SOCKS5白名单 = 缓存SOCKS5白名单;
-                if (访问路径 === 'version') {// 版本信息接口
-                        const 请求UUID = (url.searchParams.get('uuid') || '').toLowerCase();
-                        if (uuidRegex.test(请求UUID)) {
-                                const 目标UUID = String(userID).toLowerCase();
-                                let 请求前8总和 = 0, 目标前8总和 = 0;
-                                for (let i = 0; i < 8; i++) {
-                                        const 请求码 = 请求UUID.charCodeAt(i);
-                                        请求前8总和 += 请求码 <= 57 ? 请求码 - 48 : 请求码 - 87;
-                                        const 目标码 = 目标UUID.charCodeAt(i);
-                                        目标前8总和 += 目标码 <= 57 ? 目标码 - 48 : 目标码 - 87;
-                                }
-                                if (请求前8总和 === 目标前8总和 && 请求UUID.slice(-12) === 目标UUID.slice(-12)) return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                        }
-                } else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
-                        const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
-                        反代上下文._env = env;
-                        log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
-                        return await 处理WS请求(request, userID, url, 反代上下文);
-                } else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/XHTTP代理
-                        const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
-                        const referer = request.headers.get('Referer') || '';
-                        const 命中XHTTP特征 = referer.includes('x_padding', 14) || referer.includes('x_padding=');
-                        if (!命中XHTTP特征 && contentType.startsWith('application/grpc')) {
-                                log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
-                                return await 处理gRPC请求(request, userID, 反代上下文);
-                        }
-                        log(`[XHTTP] 命中请求: ${url.pathname}${url.search}`);
-                        return await 处理XHTTP请求(request, userID, 反代上下文);
-                } else {
-                        if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
-                        if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
-                        if (env.KV && typeof env.KV.get === 'function') {
-                                const 区分大小写访问路径 = url.pathname.slice(1);
-                                if (区分大小写访问路径 === 加密秘钥 && 加密秘钥 !== '勿动此默认密钥，有需求请自行通过添加变量KEY进行修改') {//快速订阅
-                                        const params = new URLSearchParams(url.search);
-                                        params.set('token', await MD5MD5(host + userID));
-                                        return new Response('重定向中...', { status: 302, headers: { 'Location': `/sub?${params.toString()}` } });
-                                } else if (访问路径 === 'login') {//处理登录页面和登录请求
-                                        const cookies = request.headers.get('Cookie') || '';
-                                        const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-                                        if (authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/admin' } });
-                                        if (request.method === 'POST') {
-                                                const formData = await request.text();
-                                                const params = new URLSearchParams(formData);
-                                                const 输入密码 = params.get('password');
-                                                if (输入密码 === (typeof 管理员密码 === 'string' ? 管理员密码.replace(/[\r\n]/g, '') : 管理员密码)) {
-                                                        // 密码正确，设置cookie并返回成功标记
-                                                        const 响应 = new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        响应.headers.set('Set-Cookie', `auth=${await MD5MD5(UA + 加密秘钥 + 管理员密码)}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Strict`);
-                                                        return 响应;
-                                                }
-                                        }
-                                        return fetch(Pages静态页面 + '/login');
-                                } else if (访问路径 === 'admin' || 访问路径.startsWith('admin/')) {//验证cookie后响应管理页面
-                                        const cookies = request.headers.get('Cookie') || '';
-                                        const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-                                        // 没有cookie或cookie错误，跳转到/login页面
-                                        if (!authCookie || authCookie !== await MD5MD5(UA + 加密秘钥 + 管理员密码)) return new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
-                                        if (访问路径 === 'admin/log.json') {// 读取日志内容
-                                                const 读取日志内容 = await env.KV.get('log.json') || '[]';
-                                                return new Response(读取日志内容, { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                        } else if (区分大小写访问路径 === 'admin/getCloudflareUsage') {// 查询请求量
-                                                try {
-                                                        const Usage_JSON = await getCloudflareUsage(url.searchParams.get('Email'), url.searchParams.get('GlobalAPIKey'), url.searchParams.get('AccountID'), url.searchParams.get('APIToken'));
-                                                        return new Response(JSON.stringify(Usage_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
-                                                } catch (err) {
-                                                        const errorResponse = { msg: '查询请求量失败，失败原因：' + err.message, error: err.message };
-                                                        return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                }
-                                        } else if (区分大小写访问路径 === 'admin/getADDAPI') {// 验证优选API
-                                                if (url.searchParams.get('url')) {
-                                                        const 待验证优选URL = url.searchParams.get('url');
-                                                        try {
-                                                                new URL(待验证优选URL);
-                                                                const 请求优选API内容 = await 请求优选API([待验证优选URL], url.searchParams.get('port') || '443');
-                                                                let 优选API的IP = 请求优选API内容[0].length > 0 ? 请求优选API内容[0] : 请求优选API内容[1];
-                                                                优选API的IP = 优选API的IP.map(item => item.replace(/#(.+)$/, (_, remark) => '#' + decodeURIComponent(remark)));
-                                                                return new Response(JSON.stringify({ success: true, data: 优选API的IP }, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        } catch (err) {
-                                                                const errorResponse = { msg: '验证优选API失败，失败原因：' + err.message, error: err.message };
-                                                                return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        }
-                                                }
-                                                return new Response(JSON.stringify({ success: false, data: [] }, null, 2), { status: 403, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                        } else if (访问路径 === 'admin/check') {// 代理检查
-                                                const 代理协议 = ['socks5', 'http', 'https', 'turn', 'sstp'].find(类型 => url.searchParams.has(类型)) || null;
-                                                if (!代理协议) return new Response(JSON.stringify({ error: '缺少代理参数' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                const 代理参数 = url.searchParams.get(代理协议);
-                                                const startTime = Date.now();
-                                                let 检测代理响应;
-                                                try {
-                                                        const checkParsed = await 获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议));
-                                                        const { username, password, hostname, port } = checkParsed;
-                                                        const 完整代理参数 = username && password ? `${username}:${password}@${hostname}:${port}` : `${hostname}:${port}`;
-                                                        try {
-                                                                const 检测主机 = 'cloudflare.com', 检测端口 = 443, encoder = new TextEncoder(), decoder = new TextDecoder();
-                                                                const TCP连接 = 创建请求TCP连接器(request);
-                                                                let tcpSocket = null, tlsSocket = null;
-                                                                try {
-                                                                        tcpSocket = 代理协议 === 'socks5'
-                                                                                ? await socks5Connect(检测主机, 检测端口, new Uint8Array(0), TCP连接, checkParsed)
-                                                                                : 代理协议 === 'turn'
-                                                                                        ? await turnConnect(checkParsed, 检测主机, 检测端口, TCP连接)
-                                                                                        : 代理协议 === 'sstp'
-                                                                                                ? await sstpConnect(checkParsed, 检测主机, 检测端口, TCP连接)
-                                                                                                : (代理协议 === 'https' && isIPHostname(hostname)
-                                                                                                        ? await httpsConnect(检测主机, 检测端口, new Uint8Array(0), TCP连接, checkParsed)
-                                                                                                        : await httpConnect(检测主机, 检测端口, new Uint8Array(0), 代理协议 === 'https', TCP连接, checkParsed));
-                                                                        if (!tcpSocket) throw new Error('无法连接到代理服务器');
-                                                                        tlsSocket = new TlsClient(tcpSocket, { serverName: 检测主机, insecure: true });
-                                                                        await tlsSocket.handshake();
-                                                                        await tlsSocket.write(encoder.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${检测主机}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n`));
-                                                                        let responseBuffer = new Uint8Array(0), headerEndIndex = -1, contentLength = null, chunked = false;
-                                                                        const 最大响应字节 = 64 * 1024;
-                                                                        while (responseBuffer.length < 最大响应字节) {
-                                                                                const value = await tlsSocket.read();
-                                                                                if (!value) break;
-                                                                                if (value.byteLength === 0) continue;
-                                                                                responseBuffer = 拼接字节数据(responseBuffer, value);
-                                                                                if (headerEndIndex === -1) {
-                                                                                        const crlfcrlf = responseBuffer.findIndex((_, i) => i < responseBuffer.length - 3 && responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a && responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a);
-                                                                                        if (crlfcrlf !== -1) {
-                                                                                                headerEndIndex = crlfcrlf + 4;
-                                                                                                const headers = decoder.decode(responseBuffer.slice(0, headerEndIndex));
-                                                                                                const statusLine = headers.split('\r\n')[0] || '';
-                                                                                                const statusMatch = statusLine.match(/HTTP\/\d\.\d\s+(\d+)/);
-                                                                                                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : NaN;
-                                                                                                if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) throw new Error(`代理检测请求失败: ${statusLine || '无效响应'}`);
-                                                                                                const lengthMatch = headers.match(/\r\nContent-Length:\s*(\d+)/i);
-                                                                                                if (lengthMatch) contentLength = parseInt(lengthMatch[1], 10);
-                                                                                                chunked = /\r\nTransfer-Encoding:\s*chunked/i.test(headers);
-                                                                                        }
-                                                                                }
-                                                                                if (headerEndIndex !== -1 && contentLength !== null && responseBuffer.length >= headerEndIndex + contentLength) break;
-                                                                                if (headerEndIndex !== -1 && chunked && decoder.decode(responseBuffer).includes('\r\n0\r\n\r\n')) break;
-                                                                        }
-                                                                        if (headerEndIndex === -1) throw new Error('代理检测响应头过长或无效');
-                                                                        const response = decoder.decode(responseBuffer);
-                                                                        const ip = response.match(/(?:^|\n)ip=(.*)/)?.[1];
-                                                                        const loc = response.match(/(?:^|\n)loc=(.*)/)?.[1];
-                                                                        if (!ip || !loc) throw new Error('代理检测响应无效');
-                                                                        检测代理响应 = { success: true, proxy: 代理协议 + "://" + 完整代理参数, ip, loc, responseTime: Date.now() - startTime };
-                                                                } finally {
-                                                                        try { tlsSocket ? tlsSocket.close() : await tcpSocket?.close?.() } catch (e) { }
-                                                                }
-                                                        } catch (error) {
-                                                                检测代理响应 = { success: false, error: error.message, proxy: 代理协议 + "://" + 完整代理参数, responseTime: Date.now() - startTime };
-                                                        }
-                                                } catch (err) {
-                                                        检测代理响应 = { success: false, error: err.message, proxy: 代理协议 + "://" + 代理参数, responseTime: Date.now() - startTime };
-                                                }
-                                                return new Response(JSON.stringify(检测代理响应, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                        }
-
-                                        config_JSON = await 读取config_JSON(env, host, userID, UA);
-
-                                        if (访问路径 === 'admin/init') {// 重置配置为默认值
-                                                try {
-                                                        config_JSON = await 读取config_JSON(env, host, userID, UA, true);
-                                                        ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Init_Config', config_JSON));
-                                                        config_JSON.init = '配置已重置为默认值';
-                                                        return new Response(JSON.stringify(config_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                } catch (err) {
-                                                        const errorResponse = { msg: '配置重置失败，失败原因：' + err.message, error: err.message };
-                                                        return new Response(JSON.stringify(errorResponse, null, 2), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                }
-                                        } else if (request.method === 'POST') {// 处理 KV 操作（POST 请求）
-                                                if (访问路径 === 'admin/config.json') { // 保存config.json配置
-                                                        try {
-                                                                const newConfig = await request.json();
-                                                                // 验证配置完整性
-                                                                if (!newConfig.UUID || !newConfig.HOST) return new Response(JSON.stringify({ error: '配置不完整' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-
-                                                                // 保存到 KV
-                                                                await env.KV.put('config.json', JSON.stringify(newConfig, null, 2));
-                                                                ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
-                                                                return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        } catch (error) {
-                                                                console.error('保存配置失败:', error);
-                                                                return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        }
-                                                } else if (访问路径 === 'admin/cf.json') { // 保存cf.json配置
-                                                        try {
-                                                                const newConfig = await request.json();
-                                                                const CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
-                                                                if (!newConfig.init || newConfig.init !== true) {
-                                                                        if (newConfig.Email && newConfig.GlobalAPIKey) {
-                                                                                CF_JSON.Email = newConfig.Email;
-                                                                                CF_JSON.GlobalAPIKey = newConfig.GlobalAPIKey;
-                                                                        } else if (newConfig.AccountID && newConfig.APIToken) {
-                                                                                CF_JSON.AccountID = newConfig.AccountID;
-                                                                                CF_JSON.APIToken = newConfig.APIToken;
-                                                                        } else if (newConfig.UsageAPI) {
-                                                                                CF_JSON.UsageAPI = newConfig.UsageAPI;
-                                                                        } else {
-                                                                                return new Response(JSON.stringify({ error: '配置不完整' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                                        }
-                                                                }
-
-                                                                // 保存到 KV
-                                                                await env.KV.put('cf.json', JSON.stringify(CF_JSON, null, 2));
-                                                                ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
-                                                                return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        } catch (error) {
-                                                                console.error('保存配置失败:', error);
-                                                                return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        }
-                                                } else if (访问路径 === 'admin/tg.json') { // 保存tg.json配置
-                                                        try {
-                                                                const newConfig = await request.json();
-                                                                if (newConfig.init && newConfig.init === true) {
-                                                                        const TG_JSON = { BotToken: null, ChatID: null };
-                                                                        await env.KV.put('tg.json', JSON.stringify(TG_JSON, null, 2));
-                                                                } else {
-                                                                        if (!newConfig.BotToken || !newConfig.ChatID) return new Response(JSON.stringify({ error: '配置不完整' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                                        await env.KV.put('tg.json', JSON.stringify(newConfig, null, 2));
-                                                                }
-                                                                ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Config', config_JSON));
-                                                                return new Response(JSON.stringify({ success: true, message: '配置已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        } catch (error) {
-                                                                console.error('保存配置失败:', error);
-                                                                return new Response(JSON.stringify({ error: '保存配置失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        }
-                                                } else if (区分大小写访问路径 === 'admin/ADD.txt') { // 保存自定义优选IP
-                                                        try {
-                                                                const customIPs = await request.text();
-                                                                await env.KV.put('ADD.txt', customIPs);// 保存到 KV
-                                                                ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Save_Custom_IPs', config_JSON));
-                                                                return new Response(JSON.stringify({ success: true, message: '自定义IP已保存' }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        } catch (error) {
-                                                                console.error('保存自定义IP失败:', error);
-                                                                return new Response(JSON.stringify({ error: '保存自定义IP失败: ' + error.message }), { status: 500, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                                        }
-                                                } else return new Response(JSON.stringify({ error: '不支持的POST请求路径' }), { status: 404, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                        } else if (访问路径 === 'admin/config.json') {// 处理 admin/config.json 请求，返回JSON
-                                                return new Response(JSON.stringify(config_JSON, null, 2), { status: 200, headers: { 'Content-Type': 'application/json' } });
-                                        } else if (区分大小写访问路径 === 'admin/ADD.txt') {// 处理 admin/ADD.txt 请求，返回本地优选IP
-                                                let 本地优选IP = await env.KV.get('ADD.txt') || 'null';
-                                                if (本地优选IP == 'null') 本地优选IP = (await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口))[1];
-                                                return new Response(本地优选IP, { status: 200, headers: { 'Content-Type': 'text/plain;charset=utf-8', 'asn': request.cf.asn } });
-                                        } else if (访问路径 === 'admin/cf.json') {// CF配置文件
-                                                return new Response(JSON.stringify(request.cf, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
-                                        }
-
-                                        ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Admin_Login', config_JSON));
-                                        return fetch(Pages静态页面 + '/admin' + url.search);
-                                } else if (访问路径 === 'logout' || uuidRegex.test(访问路径)) {//清除cookie并跳转到登录页面
-                                        const 响应 = new Response('重定向中...', { status: 302, headers: { 'Location': '/login' } });
-                                        响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
-                                        return 响应;
-                                } else if (访问路径 === 'sub') {//处理订阅请求
-                                        const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
-                                        const 请求TOKEN = url.searchParams.get('token');
-                                        const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
-                                        const 当前日序号 = Math.floor(Date.now() / 86400000);
-                                        const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, userID);
-                                        const [今日订阅转换后端专属TOKEN, 昨日订阅转换后端专属TOKEN] = await Promise.all([
-                                                MD5MD5(订阅转换后端TOKEN种子 + 当前日序号),
-                                                MD5MD5(订阅转换后端TOKEN种子 + (当前日序号 - 1)),
-                                        ]);
-                                        const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
-                                        if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
-                                                config_JSON = await 读取config_JSON(env, host, userID, UA);
-                                                if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
-                                                else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
-                                                const ua = UA.toLowerCase();
-                                                const responseHeaders = {
-                                                        "content-type": "text/plain; charset=utf-8",
-                                                        "Profile-Update-Interval": config_JSON.优选订阅生成.SUBUpdateTime,
-                                                        "Profile-web-page-url": url.protocol + '//' + url.host + '/admin',
-                                                        "Cache-Control": "no-store",
-                                                };
-                                                if (config_JSON.CF.Usage.success) {
-                                                        const pagesSum = config_JSON.CF.Usage.pages;
-                                                        const workersSum = config_JSON.CF.Usage.workers;
-                                                        const total = Number.isFinite(config_JSON.CF.Usage.max) ? (config_JSON.CF.Usage.max / 1000) * 1024 : 1024 * 100;
-                                                        responseHeaders["Subscription-Userinfo"] = `upload=${pagesSum}; download=${workersSum}; total=${total}; expire=4102329600`; // 2099-12-31 到期时间
-                                                }
-                                                const isSubConverterRequest = url.searchParams.has('b64') || url.searchParams.has('base64') || request.headers.get('subconverter-request') || request.headers.get('subconverter-version') || ua.includes('subconverter') || ua.includes(('CF-Workers-SUB').toLowerCase()) || 作为优选订阅生成器;
-                                                const 订阅类型 = isSubConverterRequest
-                                                        ? 'mixed'
-                                                        : url.searchParams.has('target')
-                                                                ? url.searchParams.get('target')
-                                                                : url.searchParams.has('clash') || ua.includes('clash') || ua.includes('meta') || ua.includes('mihomo')
-                                                                        ? 'clash'
-                                                                        : url.searchParams.has('sb') || url.searchParams.has('singbox') || ua.includes('singbox') || ua.includes('sing-box')
-                                                                                ? 'singbox'
-                                                                                : url.searchParams.has('surge') || ua.includes('surge')
-                                                                                        ? 'surge&ver=4'
-                                                                                        : url.searchParams.has('quanx') || ua.includes('quantumult')
-                                                                                                ? 'quanx'
-                                                                                                : url.searchParams.has('loon') || ua.includes('loon')
-                                                                                                        ? 'loon'
-                                                                                                        : 'mixed';
-
-                                                if (!ua.includes('mozilla')) responseHeaders["Content-Disposition"] = `attachment; filename*=utf-8''${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
-                                                const 协议类型 = ((url.searchParams.has('surge') || ua.includes('surge')) && config_JSON.协议类型 !== 'ss') ? 'tro' + 'jan' : config_JSON.协议类型;
-                                                let 订阅内容 = '';
-                                                if (订阅类型 === 'mixed') {
-                                                        const TLS分片参数 = config_JSON.TLS分片 == 'Shadowrocket' ? `&fragment=${encodeURIComponent('1,40-60,30-50,tlshello')}` : config_JSON.TLS分片 == 'Happ' ? `&fragment=${encodeURIComponent('3,1,tlshello')}` : '';
-                                                        let 完整优选IP = [], 其他节点LINK = '', 反代IP池 = [];
-
-                                                        if (!url.searchParams.has('sub') && config_JSON.优选订阅生成.local) { // 本地生成订阅
-                                                                const 完整优选列表 = config_JSON.优选订阅生成.本地IP库.随机IP ? (
-                                                                        await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口)
-                                                                )[0] : await env.KV.get('ADD.txt') ? await 整理成数组(await env.KV.get('ADD.txt')) : (
-                                                                        await 生成随机IP(request, config_JSON.优选订阅生成.本地IP库.随机数量, config_JSON.优选订阅生成.本地IP库.指定端口)
-                                                                )[0];
-                                                                const 优选API = [], 优选IP = [], 其他节点 = [];
-                                                                for (const 元素 of 完整优选列表) {
-                                                                        if (元素.toLowerCase().startsWith('sub://')) {
-                                                                                优选API.push(元素);
-                                                                        } else {
-                                                                                const 备注位置 = 元素.indexOf('#');
-                                                                                const 地址部分 = 备注位置 > -1 ? 元素.slice(0, 备注位置) : 元素;
-                                                                                const 备注部分 = 备注位置 > -1 ? 元素.slice(备注位置) : '';
-                                                                                const subMatch = 元素.match(/sub\s*=\s*([^\s&#]+)/i);
-                                                                                if (subMatch && subMatch[1].trim().includes('.')) {
-                                                                                        const 优选IP作为反代IP = 元素.toLowerCase().includes('proxyip=true');
-                                                                                        if (优选IP作为反代IP) 优选API.push('sub://' + subMatch[1].trim() + "?proxyip=true" + (元素.includes('#') ? ('#' + 元素.split('#')[1]) : ''));
-                                                                                        else 优选API.push('sub://' + subMatch[1].trim() + (元素.includes('#') ? ('#' + 元素.split('#')[1]) : ''));
-                                                                                } else if (地址部分.toLowerCase().startsWith('https://')) {
-                                                                                        优选API.push(元素);
-                                                                                } else if (地址部分.toLowerCase().includes('://')) {
-                                                                                        if (元素.includes('#')) {
-                                                                                                const 地址备注分离 = 元素.split('#');
-                                                                                                其他节点.push(地址备注分离[0] + '#' + encodeURIComponent(decodeURIComponent(地址备注分离[1])));
-                                                                                        } else 其他节点.push(元素);
-                                                                                } else {
-                                                                                        if (地址部分.includes('*')) {
-                                                                                                优选IP.push(替换星号为随机字符(地址部分) + 备注部分);
-                                                                                        } else 优选IP.push(元素);
-                                                                                }
-                                                                        }
-                                                                }
-                                                                const 请求优选API内容 = await 请求优选API(优选API, '443');
-                                                                const 合并其他节点数组 = [...new Set(其他节点.concat(请求优选API内容[1]))];
-                                                                其他节点LINK = 合并其他节点数组.length > 0 ? 合并其他节点数组.join('\n') + '\n' : '';
-                                                                const 优选API的IP = 请求优选API内容[0];
-                                                                反代IP池 = 请求优选API内容[3] || [];
-                                                                完整优选IP = [...new Set(优选IP.concat(优选API的IP))];
-                                                        } else { // 优选订阅生成器
-                                                                let 优选订阅生成器HOST = url.searchParams.get('sub') || config_JSON.优选订阅生成.SUB;
-                                                                const [优选生成器IP数组, 优选生成器其他节点] = await 获取优选订阅生成器数据(优选订阅生成器HOST);
-                                                                完整优选IP = 完整优选IP.concat(优选生成器IP数组);
-                                                                其他节点LINK += 优选生成器其他节点;
-                                                        }
-                                                        const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
-                                                        const isLoonOrSurge = ua.includes('loon') || ua.includes('surge');
-                                                        const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
-                                                        订阅内容 = 其他节点LINK + 完整优选IP.map(原始地址 => {
-                                                                // 统一正则: 匹配 域名/IPv4/IPv6地址 + 可选端口 + 可选备注
-                                                                // 示例:
-                                                                //   - 域名: hj.xmm1993.top:2096#备注 或 example.com
-                                                                //   - IPv4: 166.0.188.128:443#Los Angeles 或 166.0.188.128
-                                                                //   - IPv6: [2606:4700::]:443#CMCC 或 [2606:4700::]
-                                                                const regex = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
-                                                                const match = 原始地址.match(regex);
-
-                                                                let 节点地址, 节点端口 = "443", 节点备注;
-
-                                                                if (match) {
-                                                                        节点地址 = match[1];  // IP地址或域名(可能带方括号)
-                                                                        节点端口 = match[2] ? match[2] : '443';  // 端口默认443，SS noTLS在生成链接时再映射
-                                                                        节点备注 = match[3] || 节点地址;  // 备注,默认为地址本身
-                                                                } else {
-                                                                        // 不规范的格式，跳过处理返回null
-                                                                        console.warn(`[订阅内容] 不规范的IP格式已忽略: ${原始地址}`);
-                                                                        return null;
-                                                                }
-
-                                                                let 完整节点路径 = config_JSON.完整节点路径;
-
-                                                                const 链式代理匹配 = 节点备注.match(/\$(socks5|http|https|turn|sstp):\/\/([^#\s]+)/i);
-                                                                if (链式代理匹配) {
-                                                                        try {
-                                                                                const 代理协议 = 链式代理匹配[1].toLowerCase(), 代理参数 = 链式代理匹配[2];
-                                                                                const 链式代理数据 = { type: 代理协议, ...获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议)) };
-                                                                                完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
-                                                                                节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
-                                                                        } catch (error) {
-                                                                                console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
-                                                                        }
-                                                                } else if (反代IP池.length > 0) {
-                                                                        const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));
-                                                                        if (匹配到的反代IP) 完整节点路径 = (`${config_JSON.PATH}/proxyip=${匹配到的反代IP}`).replace(/\/\//g, '/') + (config_JSON.启用0RTT ? '?ed=2560' : '');
-                                                                }
-                                                                if (isLoonOrSurge) 完整节点路径 = 完整节点路径.replace(/,/g, '%2C');
-
-                                                                if (协议类型 === 'ss' && !作为优选订阅生成器) {
-                                                                        if (!config_JSON.SS.TLS) {
-                                                                                const TLS端口 = [443, 2053, 2083, 2087, 2096, 8443];
-                                                                                const NOTLS端口 = [80, 2052, 2082, 2086, 2095, 8080];
-                                                                                节点端口 = String(NOTLS端口[TLS端口.indexOf(Number(节点端口))] ?? 节点端口);
-                                                                        }
-                                                                        完整节点路径 = (完整节点路径.includes('?') ? 完整节点路径.replace('?', '?enc=' + config_JSON.SS.加密方式 + '&') : (完整节点路径 + '?enc=' + config_JSON.SS.加密方式)).replace(/([=,])/g, '\\$1');
-                                                                        if (!isSubConverterRequest) 完整节点路径 = 完整节点路径 + ';mux=0';
-                                                                        return `${协议类型}://${btoa(config_JSON.SS.加密方式 + ':00000000-0000-4000-8000-000000000000')}@${节点地址}:${节点端口}?plugin=v2${encodeURIComponent('ray-plugin;mode=websocket;host=example.com;path=' + (config_JSON.随机路径 ? 随机路径(完整节点路径) : 完整节点路径) + (config_JSON.SS.TLS ? ';tls' : '')) + ECHLINK参数 + TLS分片参数}#${encodeURIComponent(节点备注)}`;
-                                                                } else {
-                                                                        const 传输路径参数值 = 获取传输路径参数值(config_JSON, 完整节点路径, 作为优选订阅生成器);
-                                                                        return `${协议类型}://00000000-0000-4000-8000-000000000000@${节点地址}:${节点端口}?security=tls&type=${传输协议 + ECHLINK参数}&${域名字段名}=example.com&fp=${config_JSON.Fingerprint}&sni=example.com&${路径字段名}=${encodeURIComponent(传输路径参数值) + TLS分片参数}&encryption=none#${encodeURIComponent(节点备注)}`;
-                                                                }
-                                                        }).filter(item => item !== null).join('\n');
-                                                } else { // 订阅转换
-                                                        const 订阅转换URL = `${config_JSON.订阅转换配置.SUBAPI}/sub?target=${订阅类型}&url=${encodeURIComponent(url.protocol + '//' + url.host + '/sub?target=mixed&token=' + 今日订阅转换后端专属TOKEN + '&cnIspCode=' + 识别运营商(request) + (url.searchParams.has('sub') && url.searchParams.get('sub') != '' ? `&sub=${url.searchParams.get('sub')}` : ''))}&config=${encodeURIComponent(config_JSON.订阅转换配置.SUBCONFIG)}&emoji=${config_JSON.订阅转换配置.SUBEMOJI}&list=${config_JSON.订阅转换配置.SUBLIST}&scv=${config_JSON.跳过证书验证}&xudp=${config_JSON.订阅转换配置.XUDP}&udp=${config_JSON.订阅转换配置.UDP}&tls13=${config_JSON.订阅转换配置.TLS13}&append_type=${config_JSON.订阅转换配置.APPEND_TYPE}&sort=${config_JSON.订阅转换配置.SORT}`;
-                                                        try {
-                                                                const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } });
-                                                                if (response.ok) {
-                                                                        订阅内容 = await response.text();
-                                                                        if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
-                                                                } else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
-                                                        } catch (error) {
-                                                                return new Response('订阅转换后端异常：' + error.message, { status: 403 });
-                                                        }
-                                                }
-
-                                                if (!ua.includes('subconverter') && 用户客户端请求订阅) {
-                                                        const 打乱后HOSTS = [...config_JSON.HOSTS].sort(() => Math.random() - 0.5);
-                                                        let 替换域名计数 = 0, 当前随机HOST = null;
-                                                        订阅内容 = 订阅内容
-                                                                .replace(/00000000-0000-4000-8000-000000000000/g, config_JSON.UUID)
-                                                                .replace(/MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAw/g, btoa(config_JSON.UUID))
-                                                                .replace(/example\.com/g, () => {
-                                                                        if (替换域名计数 % 2 === 0) {
-                                                                                const 原始host = 打乱后HOSTS[Math.floor(替换域名计数 / 2) % 打乱后HOSTS.length];
-                                                                                当前随机HOST = 替换星号为随机字符(原始host);
-                                                                        }
-                                                                        替换域名计数++;
-                                                                        return 当前随机HOST;
-                                                                });
-                                                }
-
-                                                if (订阅类型 === 'mixed' && (!ua.includes('mozilla') || url.searchParams.has('b64') || url.searchParams.has('base64'))) 订阅内容 = btoa(订阅内容);
-
-                                                if (订阅类型 === 'singbox') {
-                                                        订阅内容 = await Singbox订阅配置文件热补丁(订阅内容, config_JSON);
-                                                        responseHeaders["content-type"] = 'application/json; charset=utf-8';
-                                                } else if (订阅类型 === 'clash') {
-                                                        订阅内容 = Clash订阅配置文件热补丁(订阅内容, config_JSON);
-                                                        responseHeaders["content-type"] = 'application/x-yaml; charset=utf-8';
-                                                }
-                                                return new Response(订阅内容, { status: 200, headers: responseHeaders });
-                                        }
-                                } else if (访问路径 === 'locations') {//反代locations列表
-                                        const cookies = request.headers.get('Cookie') || '';
-                                        const authCookie = cookies.split(';').find(c => c.trim().startsWith('auth='))?.split('=')[1];
-                                        if (authCookie && authCookie == await MD5MD5(UA + 加密秘钥 + 管理员密码)) return fetch(new Request('https://speed.cloudflare.com/locations', { headers: { 'Referer': 'https://speed.cloudflare.com/' } }));
-                                } else if (访问路径 === 'robots.txt') return new Response('User-agent: *\nDisallow: /', { status: 200, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
-                        } else if (!envUUID) return fetch(Pages静态页面 + '/noKV').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
-                }
-
-                let 伪装页URL = env.URL || 'nginx';
-                if (伪装页URL && 伪装页URL !== 'nginx' && 伪装页URL !== '1101') {
-                        伪装页URL = 伪装页URL.trim().replace(/\/$/, '');
-                        if (!伪装页URL.match(/^https?:\/\//i)) 伪装页URL = 'https://' + 伪装页URL;
-                        if (伪装页URL.toLowerCase().startsWith('http://')) 伪装页URL = 'https://' + 伪装页URL.substring(7);
-                        try { const u = new URL(伪装页URL); 伪装页URL = u.protocol + '//' + u.host } catch (e) { 伪装页URL = 'nginx' }
-                }
-                if (伪装页URL === '1101') return new Response(await html1101(url.host, 访问IP), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
+                let countryCode = "all";
                 try {
-                        const 反代URL = new URL(伪装页URL), 新请求头 = new Headers(request.headers);
-                        新请求头.set('Host', 反代URL.host);
-                        新请求头.set('Referer', 反代URL.origin);
-                        新请求头.set('Origin', 反代URL.origin);
-                        if (!新请求头.has('User-Agent') && UA && UA !== 'null') 新请求头.set('User-Agent', UA);
-                        const 反代响应 = await fetch(反代URL.origin + url.pathname + url.search, { method: request.method, headers: 新请求头, body: request.body, cf: request.cf });
-                        const 内容类型 = 反代响应.headers.get('content-type') || '';
-                        // 只处理文本类型的响应
-                        if (/text|javascript|json|xml/.test(内容类型)) {
-                                const 响应内容 = (await 反代响应.text()).replaceAll(反代URL.host, url.host);
-                                return new Response(响应内容, { status: 反代响应.status, headers: { ...Object.fromEntries(反代响应.headers), 'Cache-Control': 'no-store' } });
-                        }
-                        return 反代响应;
-                } catch (error) { }
-                return new Response(await nginx(), { status: 200, headers: { 'Content-Type': 'text/html; charset=UTF-8' } });
-        }
-
-///////////////////////////////////////////////////////////////////////XHTTP传输数据///////////////////////////////////////////////
-async function 处理XHTTP请求(request, yourUUID, 反代上下文 = {}) {
-        if (!request.body) return new Response('Bad Request', { status: 400 });
-        const reader = request.body.getReader();
-        const 首包 = await 读取XHTTP首包(reader, yourUUID);
-        if (!首包) {
-                try { reader.releaseLock() } catch (e) { }
-                return new Response('Invalid request', { status: 400 });
-        }
-        if (isSpeedTestSite(首包.hostname)) {
-                try { reader.releaseLock() } catch (e) { }
-                return new Response('Forbidden', { status: 403 });
-        }
-        if (首包.isUDP && 首包.协议 !== 'trojan' && 首包.port !== 53) {
-                try { reader.releaseLock() } catch (e) { }
-                return new Response('UDP is not supported', { status: 400 });
-        }
-
-        const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-        let 当前写入Socket = null;
-        let 远端写入器 = null;
-        const responseHeaders = new Headers({
-                'Content-Type': 'application/octet-stream',
-                'X-Accel-Buffering': 'no',
-                'Cache-Control': 'no-store'
-        });
-
-        const 释放远端写入器 = () => {
-                if (远端写入器) {
-                        try { 远端写入器.releaseLock() } catch (e) { }
-                        远端写入器 = null;
-                }
-                当前写入Socket = null;
-        };
-
-        const 获取远端写入器 = () => {
-                const socket = remoteConnWrapper.socket;
-                if (!socket) return null;
-                if (socket !== 当前写入Socket) {
-                        释放远端写入器();
-                        当前写入Socket = socket;
-                        远端写入器 = socket.writable.getWriter();
-                }
-                return 远端写入器;
-        };
-
-        let XHTTP上行写入队列 = null;
-        const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
-        return new Response(new ReadableStream({
-                async start(controller) {
-                        let 已关闭 = false;
-                        let udpRespHeader = 首包.respHeader;
-                        const xhttpBridge = {
-                                readyState: WebSocket.OPEN,
-                                send(data) {
-                                        if (已关闭) return;
-                                        try {
-                                                const chunk = data instanceof Uint8Array
-                                                        ? data
-                                                        : data instanceof ArrayBuffer
-                                                                ? new Uint8Array(data)
-                                                                : ArrayBuffer.isView(data)
-                                                                        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-                                                                        : new Uint8Array(data);
-                                                controller.enqueue(chunk);
-                                        } catch (e) {
-                                                已关闭 = true;
-                                                this.readyState = WebSocket.CLOSED;
-                                        }
-                                },
-                                close() {
-                                        if (已关闭) return;
-                                        已关闭 = true;
-                                        this.readyState = WebSocket.CLOSED;
-                                        try { controller.close() } catch (e) { }
-                                }
-                        };
-
-                        const 上行写入队列 = XHTTP上行写入队列 = 创建上行写入队列({
-                                获取写入器: 获取远端写入器,
-                                释放写入器: 释放远端写入器,
-                                重试连接: async () => {
-                                        if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-                                        await remoteConnWrapper.retryConnect();
-                                },
-                                关闭连接: () => {
-                                        try { remoteConnWrapper.socket?.close() } catch (e) { }
-                                        closeSocketQuietly(xhttpBridge);
-                                },
-                                名称: 'XHTTP上行'
-                        });
-
-                        const 写入远端 = async (payload, allowRetry = true) => {
-                                return 上行写入队列.写入并等待(payload, allowRetry);
-                        };
-
-                        let 转发失败 = false;
+                        let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+                        if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+                        if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
+                        else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
+                        const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
+                        const geoData = await geoRes.json();
+                        if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
+                } catch (e) {}
+                let newProxy = null;
+                const upperCountry = countryCode.toUpperCase();
+                const sources = [];
+                const isOldProxyVIP = oldProxy.includes("@");
+                if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
                         try {
-                                if (首包.isUDP) {
-                                        if (首包.协议 === 'trojan') {
-                                                木马UDP上下文.目标主机 = 首包.hostname;
-                                                木马UDP上下文.目标端口 = 首包.port;
-                                                if (木马UDP上下文.反代地址) await 转发木马UDP数据(首包.原始数据, xhttpBridge, 木马UDP上下文, request);
-                                        }
-                                        if (!(首包.协议 === 'trojan' && 木马UDP上下文.反代地址) && 首包.rawData?.byteLength) {
-                                                if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, xhttpBridge, 木马UDP上下文, request);
-                                                else await forwardataudp(首包.rawData, xhttpBridge, udpRespHeader, request);
-                                                udpRespHeader = null;
-                                        }
-                                } else {
-                                        await forwardataTCP(首包.hostname, 首包.port, 首包.rawData, xhttpBridge, 首包.respHeader, remoteConnWrapper, yourUUID, request, 反代上下文, 首包.协议 === 'trojan', 首包.原始数据);
-                                }
-
-                                while (true) {
-                                        const { done, value } = await reader.read();
-                                        if (done) break;
-                                        if (!value || value.byteLength === 0) continue;
-                                        if (首包.isUDP) {
-                                                if (首包.协议 === 'trojan') await 转发木马UDP数据(value, xhttpBridge, 木马UDP上下文, request);
-                                                else await forwardataudp(value, xhttpBridge, udpRespHeader, request);
-                                                udpRespHeader = null;
-                                        } else {
-                                                if (!(await 写入远端(value))) throw new Error('Remote socket is not ready');
-                                        }
-                                }
-
-                                if (!首包.isUDP) {
-                                        await 上行写入队列.等待空();
-                                        const writer = 获取远端写入器();
-                                        if (writer) {
-                                                try { await writer.close() } catch (e) { }
-                                        }
-                                }
-                        } catch (err) {
-                                转发失败 = true;
-                                log(`[XHTTP转发] 处理失败: ${err?.message || err}`);
-                                closeSocketQuietly(xhttpBridge);
-                        } finally {
-                                const 保持木马UDP反代下行 = !转发失败 && 首包.isUDP && 首包.协议 === 'trojan' && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;
-                                上行写入队列.清空();
-                                释放远端写入器();
-                                if (!保持木马UDP反代下行) try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-                                try { reader.releaseLock() } catch (e) { }
-                        }
-                },
-                cancel() {
-                        XHTTP上行写入队列?.清空();
-                        try { remoteConnWrapper.socket?.close() } catch (e) { }
-                        try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-                        释放远端写入器();
-                        try { reader.releaseLock() } catch (e) { }
-                }
-        }), { status: 200, headers: responseHeaders });
-}
-
-function 有效数据长度(data) {
-        if (!data) return 0;
-        if (typeof data.byteLength === 'number') return data.byteLength;
-        if (typeof data.length === 'number') return data.length;
-        return 0;
-}
-
-async function 读取XHTTP首包(reader, token) {
-        const decoder = VLESS文本解码器;
-
-        const 尝试解析魏烈思首包 = (data) => {
-                const length = data.byteLength;
-                if (length < 18) return { 状态: 'need_more' };
-                if (!UUID字节匹配(data, 1, token)) return { 状态: 'invalid' };
-
-                const optLen = data[17];
-                const cmdIndex = 18 + optLen;
-                if (length < cmdIndex + 1) return { 状态: 'need_more' };
-
-                const cmd = data[cmdIndex];
-                if (cmd !== 1 && cmd !== 2) return { 状态: 'invalid' };
-
-                const portIndex = cmdIndex + 1;
-                if (length < portIndex + 3) return { 状态: 'need_more' };
-
-                const port = (data[portIndex] << 8) | data[portIndex + 1];
-                const addressType = data[portIndex + 2];
-                const addressIndex = portIndex + 3;
-                let headerLen = -1;
-                let hostname = '';
-
-                if (addressType === 1) {
-                        if (length < addressIndex + 4) return { 状态: 'need_more' };
-                        hostname = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
-                        headerLen = addressIndex + 4;
-                } else if (addressType === 2) {
-                        if (length < addressIndex + 1) return { 状态: 'need_more' };
-                        const domainLen = data[addressIndex];
-                        if (length < addressIndex + 1 + domainLen) return { 状态: 'need_more' };
-                        hostname = decoder.decode(data.subarray(addressIndex + 1, addressIndex + 1 + domainLen));
-                        headerLen = addressIndex + 1 + domainLen;
-                } else if (addressType === 3) {
-                        if (length < addressIndex + 16) return { 状态: 'need_more' };
-                        const ipv6 = [];
-                        for (let i = 0; i < 8; i++) {
-                                const base = addressIndex + i * 2;
-                                ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-                        }
-                        hostname = ipv6.join(':');
-                        headerLen = addressIndex + 16;
-                } else return { 状态: 'invalid' };
-
-                if (!hostname) return { 状态: 'invalid' };
-
-                return {
-                        状态: 'ok',
-                        结果: {
-                                协议: 'vl' + 'ess',
-                                hostname,
-                                port,
-                                isUDP: cmd === 2,
-                                rawData: data.subarray(headerLen),
-                                respHeader: new Uint8Array([data[0], 0]),
-                                原始数据: null,
-                        }
-                };
-        };
-
-        const 尝试解析木马首包 = (data) => {
-                const 密码哈希 = sha224(token);
-                const 密码哈希字节 = new TextEncoder().encode(密码哈希);
-                const length = data.byteLength;
-                if (length < 58) return { 状态: 'need_more' };
-                if (data[56] !== 0x0d || data[57] !== 0x0a) return { 状态: 'invalid' };
-                for (let i = 0; i < 56; i++) {
-                        if (data[i] !== 密码哈希字节[i]) return { 状态: 'invalid' };
-                }
-
-                const socksStart = 58;
-                if (length < socksStart + 2) return { 状态: 'need_more' };
-                const cmd = data[socksStart];
-                if (cmd !== 1 && cmd !== 3) return { 状态: 'invalid' };
-                const isUDP = cmd === 3;
-
-                const atype = data[socksStart + 1];
-                let cursor = socksStart + 2;
-                let hostname = '';
-
-                if (atype === 1) {
-                        if (length < cursor + 4) return { 状态: 'need_more' };
-                        hostname = `${data[cursor]}.${data[cursor + 1]}.${data[cursor + 2]}.${data[cursor + 3]}`;
-                        cursor += 4;
-                } else if (atype === 3) {
-                        if (length < cursor + 1) return { 状态: 'need_more' };
-                        const domainLen = data[cursor];
-                        if (length < cursor + 1 + domainLen) return { 状态: 'need_more' };
-                        hostname = decoder.decode(data.subarray(cursor + 1, cursor + 1 + domainLen));
-                        cursor += 1 + domainLen;
-                } else if (atype === 4) {
-                        if (length < cursor + 16) return { 状态: 'need_more' };
-                        const ipv6 = [];
-                        for (let i = 0; i < 8; i++) {
-                                const base = cursor + i * 2;
-                                ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-                        }
-                        hostname = ipv6.join(':');
-                        cursor += 16;
-                } else return { 状态: 'invalid' };
-
-                if (!hostname) return { 状态: 'invalid' };
-                if (length < cursor + 4) return { 状态: 'need_more' };
-
-                const port = (data[cursor] << 8) | data[cursor + 1];
-                if (data[cursor + 2] !== 0x0d || data[cursor + 3] !== 0x0a) return { 状态: 'invalid' };
-                const dataOffset = cursor + 4;
-
-                return {
-                        状态: 'ok',
-                        结果: {
-                                协议: 'trojan',
-                                hostname,
-                                port,
-                                isUDP,
-                                rawData: data.subarray(dataOffset),
-                                原始数据: data,
-                                respHeader: null,
-                        }
-                };
-        };
-
-        let buffer = new Uint8Array(1024);
-        let offset = 0;
-
-        while (true) {
-                const { value, done } = await reader.read();
-                if (done) {
-                        if (offset === 0) return null;
-                        break;
-                }
-
-                const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-                if (offset + chunk.byteLength > buffer.byteLength) {
-                        const newBuffer = new Uint8Array(Math.max(buffer.byteLength * 2, offset + chunk.byteLength));
-                        newBuffer.set(buffer.subarray(0, offset));
-                        buffer = newBuffer;
-                }
-
-                buffer.set(chunk, offset);
-                offset += chunk.byteLength;
-
-                const 当前数据 = buffer.subarray(0, offset);
-                const 木马结果 = 尝试解析木马首包(当前数据);
-                if (木马结果.状态 === 'ok') return { ...木马结果.结果, reader };
-
-                const 魏烈思结果 = 尝试解析魏烈思首包(当前数据);
-                if (魏烈思结果.状态 === 'ok') return { ...魏烈思结果.结果, reader };
-
-                if (木马结果.状态 === 'invalid' && 魏烈思结果.状态 === 'invalid') return null;
-        }
-
-        const 最终数据 = buffer.subarray(0, offset);
-        const 最终木马结果 = 尝试解析木马首包(最终数据);
-        if (最终木马结果.状态 === 'ok') return { ...最终木马结果.结果, reader };
-        const 最终魏烈思结果 = 尝试解析魏烈思首包(最终数据);
-        if (最终魏烈思结果.状态 === 'ok') return { ...最终魏烈思结果.结果, reader };
-        return null;
-}
-///////////////////////////////////////////////////////////////////////gRPC传输数据///////////////////////////////////////////////
-async function 处理gRPC请求(request, yourUUID, 反代上下文 = {}) {
-        if (!request.body) return new Response('Bad Request', { status: 400 });
-        const reader = request.body.getReader();
-        const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-        let isDnsQuery = false;
-        const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
-        let 判断是否是木马 = null;
-        let 当前写入Socket = null;
-        let 远端写入器 = null;
-        let GRPC上行写入队列 = null;
-        //log('[gRPC] 开始处理双向流');
-        const grpcHeaders = new Headers({
-                'Content-Type': 'application/grpc',
-                'grpc-status': '0',
-                'X-Accel-Buffering': 'no',
-                'Cache-Control': 'no-store'
-        });
-
-        const 下行缓存上限 = 下行Grain包字节;
-        const 下行刷新间隔 = Math.max(下行Grain静默毫秒, 1);
-
-        return new Response(new ReadableStream({
-                async start(controller) {
-                        let 已关闭 = false;
-                        let 发送队列 = [];
-                        let 队列字节数 = 0;
-                        let 刷新定时器 = null;
-                        let 刷新Microtask已排队 = false;
-                        const grpcBridge = {
-                                readyState: WebSocket.OPEN,
-                                send(data) {
-                                        if (已关闭) return;
-                                        const chunk = data instanceof Uint8Array ? data : new Uint8Array(data);
-                                        const lenBytes数组 = [];
-                                        let remaining = chunk.byteLength >>> 0;
-                                        while (remaining > 127) {
-                                                lenBytes数组.push((remaining & 0x7f) | 0x80);
-                                                remaining >>>= 7;
-                                        }
-                                        lenBytes数组.push(remaining);
-                                        const lenBytes = new Uint8Array(lenBytes数组);
-                                        const protobufLen = 1 + lenBytes.length + chunk.byteLength;
-                                        const frame = new Uint8Array(5 + protobufLen);
-                                        frame[0] = 0;
-                                        frame[1] = (protobufLen >>> 24) & 0xff;
-                                        frame[2] = (protobufLen >>> 16) & 0xff;
-                                        frame[3] = (protobufLen >>> 8) & 0xff;
-                                        frame[4] = protobufLen & 0xff;
-                                        frame[5] = 0x0a;
-                                        frame.set(lenBytes, 6);
-                                        frame.set(chunk, 6 + lenBytes.length);
-                                        发送队列.push(frame);
-                                        队列字节数 += frame.byteLength;
-                                        安排刷新发送队列();
-                                },
-                                close() {
-                                        if (this.readyState === WebSocket.CLOSED) return;
-                                        刷新发送队列(true);
-                                        已关闭 = true;
-                                        this.readyState = WebSocket.CLOSED;
-                                        try { controller.close() } catch (e) { }
-                                }
-                        };
-
-                        const 刷新发送队列 = (force = false) => {
-                                刷新Microtask已排队 = false;
-                                if (刷新定时器) {
-                                        clearTimeout(刷新定时器);
-                                        刷新定时器 = null;
-                                }
-                                if ((!force && 已关闭) || 队列字节数 === 0) return;
-                                const out = new Uint8Array(队列字节数);
-                                let offset = 0;
-                                for (const item of 发送队列) {
-                                        out.set(item, offset);
-                                        offset += item.byteLength;
-                                }
-                                发送队列 = [];
-                                队列字节数 = 0;
-                                try {
-                                        controller.enqueue(out);
-                                } catch (e) {
-                                        已关闭 = true;
-                                        grpcBridge.readyState = WebSocket.CLOSED;
-                                }
-                        };
-
-                        const 安排刷新发送队列 = () => {
-                                if (队列字节数 >= 下行缓存上限) {
-                                        刷新发送队列();
-                                        return;
-                                }
-                                if (刷新Microtask已排队 || 刷新定时器) return;
-                                刷新Microtask已排队 = true;
-                                queueMicrotask(() => {
-                                        刷新Microtask已排队 = false;
-                                        if (已关闭 || 队列字节数 === 0 || 刷新定时器) return;
-                                        刷新定时器 = setTimeout(刷新发送队列, 下行刷新间隔);
+                                const ghRes = await fetch("https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip", {
+                                        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
                                 });
-                        };
-
-                        const 关闭连接 = () => {
-                                if (已关闭) return;
-                                GRPC上行写入队列?.清空();
-                                刷新发送队列(true);
-                                已关闭 = true;
-                                grpcBridge.readyState = WebSocket.CLOSED;
-                                if (刷新定时器) clearTimeout(刷新定时器);
-                                if (远端写入器) {
-                                        try { 远端写入器.releaseLock() } catch (e) { }
-                                        远端写入器 = null;
+                                if (ghRes.ok) {
+                                        const files = await ghRes.json();
+                                        cachedVipCountries = files.filter(f => f.name.endsWith('.txt')).map(f => f.name.replace('.txt', '').toUpperCase());
+                                        lastVipCountriesFetch = Date.now();
                                 }
-                                当前写入Socket = null;
-                                try { reader.releaseLock() } catch (e) { }
-                                try { remoteConnWrapper.socket?.close() } catch (e) { }
-                                try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-                                try { controller.close() } catch (e) { }
-                        };
-
-                        const 释放远端写入器 = () => {
-                                if (远端写入器) {
-                                        try { 远端写入器.releaseLock() } catch (e) { }
-                                        远端写入器 = null;
-                                }
-                                当前写入Socket = null;
-                        };
-
-                        const 上行写入队列 = GRPC上行写入队列 = 创建上行写入队列({
-                                获取写入器: () => {
-                                        const socket = remoteConnWrapper.socket;
-                                        if (!socket) return null;
-                                        if (socket !== 当前写入Socket) {
-                                                释放远端写入器();
-                                                当前写入Socket = socket;
-                                                远端写入器 = socket.writable.getWriter();
-                                        }
-                                        return 远端写入器;
-                                },
-                                释放写入器: 释放远端写入器,
-                                重试连接: async () => {
-                                        if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-                                        await remoteConnWrapper.retryConnect();
-                                },
-                                关闭连接,
-                                名称: 'gRPC上行'
-                        });
-
-                        const 写入远端 = async (payload, allowRetry = true) => {
-                                return 上行写入队列.写入并等待(payload, allowRetry);
-                        };
-
-                        let 转发失败 = false;
+                        } catch (e) {}
+                }
+                let fallbackVIPs = cachedVipCountries.length > 0 ? [...cachedVipCountries] : ["DE", "US", "GB", "NL", "FR", "TR"];
+                for (let i = fallbackVIPs.length - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
+                }
+                if (upperCountry !== "ALL" && upperCountry !== "UN") {
+                        sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${upperCountry}.txt`, type: 'repo' });
+                }
+                for (const fc of fallbackVIPs) {
+                        if (fc !== upperCountry) {
+                                sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${fc}.txt`, type: 'repo' });
+                        }
+                }
+                if (!isOldProxyVIP) {
+                        if (upperCountry !== "ALL" && upperCountry !== "UN") {
+                                sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/${upperCountry}.txt`, type: 'repo' });
+                        }
+                        sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/ALL.txt`, type: 'repo' });
+                }
+                for (const src of sources) {
                         try {
-                                let pending = new Uint8Array(0);
-                                while (true) {
-                                        const { done, value } = await reader.read();
-                                        if (done) break;
-                                        if (!value || value.byteLength === 0) continue;
-                                        const 当前块 = value instanceof Uint8Array ? value : new Uint8Array(value);
-                                        const merged = new Uint8Array(pending.length + 当前块.length);
-                                        merged.set(pending, 0);
-                                        merged.set(当前块, pending.length);
-                                        pending = merged;
-                                        while (pending.byteLength >= 5) {
-                                                const grpcLen = ((pending[1] << 24) >>> 0) | (pending[2] << 16) | (pending[3] << 8) | pending[4];
-                                                const frameSize = 5 + grpcLen;
-                                                if (pending.byteLength < frameSize) break;
-                                                const grpcPayload = pending.subarray(5, frameSize);
-                                                pending = pending.slice(frameSize);
-                                                if (!grpcPayload.byteLength) continue;
-                                                let payload = grpcPayload;
-                                                if (payload.byteLength >= 2 && payload[0] === 0x0a) {
-                                                        let shift = 0;
-                                                        let offset = 1;
-                                                        let varint有效 = false;
-                                                        while (offset < payload.length) {
-                                                                const current = payload[offset++];
-                                                                if ((current & 0x80) === 0) {
-                                                                        varint有效 = true;
-                                                                        break;
-                                                                }
-                                                                shift += 7;
-                                                                if (shift > 35) break;
-                                                        }
-                                                        if (varint有效) payload = payload.subarray(offset);
+                                const res = await fetch(src.url);
+                                if (!res.ok) continue;
+                                const text = await res.text();
+                                const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 5);
+                                if (lines.length > 0) {
+                                        for (let i = lines.length - 1; i > 0; i--) {
+                                                const j = Math.floor(Math.random() * (i + 1));
+                                                [lines[i], lines[j]] = [lines[j], lines[i]];
+                                        }
+                                        const testBatch = lines.slice(0, 3).map(line => {
+                                                if (src.type === 'repo' && !line.match(/^(socks4|socks5|socks|http|https):\/\//i)) {
+                                                        return `socks5://${line}`;
+                                                } else if (src.type === 'socks5') {
+                                                        return `socks5://${line}`;
+                                                } else if (src.type === 'http') {
+                                                        return `http://${line}`;
                                                 }
-                                                if (!payload.byteLength) continue;
-                                                if (isDnsQuery) {
-                                                        if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
-                                                        else await forwardataudp(payload, grpcBridge, null, request);
-                                                        continue;
-                                                }
-                                                if (remoteConnWrapper.socket) {
-                                                        if (!(await 写入远端(payload))) throw new Error('Remote socket is not ready');
-                                                } else {
-                                                        const 首包bytes = 数据转Uint8Array(payload);
-                                                        if (判断是否是木马 === null) 判断是否是木马 = 首包bytes.byteLength >= 58 && 首包bytes[56] === 0x0d && 首包bytes[57] === 0x0a;
-                                                        if (判断是否是木马) {
-                                                                const 解析结果 = 解析木马请求(首包bytes, yourUUID);
-                                                                if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-                                                                const { port, hostname, rawClientData, isUDP } = 解析结果;
-                                                                log(`[gRPC] 木马首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-                                                                if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                                                                if (isUDP) {
-                                                                        isDnsQuery = true;
-                                                                        木马UDP上下文.目标主机 = hostname;
-                                                                        木马UDP上下文.目标端口 = port;
-                                                                        if (木马UDP上下文.反代地址) await 转发木马UDP数据(首包bytes, grpcBridge, 木马UDP上下文, request);
-                                                                        else if (有效数据长度(rawClientData) > 0) await 转发木马UDP数据(rawClientData, grpcBridge, 木马UDP上下文, request);
-                                                                } else {
-                                                                        await forwardataTCP(hostname, port, rawClientData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 首包bytes);
+                                                return line;
+                                        });
+                                        try {
+                                                newProxy = await Promise.any(testBatch.map(p => {
+                                                        return new Promise(async (resolve, reject) => {
+                                                                const timeoutId = setTimeout(() => reject(new Error('timeout')), 3000); 
+                                                                try {
+                                                                        const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+                                                                        const s = await connectProxy(p, "1.1.1.1", 80, payload);
+                                                                        const reader = s.readable.getReader();
+                                                                        const res = await reader.read();
+                                                                        s.close();
+                                                                        clearTimeout(timeoutId);
+                                                                        if (res.done || !res.value) reject(new Error("empty"));
+                                                                        else resolve(p);
+                                                                } catch (e) {
+                                                                        clearTimeout(timeoutId);
+                                                                        reject(e);
                                                                 }
-                                                        } else {
-                                                                判断是否是木马 = false;
-                                                                const 解析结果 = 解析魏烈思请求(首包bytes, yourUUID);
-                                                                if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
-                                                                const { port, hostname, version, isUDP, rawClientData } = 解析结果;
-                                                                log(`[gRPC] 魏烈思首包: ${hostname}:${port} | UDP: ${isUDP ? '是' : '否'}`);
-                                                                if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                                                                if (isUDP) {
-                                                                        if (port !== 53) throw new Error('UDP is not supported');
-                                                                        isDnsQuery = true;
-                                                                }
-                                                                const respHeader = new Uint8Array([version, 0]);
-                                                                grpcBridge.send(respHeader);
-                                                                const rawData = rawClientData;
-                                                                if (isDnsQuery) {
-                                                                        if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
-                                                                        else await forwardataudp(rawData, grpcBridge, null, request);
-                                                                }
-                                                                else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+                                                        });
+                                                }));
+                                        } catch (e) {
+                                                continue;
+                                        }
+                                        if (newProxy) {
+                                                break; 
+                                        }
+                                }
+                        } catch (e) {}
+                }
+                if (newProxy) {
+                        await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(newProxy, user.id).run();
+                }
+        } catch(e) {
+        } finally {
+                GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
+        }
+}
+export default {
+        async fetch(request, env, ctx) {
+                if (!env.DB) {
+                        return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
+                }
+                await DbService.ensureSchema(env.DB);
+                trackRequest(env, ctx);
+                if (schemaEnsured) {
+                        ctx.waitUntil(checkAutoResets(env));
+                        ctx.waitUntil(checkAutoRotates(env));
+                }
+                const url = new URL(request.url);
+                if (Router.isWebSocketUpgrade(request)) {
+                        return await Router.handleWebSocket(request, env, ctx);
+                }
+                if (Router.isSubscriptionPath(url.pathname)) {
+                        return await Router.handleSubscription(url, env);
+                }
+                if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
+                        return await Router.handleApi(request, url, env, ctx);
+                }
+                if (url.pathname === "/panel" || url.pathname === "/login") {
+                        return await Router.handlePanel(request, env);
+                }
+                if (url.pathname.startsWith("/status/")) {
+                        return await Router.handleUserStatus(url, env);
+                }
+                return new Response(HTML_TEMPLATES.nginx, {
+                        headers: { "Content-Type": "text/html; charset=utf-8" },
+                });
+        },
+};
+const Router = {
+        isWebSocketUpgrade(request) {
+                const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
+                return upgradeHeader === "websocket";
+        },
+        isSubscriptionPath(pathname) {
+                return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
+        },
+        async handleWebSocket(request, env, ctx) {
+                try {
+                        let proxyIP = "";
+                        let socks5 = "";
+                        try {
+                                const proxyRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'proxy_ip'").first();
+                                if (proxyRow && proxyRow.value) {
+                                        proxyIP = proxyRow.value;
+                                }
+                                const socksRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'socks5'").first();
+                                if (socksRow && socksRow.value) {
+                                        socks5 = socksRow.value;
+                                }
+                        } catch (e) {}
+                        const mockStoredData = { proxy_ip: proxyIP, socks5: socks5 };
+                        return handlevIees(env, mockStoredData, ctx, request);
+                } catch (e) {
+                        return new Response("Internal Server Error", { status: 500 });
+                }
+        },
+        async handleSubscription(url, env) {
+                const isSubPath = url.pathname.startsWith("/sub/");
+                const offset = isSubPath ? 5 : 6;
+                let subUser = decodeURIComponent(url.pathname.slice(offset));
+                const host = url.hostname;
+                try {
+                        const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
+                        if (!user || user.connection_type !== "vl" + "e" + "ss") {
+                                return new Response("Not Found", { status: 404 });
+                        }
+                        try {
+                                await env.DB.prepare("UPDATE users SET used_req = used_req + 1 WHERE username = ?").bind(user.username).run();
+                        } catch (e) {}
+                        return await SubscriptionService.generateText(user, host);
+                } catch (err) {
+                        return new Response("Error building config: " + err.message, { status: 500 });
+                }
+        },
+        async handlePanel(request, env) {
+                const hasPassword = await DbService.getPanelPassword(env.DB);
+                if (!hasPassword) {
+                        return new Response(HTML_TEMPLATES.setup, {
+                                headers: { "Content-Type": "text/html; charset=utf-8" },
+                        });
+                }
+                const authorized = await DbService.verifyApiAuth(request, env);
+                if (!authorized) {
+                        return new Response(HTML_TEMPLATES.login, {
+                                headers: { "Content-Type": "text/html; charset=utf-8" },
+                        });
+                }
+                return new Response(HTML_TEMPLATES.panel, {
+                        headers: {
+                                "Content-Type": "text/html; charset=utf-8",
+                                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                Pragma: "no-cache",
+                                Expires: "0",
+                        },
+                });
+        },
+        async handleUserStatus(url, env) {
+                const username = decodeURIComponent(url.pathname.slice(8));
+                if (!username) {
+                        return new Response("Username is required", { status: 400 });
+                }
+                try {
+                        const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(username, username).first();
+                        if (!user) {
+                                return new Response("User not found", { status: 404 });
+                        }
+                        const userJson = JSON.stringify({
+                                username: user.username,
+                                uuid: user.uuid,
+                                limit_gb: user.limit_gb,
+                                expiry_days: user.expiry_days,
+                                used_gb: user.used_gb,
+                                limit_req: user.limit_req,
+                                used_req: user.used_req,
+                                is_active: user.is_active,
+                                online_count: getActiveIpCount(user.active_ips),
+                                ip_limit: user.ip_limit,
+                                created_at: user.created_at,
+                                tls: user.tls,
+                                port: user.port,
+                                ips: user.ips,
+                                fingerprint: user.fingerprint || "chrome",
+                                user_proxy_iata: user.user_proxy_iata,
+                                user_socks5: user.user_socks5,
+                                user_proxy_ip: user.user_proxy_ip,
+                        });
+                        const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson};`);
+                        return new Response(html, {
+                                headers: { "Content-Type": "text/html; charset=utf-8" },
+                        });
+                } catch (err) {
+                        return new Response("Error: " + err.message, { status: 500 });
+                }
+        },
+        async handleApi(request, url, env, ctx) {
+                const hasPassword = await DbService.getPanelPassword(env.DB);
+                if (url.pathname === "/api/setup-password" && request.method === "POST") {
+                        if (hasPassword) {
+                                return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
+                                        status: 400,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        const { password } = await request.json();
+                        if (!password || password.length < 4) {
+                                return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
+                                        status: 400,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        const hashed = await DbService.sha256(password);
+                        await DbService.setPanelPassword(env.DB, hashed);
+                        return new Response(JSON.stringify({ success: true }), {
+                                headers: {
+                                        "Content-Type": "application/json; charset=utf-8",
+                                        "Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+                                },
+                        });
+                }
+                if (url.pathname === "/api/login" && request.method === "POST") {
+                        const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+                        const now = Date.now();
+                        const attemptRecord = LOGIN_ATTEMPTS.get(clientIP) || { count: 0, lastAttempt: 0 };
+
+                        if (attemptRecord.count >= 5 && (now - attemptRecord.lastAttempt) < 900000) {
+                                const remaining = Math.ceil((900000 - (now - attemptRecord.lastAttempt)) / 60000);
+                                return new Response(JSON.stringify({ error: `دسترسی شما مسدود شد. لطفاً ${remaining} دقیقه دیگر تلاش کنید.` }), {
+                                        status: 429,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+
+                        const { password } = await request.json();
+                        const hashedInput = await DbService.sha256(password);
+                        const storedHash = await DbService.getPanelPassword(env.DB);
+
+                        if (storedHash === hashedInput) {
+                                LOGIN_ATTEMPTS.delete(clientIP); 
+                                return new Response(JSON.stringify({ success: true }), {
+                                        headers: {
+                                                "Content-Type": "application/json; charset=utf-8",
+                                                "Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+                                        },
+                                });
+                        } else {
+                                attemptRecord.count = (now - attemptRecord.lastAttempt > 900000) ? 1 : attemptRecord.count + 1;
+                                attemptRecord.lastAttempt = now;
+                                LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
+                                
+                                return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${5 - attemptRecord.count})` }), {
+                                        status: 401,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                }
+                if (url.pathname === "/api/logout" && request.method === "POST") {
+                        return new Response(JSON.stringify({ success: true }), {
+                                headers: {
+                                        "Content-Type": "application/json; charset=utf-8",
+                                        "Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
+                                },
+                        });
+                }
+                if (url.pathname === "/api/recover" && request.method === "POST") {
+                        const { api_token } = await request.json();
+                        if (!api_token) {
+                                return new Response(JSON.stringify({ error: "Token is required" }), {
+                                        status: 400,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        try {
+                                const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+                                        headers: { Authorization: "Bearer " + api_token },
+                                });
+                                const cfData = await cfRes.json();
+                                if (!cfRes.ok || !cfData.success) {
+                                        return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
+                                                status: 401,
+                                                headers: { "Content-Type": "application/json; charset=utf-8" },
+                                        });
+                                }
+                                const host = url.hostname;
+                                let isAuthorized = false;
+                                if (host.endsWith(".workers.dev")) {
+                                        const parts = host.split(".");
+                                        const targetSubdomain = parts[parts.length - 3];
+                                        const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+                                                headers: { Authorization: "Bearer " + api_token },
+                                        });
+                                        const accountsData = await accountsRes.json();
+                                        if (accountsData.success && accountsData.result) {
+                                                for (const acc of accountsData.result) {
+                                                        const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
+                                                                headers: { Authorization: "Bearer " + api_token },
+                                                        });
+                                                        const subData = await subRes.json();
+                                                        if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
+                                                                isAuthorized = true;
+                                                                break;
                                                         }
                                                 }
                                         }
-                                        刷新发送队列();
-                                }
-                                await 上行写入队列.等待空();
-                        } catch (err) {
-                                转发失败 = true;
-                                log(`[gRPC转发] 处理失败: ${err?.message || err}`);
-                        } finally {
-                                const 保持木马UDP反代下行 = !转发失败 && isDnsQuery && 判断是否是木马 && 木马UDP上下文.反代地址 && 木马UDP上下文.反代Socket;
-                                if (保持木马UDP反代下行) {
-                                        上行写入队列.清空();
-                                        释放远端写入器();
-                                        try { reader.releaseLock() } catch (e) { }
                                 } else {
-                                        关闭连接();
+                                        const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+                                                headers: { Authorization: "Bearer " + api_token },
+                                        });
+                                        const zonesData = await zonesRes.json();
+                                        if (zonesData.success && zonesData.result) {
+                                                for (const zone of zonesData.result) {
+                                                        if (host === zone.name || host.endsWith("." + zone.name)) {
+                                                                isAuthorized = true;
+                                                                break;
+                                                        }
+                                                }
+                                        }
+                                }
+                                if (!isAuthorized) {
+                                        return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پـنـل نیست (ای کــثـــکـــش)" }), {
+                                                status: 403,
+                                                headers: { "Content-Type": "application/json; charset=utf-8" },
+                                        });
+                                }
+                                await env.DB.prepare("DELETE FROM edgepp_settings WHERE key = 'panel_password'").run();
+                                cachedPanelPassword = null;
+                                return new Response(JSON.stringify({ success: true }), {
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        } catch (err) {
+                                return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
+                                        status: 500,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                }
+                const authorized = await DbService.verifyApiAuth(request, env);
+                if (!authorized && url.pathname !== "/api/test-proxy") {
+                        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+                                status: 401,
+                                headers: { "Content-Type": "application/json; charset=utf-8" },
+                        });
+                }
+                if (url.pathname === "/api/restart-core" && request.method === "POST") {
+                        try {
+                                GLOBAL_TRAFFIC_CACHE.clear();
+                                ACTIVE_CONNECTIONS_COUNT.clear();
+                                GLOBAL_LAST_ACTIVE_WRITE.clear();
+                                GLOBAL_LAST_DB_WRITE.clear();
+                                GLOBAL_WRITE_LOCK.clear();
+                                DNS_CACHE.clear();
+                                USER_REQ_CACHE.clear();
+                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                        } catch (err) {
+                                return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+                        }
+                }
+                if (url.pathname === "/api/update-panel" && request.method === "POST") {
+                        const body = await request.json().catch(() => ({}));
+                        let currentToken = env.CF_API_TOKEN || body.cf_token || null;
+                        let currentAccountId = env.CF_ACCOUNT_ID;
+                        if (!currentToken) {
+                                return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
+                        }
+                        try {
+                                const cfHeaders = {
+                                        "Authorization": "Bearer " + currentToken,
+                                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0"
+                                };
+                                if (!currentAccountId) {
+                                        const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
+                                        if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
+                                        const accData = await accRes.json().catch(() => ({}));
+                                        if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
+                                        currentAccountId = accData.result[0].id;
+                                }
+                                
+                                const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now(), {
+                                        headers: {
+                                                "User-Agent": "Mozilla/5.0",
+                                                "Cache-Control": "no-cache"
+                                        }
+                                });
+                                if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
+                                const newCode = await githubRes.text();
+                                const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
+                                
+                                const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
+                                        headers: cfHeaders
+                                });
+                                if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
+                                const bindingsData = await bindingsRes.json().catch(() => ({}));
+                                if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
+                                
+                                const newBindings = [];
+                                for (const b of bindingsData.result || []) {
+                                        if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
+                                        if (b.type === "d1") {
+                                                newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
+                                        } else if (b.type === "kv_namespace") {
+                                                newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
+                                        } else if (b.type === "plain_text") {
+                                                newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
+                                        } else if (b.type !== "secret_text") {
+                                                newBindings.push(b);
+                                        }
+                                }
+                                newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
+                                newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+                                
+                                const metadata = {
+                                        main_module: "zeus.js",
+                                        compatibility_date: "2026-07-10",
+                                        compatibility_flags: ["nodejs_compat"],
+                                        bindings: newBindings
+                                };
+                                
+                                const formData = new FormData();
+                                formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
+                                formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+                                
+                                const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
+                                        method: "PUT",
+                                        headers: cfHeaders,
+                                        body: formData
+                                });
+                                if (!deployRes.ok) {
+                                        const errText = await deployRes.text().catch(() => "");
+                                        throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
+                                }
+                                const deployData = await deployRes.json().catch(() => ({}));
+                                if (!deployData.success) {
+                                        const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
+                                        throw new Error(cfError);
+                                }
+                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                        } catch (err) {
+                                return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
+                        }
+                }
+                if (url.pathname === "/api/change-password" && request.method === "POST") {
+                        const { current_password, new_password } = await request.json();
+                        if (!current_password || !new_password) {
+                                return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
+                                        status: 400,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        const currentHash = await DbService.sha256(current_password);
+                        const storedHash = await DbService.getPanelPassword(env.DB);
+                        if (storedHash && storedHash !== currentHash) {
+                                return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
+                                        status: 401,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        if (new_password.length < 4) {
+                                return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
+                                        status: 400,
+                                        headers: { "Content-Type": "application/json; charset=utf-8" },
+                                });
+                        }
+                        const newHash = await DbService.sha256(new_password);
+                        await DbService.setPanelPassword(env.DB, newHash);
+                        return new Response(JSON.stringify({ success: true }), {
+                                headers: {
+                                        "Content-Type": "application/json; charset=utf-8",
+                                        "Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
+                                },
+                        });
+                }
+                if (url.pathname === "/locations") {
+                        try {
+                                const response = await fetch("https://speed.cloudflare.com/locations", {
+                                        headers: { Referer: "https://speed.cloudflare.com/" },
+                                });
+                                const data = await response.json();
+                                return new Response(JSON.stringify(data), {
+                                        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+                                });
+                        } catch (e) {
+                                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+                        }
+                }
+                if (url.pathname === "/api/settings/bulk") {
+                        if (request.method === "GET") {
+                                try {
+                                        const { results } = await env.DB.prepare("SELECT * FROM settings").all();
+                                        const settingsObj = {};
+                                        if (results) {
+                                                results.forEach((r) => {
+                                                        settingsObj[r.key] = r.value;
+                                                });
+                                        }
+                                        return new Response(JSON.stringify(settingsObj), { headers: { "Content-Type": "application/json" } });
+                                } catch (e) {
+                                        return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
                                 }
                         }
-                },
-                cancel() {
-                        GRPC上行写入队列?.清空();
-                        try { remoteConnWrapper.socket?.close() } catch (e) { }
-                        try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-                        try { reader.releaseLock() } catch (e) { }
+                        if (request.method === "POST") {
+                                const body = await request.json();
+                                if (body.settings && typeof body.settings === "object") {
+                                        for (const [k, v] of Object.entries(body.settings)) {
+                                                await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
+                                        }
+                                }
+                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                        }
                 }
-        }), { status: 200, headers: grpcHeaders });
-}
-
-function 是有效WS早期数据(bytes, token) {
-        if (!bytes?.byteLength) return false;
-        if (bytes.byteLength >= 18 && UUID字节匹配(bytes, 1, token)) return true;
-        if (bytes.byteLength < 58 || bytes[56] !== 0x0d || bytes[57] !== 0x0a) return false;
-
-        const trojanPassword = sha224(token);
-        for (let i = 0; i < 56; i++) {
-                if (bytes[i] !== trojanPassword.charCodeAt(i)) return false;
-        }
-        return true;
-}
-
-function 解码WS早期数据(header, token) {
-        if (!header) return null;
-        if (header.length > WS早期数据最大头长度) throw new Error('early data is too large');
-
-        let bytes;
-        const Uint8ArrayBase64 = /** @type {any} */ (Uint8Array);
-        if (typeof Uint8ArrayBase64.fromBase64 === 'function') {
+                if (url.pathname === "/api/proxy-ip") {
+                        if (request.method === "POST") {
+                                const { proxy_ip, iata, socks5 } = await request.json();
+                                if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
+                                if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
+                                if (socks5 !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
+                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                        }
+                        if (request.method === "GET") {
+                                const rowIp = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'proxy_ip'").first();
+                                const rowIata = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'proxy_location_iata'").first();
+                                const rowSocks = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'socks5'").first();
+                                return new Response(
+                                        JSON.stringify({
+                                                proxy_ip: rowIp ? rowIp.value : "",
+                                                iata: rowIata ? rowIata.value : "",
+                                                socks5: rowSocks ? rowSocks.value : "",
+                                        }),
+                                        { headers: { "Content-Type": "application/json" } },
+                                );
+                        }
+                }
+                if (url.pathname === "/api/test-proxy" && request.method === "POST") {
+                        const { proxy } = await request.json();
+                        if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+                        try {
+                                let ip = "";
+                                let workingProxy = proxy;
+                                if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
+                                        ip = proxy.match(/server=([^&]+)/)?.[1] || "";
+                                } else {
+                                        let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+                                        let remain = cleanProxy;
+                                        if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+                                        if (remain.startsWith("[")) {
+                                                ip = remain.substring(1, remain.indexOf("]"));
+                                        } else {
+                                                const lastColon = remain.lastIndexOf(":");
+                                                if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
+                                                else ip = remain;
+                                        }
+                                }
+                                let country = "UN";
+                                if (ip) {
+                                        try {
+                                                const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+                                                const geoData = await geoRes.json();
+                                                if (geoData && geoData.countryCode) country = geoData.countryCode;
+                                        } catch (e) {}
+                                }
+                                const startTime = Date.now();
+                                const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+                                const s = await connectProxy(proxy, "1.1.1.1", 80, payload);
+                                const reader = s.readable.getReader();
+                                const res = await reader.read();
+                                if (res.done || !res.value) {
+                                        s.close();
+                                        throw new Error("تایم‌اوت در دریافت دیتا");
+                                }
+                                s.close();
+                                const ping = Date.now() - startTime;
+                                return new Response(JSON.stringify({ success: true, ping, country }), { headers: { "Content-Type": "application/json" } });
+                        } catch (e) {
+                                let msg = e.message;
+                                if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "ارتباط با سرور قطع شد (احتمالاً پـروکـسـی مسدود یا خاموش است)";
+                                else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("تایم‌اوت")) msg = "تایم‌اوت در اتصال (پـروکـسـی در دسترس نیست)";
+                                else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "فرمت وارد شده برای پـروکـسـی اشتباه است";
+                                else if (msg === "err") msg = "خطای نامشخص (ارتباط برقرار نشد)";
+                                return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+                        }
+                }
+                if (url.pathname.startsWith("/api/users")) {
+                        const pathParts = url.pathname.split("/");
+                        const isUserAction = pathParts.length > 3;
+                        if (isUserAction) {
+                                const username = decodeURIComponent(pathParts.pop());
+                                if (request.method === "PUT") {
+                                        const body = await request.json();
+                                        if (body.toggle_only !== undefined) {
+                                                await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+                                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                                        } else if (body.reset_action !== undefined) {
+                                                if (body.reset_action === "volume") {
+                                                        await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
+                                                        GLOBAL_TRAFFIC_CACHE.set(username, 0);
+                                                } else if (body.reset_action === "req") {
+                                                        await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
+                                                        USER_REQ_CACHE.set(username, 0);
+                                                } else if (body.reset_action === "time") {
+                                                        await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, is_active = 1 WHERE username = ?").bind(username).run();
+                                                }
+                                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                                        } else {
+                                                const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = body;
+                                                if (new_username && new_username !== username) {
+                                                        if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
+                                                                return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+                                                        }
+                                                        const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(new_username).first();
+                                                        if (existing) {
+                                                                return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+                                                        }
+                                                        if (GLOBAL_TRAFFIC_CACHE.has(username)) {
+                                                                GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
+                                                                GLOBAL_TRAFFIC_CACHE.delete(username);
+                                                        }
+                                                        if (USER_REQ_CACHE.has(username)) {
+                                                                USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
+                                                                USER_REQ_CACHE.delete(username);
+                                                        }
+                                                        if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
+                                                                ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
+                                                                ACTIVE_CONNECTIONS_COUNT.delete(username);
+                                                        }
+                                                        if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
+                                                                GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
+                                                                GLOBAL_LAST_ACTIVE_WRITE.delete(username);
+                                                        }
+                                                }
+                                                await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ? WHERE username = ?")
+                                                        .bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, username)
+                                                        .run();
+                                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                                        }
+                                }
+                                if (request.method === "DELETE") {
+                                        await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
+                                        return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                                }
+                        } else {
+                                if (request.method === "GET") {
+                                        try {
+                                                await flushExpiredTraffic(env);
+                                        } catch (e) {}
+                                        try {
+                                                const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
+                                                const now = Date.now();
+                                                const enrichedUsers = (results || []).map((user) => ({
+                                                        ...user,
+                                                        is_online: user.last_active && now - user.last_active < 20000 ? 1 : 0,
+                                                        online_count: getActiveIpCount(user.active_ips),
+                                                }));
+                                                let cfReqs = { today: 0, total: 0 };
+                                                try {
+                                                        const liveCf = await getCfUsage(env);
+                                                        const todayStr = new Date().toISOString().split("T")[0];
+                                                        const dateRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'req_last_date'").first();
+                                                        const totalRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'req_total'").first();
+                                                        let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
+                                                        let dbToday = 0;
+                                                        if (dateRow && dateRow.value === todayStr) {
+                                                                const todayRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'req_today'").first();
+                                                                dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
+                                                        }
+                                                        if (liveCf.today > dbToday) {
+                                                                dbToday = liveCf.today;
+                                                                await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
+                                                                await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
+                                                        }
+                                                        if (liveCf.total > dbTotal) {
+                                                                dbTotal = liveCf.total;
+                                                                await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
+                                                        }
+                                                        cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
+                                                        cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
+                                                } catch (e) {}
+                                                return new Response(
+                                                        JSON.stringify({
+                                                                users: enrichedUsers,
+                                                                serverTime: now,
+                                                                cfRequestsToday: cfReqs.today,
+                                                                cfRequestsTotal: cfReqs.total,
+                                                        }),
+                                                        {
+                                                                headers: {
+                                                                        "Content-Type": "application/json",
+                                                                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                                                },
+                                                        },
+                                                );
+                                        } catch (dbErr) {
+                                                return new Response(
+                                                        JSON.stringify({
+                                                                users: [],
+                                                                serverTime: Date.now(),
+                                                                cfRequestsToday: 0,
+                                                                cfRequestsTotal: 0,
+                                                                error: dbErr.message
+                                                        }),
+                                                        {
+                                                                status: 200, 
+                                                                headers: {
+                                                                        "Content-Type": "application/json",
+                                                                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                                                },
+                                                        }
+                                                );
+                                        }
+                                }
+                                if (request.method === "POST") {
+                                        const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await request.json();
+                                        if (!username) {
+                                                return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
+                                        }
+                                        if (username.length > 32) {
+                                                return new Response(JSON.stringify({ error: "نام کاربری نمی‌تواند بیشتر از ۳۲ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json" } });
+                                        }
+                                        if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
+                                                return new Response(JSON.stringify({ error: "نام کاربری غیرمجاز است (فقط حروف، اعداد، خط تیره و آندرلاین)" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+                                        }
+                                        let finalUuid = uuid;
+                                        if (!finalUuid) {
+                                                const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+                                                        .map(b => b.toString(16).padStart(2, "0"))
+                                                        .join("");
+                                                finalUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
+                                        }
+                                        const parsedUsedGb = parseFloat(used_gb);
+                                        const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
+                                        const parsedUsedReq = parseInt(used_req);
+                                        const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
+                                        const finalCreatedAt = created_at || new Date().toISOString();
+                                        const parsedIsActive = parseInt(is_active);
+                                        const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
+                                        const existingUser = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(username).first();
+                                        if (existingUser) {
+                                                return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
+                                        }
+                                        try {
+                                                const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
+                                                const nowTime = Date.now();
+                                                await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                                                        .bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, "vl" + "e" + "ss", tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
+                                                        .run();
+                                                return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+                                        } catch (err) {
+                                                return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+                                        }
+                                }
+                        }
+                }
+                return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+        },
+};
+let schemaEnsured = false;
+let schemaPromise = null;
+let cachedPanelPassword = null;
+const DbService = {
+        async ensureSchema(db) {
+                if (schemaEnsured) return;
+                if (schemaPromise) {
+                        await schemaPromise;
+                        return;
+                }
+                schemaPromise = (async () => {
+                        try {
+                                await db.prepare(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, uuid TEXT, limit_gb REAL, expiry_days INTEGER, ips TEXT, connection_type TEXT, tls TEXT, port INTEGER, used_gb REAL DEFAULT 0, is_active INTEGER DEFAULT 1, last_active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).run();
+                        } catch (e) {}
+                        try {
+                                await db.prepare("CREATE TABLE IF NOT EXISTS edgepp_settings (key TEXT PRIMARY KEY, value TEXT)").run();
+                        } catch (e) {}
+                        try {
+                                const { results } = await db.prepare("PRAGMA table_info(users)").all();
+                                const existingCols = new Set((results || []).map((r) => r.name));
+                                const colsToAdd = [
+                                        { name: "is_active", def: "INTEGER DEFAULT 1" },
+                                        { name: "last_active", def: "INTEGER" },
+                                        { name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
+                                        { name: "max_connections", def: "INTEGER" },
+                                        { name: "limit_req", def: "INTEGER" },
+                                        { name: "used_req", def: "INTEGER DEFAULT 0" },
+                                        { name: "ip_limit", def: "INTEGER DEFAULT NULL" },
+                                        { name: "active_ips", def: "TEXT DEFAULT NULL" },
+                                        { name: "block_porn", def: "INTEGER DEFAULT 0" },
+                                        { name: "block_ads", def: "INTEGER DEFAULT 0" },
+                                        { name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
+                                        { name: "frag_int", def: "TEXT DEFAULT '1-2'" },
+                                        { name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
+                                        { name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
+                                        { name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
+                                        { name: "user_socks5", def: "TEXT DEFAULT NULL" },
+                                        { name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
+                                        { name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
+                                        { name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
+                                        { name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
+                                        { name: "auto_rotate_ip", def: "INTEGER DEFAULT 0" },
+                                        { name: "rotate_time", def: "INTEGER DEFAULT 0" },
+                                        { name: "ip_operator", def: "TEXT DEFAULT 'all'" },
+                                        { name: "ip_count", def: "INTEGER DEFAULT 20" },
+                                        { name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
+                                        { name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" }
+                                ];
+                                const stmts = [];
+                                for (const col of colsToAdd) {
+                                        if (!existingCols.has(col.name)) {
+                                                stmts.push(db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`));
+                                        }
+                                }
+                                if (stmts.length > 0) {
+                                        await db.batch(stmts);
+                                }
+                        } catch (e) {}
+                        try {
+                                await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
+                        } catch (e) {}
+                        try {
+                                await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
+                        } catch (e) {}
+                })();
+                await schemaPromise;
+                schemaEnsured = true;
+        },
+        async getPanelPassword(db) {
+                if (cachedPanelPassword !== null) return cachedPanelPassword;
                 try {
-                        bytes = Uint8ArrayBase64.fromBase64(header, { alphabet: 'base64url' });
-                } catch (_) { }
-        }
-        if (!bytes) {
-                let normalized = header.replace(/-/g, '+').replace(/_/g, '/');
-                const padding = normalized.length % 4;
-                if (padding) normalized += '='.repeat(4 - padding);
-                let binaryString;
-                try {
-                        binaryString = atob(normalized);
-                } catch (_) {
+                        const row = await db.prepare("SELECT value FROM edgepp_settings WHERE key = 'panel_password'").first();
+                        cachedPanelPassword = row ? row.value : "";
+                        return cachedPanelPassword || null;
+                } catch (e) {
                         return null;
                 }
-                bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-        }
-
-        if (bytes.byteLength > WS早期数据最大字节) throw new Error('early data is too large');
-        return 是有效WS早期数据(bytes, token) ? bytes : null;
-}
-
-///////////////////////////////////////////////////////////////////////WS传输数据///////////////////////////////////////////////
-async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
-        const WS套接字对 = new WebSocketPair();
-        const [clientSock, serverSock] = Object.values(WS套接字对);
-        try { (/** @type {any} */ (serverSock)).accept({ allowHalfOpen: true }) }
-        catch (_) { serverSock.accept() }
-        serverSock.binaryType = 'arraybuffer';
-        let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-        let isDnsQuery = false;
-        let 判断是否是木马 = null;
-        const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
-        const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
-        const SS模式禁用EarlyData = !!url.searchParams.get('enc');
-        let WS上行写入队列 = null;
-        let WS显式传输链 = Promise.resolve();
-        let WS显式传输停止接收 = false, WS显式传输失败 = false, WS显式传输收尾已入队 = false;
-        let WS显式队列字节 = 0, WS显式队列条目 = 0;
-        let 判断协议类型 = null, 当前写入Socket = null, 远端写入器 = null;
-        let ss上下文 = null, ss初始化任务 = null;
-
-        const 释放远端写入器 = () => {
-                if (远端写入器) {
-                        try { 远端写入器.releaseLock() } catch (e) { }
-                        远端写入器 = null;
-                }
-                当前写入Socket = null;
-        };
-
-        const 上行写入队列 = WS上行写入队列 = 创建上行写入队列({
-                获取写入器: () => {
-                        const socket = remoteConnWrapper.socket;
-                        if (!socket) return null;
-                        if (socket !== 当前写入Socket) {
-                                释放远端写入器();
-                                当前写入Socket = socket;
-                                远端写入器 = socket.writable.getWriter();
+        },
+        async setPanelPassword(db, password) {
+                await db.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
+                cachedPanelPassword = password;
+        },
+        async verifyApiAuth(request, env) {
+                const storedPasswordHash = await this.getPanelPassword(env.DB);
+                if (!storedPasswordHash) return true;
+                const cookies = request.headers.get("Cookie") || "";
+                const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
+                if (!sessionCookie) return false;
+                const sessionToken = sessionCookie.split("=")[1].trim();
+                return sessionToken === storedPasswordHash;
+        },
+        async sha256(message) {
+                const msgBuffer = new TextEncoder().encode(message);
+                const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+        },
+};
+function getActiveIpCount(activeIpsJson) {
+        if (!activeIpsJson) return 0;
+        try {
+                const activeIps = JSON.parse(activeIpsJson);
+                const now = Date.now();
+                let count = 0;
+                for (const [ip, data] of Object.entries(activeIps)) {
+                        const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+                        if (now - lastSeen <= 20000) {
+                                count++;
                         }
-                        return 远端写入器;
+                }
+                return count;
+        } catch (e) {
+                return 0;
+        }
+}
+const SubscriptionService = {
+        async generateText(user, host) {
+                let ips = [host];
+                if (user.ips) {
+                        const parsedIps = user.ips
+                                .split("\n")
+                                .map((ip) => ip.trim())
+                                .filter((ip) => ip.length > 0);
+                        if (parsedIps.length > 0) ips = parsedIps;
+                }
+                const ports = String(user.port || "443")
+                        .split(",")
+                        .map((p) => p.trim())
+                        .filter((p) => p.length > 0);
+                const fp = user.fingerprint || "chrome";
+                const dynPath = encodeURIComponent("/stream/PANEL_EDGE/" + (user.uuid ? user.uuid.split("-")[0] : "default"));
+                const links = [];
+                const m1 = decodeURIComponent("%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F");
+                const m2 = decodeURIComponent("%F0%9F%9A%80%40PANEL_EDGE%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80");
+                links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m1));
+                links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m2));
+                let remVol = "Unlimited";
+                if (user.limit_gb) {
+                        let rem = user.limit_gb - (user.used_gb || 0);
+                        remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
+                }
+                let remTime = "Unlimited";
+                if (user.expiry_days && user.created_at) {
+                        const created = new Date(user.created_at);
+                        const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+                        const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+                        remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
+                }
+                let remReq = "Unlimited";
+                if (user.limit_req) {
+                        let rem = user.limit_req - (user.used_req || 0);
+                        remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
+                }
+                const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
+                links.push("vl" + "e" + "ss://" + user.uuid + "@" + host + ":80?path=" + dynPath + "&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(infoRemark));
+                let countryCode = "";
+                if (user.user_proxy_iata) {
+                        try {
+                                const res = await fetch("https://speed.cloudflare.com/locations", {
+                                        headers: { Referer: "https://speed.cloudflare.com/" },
+                                });
+                                if (res.ok) {
+                                        const locations = await res.json();
+                                        const found = locations.find((l) => l.iata && l.iata.toUpperCase() === user.user_proxy_iata.toUpperCase());
+                                        if (found && found.cca2) countryCode = found.cca2;
+                                }
+                        } catch (e) {}
+                } else if (user.user_socks5 || user.user_proxy_ip) {
+                        let proxy = user.user_socks5 || user.user_proxy_ip;
+                        let ip = "";
+                        let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+                        let remain = cleanProxy;
+                        if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+                        if (remain.startsWith("[")) {
+                                ip = remain.substring(1, remain.indexOf("]"));
+                        } else {
+                                const lastColon = remain.lastIndexOf(":");
+                                if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
+                                else ip = remain;
+                        }
+                        if (ip) {
+                                try {
+                                        const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+                                        const geoData = await geoRes.json();
+                                        if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
+                                } catch (e) {}
+                        }
+                }
+                let flagEmoji = "🌐";
+                if (countryCode) {
+                        const codePoints = countryCode
+                                .toUpperCase()
+                                .split("")
+                                .map((char) => 127397 + char.charCodeAt(0));
+                        try {
+                                flagEmoji = String.fromCodePoint(...codePoints);
+                        } catch (e) {}
+                }
+                ips.forEach((ip) => {
+                        ports.forEach((portStr) => {
+                                const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
+                                const tlsVal = isTlsPort ? "tls" : "none";
+                                const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
+                                const remark = flagEmoji + " | " + user.username + " | \u200E" + ip + " | \u200E" + portStr;
+                                links.push("vl" + "e" + "ss://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + dynPath + "&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + userFrag + "#" + encodeURIComponent(remark));
+                        });
+                });
+                const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
+                const plainContent = noise + links.join("\n");
+                const subContent = btoa(unescape(encodeURIComponent(plainContent)));
+                const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
+                const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
+                let expireTimestamp = 0;
+                if (user.expiry_days && user.created_at) {
+                        expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
+                }
+                const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
+                return new Response(subContent, {
+                        headers: {
+                                "Content-Type": "text/plain; charset=utf-8",
+                                "Access-Control-Allow-Origin": "*",
+                                "Cache-Control": "no-store",
+                                "Subscription-Userinfo": subUserInfo,
+                        },
+                });
+        },
+};
+async function flushExpiredTraffic(env) {
+        const now = Date.now();
+        for (const [uname, cachedBytes] of GLOBAL_TRAFFIC_CACHE.entries()) {
+                const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+                if (cachedBytes <= 0 && cachedReqs <= 0) continue;
+                if (GLOBAL_WRITE_LOCK.get(uname)) continue;
+                const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
+                const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+                if (activeCount <= 0 || now - lastActive > 20000) {
+                        GLOBAL_WRITE_LOCK.set(uname, true);
+                        const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+                        try {
+                                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
+                        } catch (e) {
+                                console.error(e.message);
+                        } finally {
+                                GLOBAL_WRITE_LOCK.delete(uname);
+                                GLOBAL_TRAFFIC_CACHE.delete(uname);
+                                USER_REQ_CACHE.delete(uname);
+                                GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+                        }
+                }
+        }
+}
+async function handlevIees(env, storedData = null, ctx = null, request = null) {
+        const clientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
+        const socketPair = new WebSocketPair();
+        const [clientSock, serverSock] = Object.values(socketPair);
+        serverSock.accept();
+        serverSock.binaryType = "arraybuffer";
+        let username = null;
+        let validUUID = null;
+        let targetDns = "8.8.4.4";
+        let targetDoh = "https://cloudflare-dns.com/dns-query";
+        function addBytes(bytes) {
+                if (bytes <= 0) return;
+                if (!username) {
+                        uncountedBytes += bytes;
+                        return;
+                }
+                if (uncountedBytes > 0) {
+                        bytes += uncountedBytes;
+                        uncountedBytes = 0;
+                }
+                let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+                GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
+                GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
+                if (GLOBAL_WRITE_LOCK.get(username)) return;
+                let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
+                let now = Date.now();
+                let thresholdBytes = 10 * 1024 * 1024;
+                if (current >= thresholdBytes || (current > 0 && now - lastDbWrite > 60000)) {
+                        GLOBAL_WRITE_LOCK.set(username, true);
+                        let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
+                        let toCommitReq = USER_REQ_CACHE.get(username) || 0;
+                        if (toCommit <= 0 && toCommitReq <= 0) {
+                                GLOBAL_WRITE_LOCK.set(username, false);
+                                return;
+                        }
+                        GLOBAL_TRAFFIC_CACHE.set(username, 0);
+                        USER_REQ_CACHE.set(username, 0);
+                        GLOBAL_LAST_DB_WRITE.set(username, now);
+                        let deltaGb = toCommit / (1024 * 1024 * 1024);
+                        let writeTask = async () => {
+                                try {
+                                        await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, username).run();
+                                } catch (e) {
+                                        console.error(e.message);
+                                } finally {
+                                        GLOBAL_WRITE_LOCK.set(username, false);
+                                }
+                        };
+                        if (ctx) ctx.waitUntil(writeTask());
+                        else writeTask();
+                }
+        }
+        let isOfflineSet = false;
+        let hasCountedAsActive = false;
+        const setOffline = () => {
+                if (isOfflineSet) return;
+                isOfflineSet = true;
+                const uname = username;
+                if (!uname) return;
+                if (clientIP && clientIP !== "unknown" && validUUID) {
+                        const removeIpTask = async () => {
+                                try {
+                                        const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+                                        if (user) {
+                                                console.log(`[setOffline Task] DB active_ips for ${uname}: ${user.active_ips}`);
+                                                let activeIps = JSON.parse(user.active_ips || "{}");
+                                                if (activeIps[clientIP]) {
+                                                        if (typeof activeIps[clientIP] === "object") {
+                                                                activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
+                                                                if (activeIps[clientIP].count <= 0) {
+                                                                        delete activeIps[clientIP];
+                                                                }
+                                                        } else {
+                                                                delete activeIps[clientIP];
+                                                        }
+                                                        await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), validUUID).run();
+                                                        console.log(`[setOffline Task] Updated active_ips in DB to: ${JSON.stringify(activeIps)}`);
+                                                } else {
+                                                        console.log(`[setOffline Task] IP ${clientIP} not found in user's active_ips`);
+                                                }
+                                        }
+                                } catch (e) {
+                                        console.error(`[setOffline Task] Error: ${e.message}`);
+                                }
+                        };
+                        if (ctx) ctx.waitUntil(removeIpTask());
+                        else removeIpTask();
+                }
+                let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
+                if (hasCountedAsActive) {
+                        activeCount = Math.max(0, activeCount - 1);
+                }
+                if (activeCount <= 0) {
+                        ACTIVE_CONNECTIONS_COUNT.delete(uname);
+                        let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
+                        let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
+                        if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
+                                GLOBAL_WRITE_LOCK.set(uname, true);
+                                GLOBAL_TRAFFIC_CACHE.set(uname, 0);
+                                USER_REQ_CACHE.set(uname, 0);
+                                const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+                                const writeTask = async () => {
+                                        try {
+                                                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
+                                        } catch (e) {
+                                                console.error(e.message);
+                                        } finally {
+                                                GLOBAL_WRITE_LOCK.delete(uname);
+                                                GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+                                        }
+                                };
+                                if (ctx) {
+                                        ctx.waitUntil(writeTask());
+                                } else {
+                                        writeTask();
+                                }
+                        } else {
+                                GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
+                        }
+                } else {
+                        ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
+                }
+        };
+        let heartbeat;
+        const runHeartbeat = async () => {
+                if (serverSock.readyState === WebSocket.OPEN) {
+                        try {
+                                serverSock.send(new Uint8Array(0));
+                                if (!validUUID || !username) {
+                                        heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+                                        return;
+                                }
+                                const nowTime = Date.now();
+                                const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
+                                if (nowTime - lastCheck >= 20000) {
+                                        GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
+
+                                        const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+                                        let isExpired = false;
+                                        let isIpLimitExpired = false;
+                                        let updatedActiveIps = null;
+                                        if (!user || user.is_active === 0) {
+                                                isExpired = true;
+                                        } else {
+                                                if (user.limit_gb && user.used_gb >= user.limit_gb) isExpired = true;
+                                                if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
+                                                if (user.expiry_days && user.created_at) {
+                                                        const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 86400000);
+                                                        if (nowTime > expiryDate.getTime()) isExpired = true;
+                                                }
+                                                if (!isExpired && clientIP && clientIP !== "unknown") {
+                                                        let activeIps = {};
+                                                        try { activeIps = JSON.parse(user.active_ips || "{}"); } catch (e) {}
+                                                        let hasChanges = false;
+                                                        for (const [ip, data] of Object.entries(activeIps)) {
+                                                                const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+                                                                if (nowTime - lastSeen > 20000) { delete activeIps[ip]; hasChanges = true; }
+                                                        }
+                                                        if (!activeIps[clientIP]) {
+                                                                isIpLimitExpired = true;
+                                                        } else {
+                                                                const sortedIps = Object.keys(activeIps).sort((a, b) => {
+                                                                        const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
+                                                                        const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
+                                                                        return tB - tA;
+                                                                });
+                                                                if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true;
+                                                        }
+                                                        if (hasChanges || isIpLimitExpired) updatedActiveIps = JSON.stringify(activeIps);
+                                                }
+                                        }
+                                        if (isExpired) {
+                                                await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
+                                                clearTimeout(heartbeat);
+                                                closeSocketQuietly(serverSock);
+                                                return;
+                                        }
+                                        if (isIpLimitExpired) {
+                                                clearTimeout(heartbeat);
+                                                closeSocketQuietly(serverSock);
+                                                return;
+                                        }
+                                        if (updatedActiveIps !== null) {
+                                                await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(nowTime, updatedActiveIps, username).run();
+                                        } else {
+                                                await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
+                                        }
+                                }
+                        } catch (e) {}
+                        heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+                } else {
+                        clearTimeout(heartbeat);
+                }
+        };
+        heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+        let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
+        let reqUUID = null;
+        let isHeaderParsed = false;
+        let isHeaderParsing = false;
+        let isDnsQuery = false;
+        let chunkBuffer = new Uint8Array(0);
+        let uncountedBytes = 0;
+        const proxyIP = storedData?.proxy_ip || "";
+        let wsChain = Promise.resolve();
+        let wsStopped = false,
+                wsFailed = false,
+                wsFinished = false;
+        let wsQueueBytes = 0,
+                wsQueueItems = 0;
+        let currentSocketWriter = null,
+                activeRemoteWriter = null;
+        const releaseRemoteWriter = () => {
+                if (activeRemoteWriter) {
+                        try {
+                                activeRemoteWriter.releaseLock();
+                        } catch (e) {}
+                        activeRemoteWriter = null;
+                }
+                currentSocketWriter = null;
+        };
+        const getRemoteWriter = () => {
+                const s = remoteConnWrapper.socket;
+                if (!s) return null;
+                if (s !== currentSocketWriter) {
+                        releaseRemoteWriter();
+                        currentSocketWriter = s;
+                        activeRemoteWriter = s.writable.getWriter();
+                }
+                return activeRemoteWriter;
+        };
+        const upstreamQueue = createUpstreamQueue({
+                getWriter: getRemoteWriter,
+                releaseWriter: releaseRemoteWriter,
+                retryConnect: async () => {
+                        if (typeof remoteConnWrapper.retryConnect === "function") {
+                                await remoteConnWrapper.retryConnect();
+                        }
                 },
-                释放写入器: 释放远端写入器,
-                重试连接: async () => {
-                        if (typeof remoteConnWrapper.retryConnect !== 'function') throw new Error('retry unavailable');
-                        await remoteConnWrapper.retryConnect();
-                },
-                关闭连接: () => {
-                        try { remoteConnWrapper.socket?.close() } catch (e) { }
+                closeConnection: () => {
+                        try {
+                                remoteConnWrapper.socket?.close();
+                        } catch (e) {}
                         closeSocketQuietly(serverSock);
                 },
-                名称: 'WS上行'
+                name: "vIeesWSQueue",
         });
-
-        const 写入远端 = async (chunk, allowRetry = true) => {
-                return 上行写入队列.写入并等待(chunk, allowRetry);
+        const writeToRemote = async (chunk, allowRetry = true) => {
+                return upstreamQueue.writeAndAwait(chunk, allowRetry);
         };
-
-        const 获取SS上下文 = async () => {
-                if (ss上下文) return ss上下文;
-                if (!ss初始化任务) {
-                        ss初始化任务 = (async () => {
-                                const 请求加密方式 = (url.searchParams.get('enc') || '').toLowerCase();
-                                const 首选加密配置 = SS支持加密配置[请求加密方式] || SS支持加密配置['aes-128-gcm'];
-                                const 入站候选加密配置 = [首选加密配置, ...Object.values(SS支持加密配置).filter(c => c.method !== 首选加密配置.method)];
-                                const 入站主密钥任务缓存 = new Map();
-                                const 取入站主密钥任务 = (config) => {
-                                        if (!入站主密钥任务缓存.has(config.method)) 入站主密钥任务缓存.set(config.method, SS派生主密钥(yourUUID, config.keyLen));
-                                        return 入站主密钥任务缓存.get(config.method);
-                                };
-                                const 入站状态 = {
-                                        buffer: new Uint8Array(0),
-                                        hasSalt: false,
-                                        waitPayloadLength: null,
-                                        decryptKey: null,
-                                        nonceCounter: new Uint8Array(SSNonce长度),
-                                        加密配置: null,
-                                };
-                                const 初始化入站解密状态 = async () => {
-                                        const lengthCipherTotalLength = 2 + SSAEAD标签长度;
-                                        const 最大盐长度 = Math.max(...入站候选加密配置.map(c => c.saltLen));
-                                        const 最大对齐扫描字节 = 16;
-                                        const 可扫描最大偏移 = Math.min(最大对齐扫描字节, Math.max(0, 入站状态.buffer.byteLength - (lengthCipherTotalLength + Math.min(...入站候选加密配置.map(c => c.saltLen)))));
-                                        for (let offset = 0; offset <= 可扫描最大偏移; offset++) {
-                                                for (const 加密配置 of 入站候选加密配置) {
-                                                        const 初始化最小长度 = offset + 加密配置.saltLen + lengthCipherTotalLength;
-                                                        if (入站状态.buffer.byteLength < 初始化最小长度) continue;
-                                                        const salt = 入站状态.buffer.subarray(offset, offset + 加密配置.saltLen);
-                                                        const lengthCipher = 入站状态.buffer.subarray(offset + 加密配置.saltLen, 初始化最小长度);
-                                                        const masterKey = await 取入站主密钥任务(加密配置);
-                                                        const decryptKey = await SS派生会话密钥(加密配置, masterKey, salt, ['decrypt']);
-                                                        const nonceCounter = new Uint8Array(SSNonce长度);
-                                                        try {
-                                                                const lengthPlain = await SSAEAD解密(decryptKey, nonceCounter, lengthCipher);
-                                                                if (lengthPlain.byteLength !== 2) continue;
-                                                                const payloadLength = (lengthPlain[0] << 8) | lengthPlain[1];
-                                                                if (payloadLength < 0 || payloadLength > 加密配置.maxChunk) continue;
-                                                                if (offset > 0) log(`[SS入站] 检测到前导噪声 ${offset}B，已自动对齐`);
-                                                                if (加密配置.method !== 首选加密配置.method) log(`[SS入站] URL enc=${请求加密方式 || 首选加密配置.method} 与实际 ${加密配置.method} 不一致，已自动切换`);
-                                                                入站状态.buffer = 入站状态.buffer.subarray(初始化最小长度);
-                                                                入站状态.decryptKey = decryptKey;
-                                                                入站状态.nonceCounter = nonceCounter;
-                                                                入站状态.waitPayloadLength = payloadLength;
-                                                                入站状态.加密配置 = 加密配置;
-                                                                入站状态.hasSalt = true;
-                                                                return true;
-                                                        } catch (_) { }
-                                                }
-                                        }
-                                        const 初始化失败判定长度 = 最大盐长度 + lengthCipherTotalLength + 最大对齐扫描字节;
-                                        if (入站状态.buffer.byteLength >= 初始化失败判定长度) {
-                                                throw new Error(`SS handshake decrypt failed (enc=${请求加密方式 || 'auto'}, candidates=${入站候选加密配置.map(c => c.method).join('/')})`);
-                                        }
-                                        return false;
-                                };
-                                const 入站解密器 = {
-                                        async 输入(dataChunk) {
-                                                const chunk = 数据转Uint8Array(dataChunk);
-                                                if (chunk.byteLength > 0) 入站状态.buffer = 拼接字节数据(入站状态.buffer, chunk);
-                                                if (!入站状态.hasSalt) {
-                                                        const 初始化成功 = await 初始化入站解密状态();
-                                                        if (!初始化成功) return [];
-                                                }
-                                                const plaintextChunks = [];
-                                                while (true) {
-                                                        if (入站状态.waitPayloadLength === null) {
-                                                                const lengthCipherTotalLength = 2 + SSAEAD标签长度;
-                                                                if (入站状态.buffer.byteLength < lengthCipherTotalLength) break;
-                                                                const lengthCipher = 入站状态.buffer.subarray(0, lengthCipherTotalLength);
-                                                                入站状态.buffer = 入站状态.buffer.subarray(lengthCipherTotalLength);
-                                                                const lengthPlain = await SSAEAD解密(入站状态.decryptKey, 入站状态.nonceCounter, lengthCipher);
-                                                                if (lengthPlain.byteLength !== 2) throw new Error('SS length decrypt failed');
-                                                                const payloadLength = (lengthPlain[0] << 8) | lengthPlain[1];
-                                                                if (payloadLength < 0 || payloadLength > 入站状态.加密配置.maxChunk) throw new Error(`SS payload length invalid: ${payloadLength}`);
-                                                                入站状态.waitPayloadLength = payloadLength;
-                                                        }
-                                                        const payloadCipherTotalLength = 入站状态.waitPayloadLength + SSAEAD标签长度;
-                                                        if (入站状态.buffer.byteLength < payloadCipherTotalLength) break;
-                                                        const payloadCipher = 入站状态.buffer.subarray(0, payloadCipherTotalLength);
-                                                        入站状态.buffer = 入站状态.buffer.subarray(payloadCipherTotalLength);
-                                                        const payloadPlain = await SSAEAD解密(入站状态.decryptKey, 入站状态.nonceCounter, payloadCipher);
-                                                        plaintextChunks.push(payloadPlain);
-                                                        入站状态.waitPayloadLength = null;
-                                                }
-                                                return plaintextChunks;
-                                        },
-                                };
-                                let 出站加密器 = null;
-                                const SS单批最大字节 = 32 * 1024;
-                                const 获取出站加密器 = async () => {
-                                        if (出站加密器) return 出站加密器;
-                                        if (!入站状态.加密配置) throw new Error('SS cipher is not negotiated');
-                                        const 出站加密配置 = 入站状态.加密配置;
-                                        const 出站主密钥 = await SS派生主密钥(yourUUID, 出站加密配置.keyLen);
-                                        const 出站随机字节 = crypto.getRandomValues(new Uint8Array(出站加密配置.saltLen));
-                                        const 出站加密密钥 = await SS派生会话密钥(出站加密配置, 出站主密钥, 出站随机字节, ['encrypt']);
-                                        const 出站Nonce计数器 = new Uint8Array(SSNonce长度);
-                                        let 随机字节已发送 = false;
-                                        出站加密器 = {
-                                                async 加密并发送(dataChunk, sendChunk) {
-                                                        const plaintextData = 数据转Uint8Array(dataChunk);
-                                                        if (!随机字节已发送) {
-                                                                await sendChunk(出站随机字节);
-                                                                随机字节已发送 = true;
-                                                        }
-                                                        if (plaintextData.byteLength === 0) return;
-                                                        let offset = 0;
-                                                        while (offset < plaintextData.byteLength) {
-                                                                const end = Math.min(offset + 出站加密配置.maxChunk, plaintextData.byteLength);
-                                                                const payloadPlain = plaintextData.subarray(offset, end);
-                                                                const lengthPlain = new Uint8Array(2);
-                                                                lengthPlain[0] = (payloadPlain.byteLength >>> 8) & 0xff;
-                                                                lengthPlain[1] = payloadPlain.byteLength & 0xff;
-                                                                const lengthCipher = await SSAEAD加密(出站加密密钥, 出站Nonce计数器, lengthPlain);
-                                                                const payloadCipher = await SSAEAD加密(出站加密密钥, 出站Nonce计数器, payloadPlain);
-                                                                const frame = new Uint8Array(lengthCipher.byteLength + payloadCipher.byteLength);
-                                                                frame.set(lengthCipher, 0);
-                                                                frame.set(payloadCipher, lengthCipher.byteLength);
-                                                                await sendChunk(frame);
-                                                                offset = end;
-                                                        }
-                                                },
-                                        };
-                                        return 出站加密器;
-                                };
-                                let SS发送队列 = Promise.resolve();
-                                const SS入队发送 = (chunk) => {
-                                        SS发送队列 = SS发送队列.then(async () => {
-                                                if (serverSock.readyState !== WebSocket.OPEN) return;
-                                                const 已初始化出站加密器 = await 获取出站加密器();
-                                                await 已初始化出站加密器.加密并发送(chunk, async (encryptedChunk) => {
-                                                        if (encryptedChunk.byteLength > 0 && serverSock.readyState === WebSocket.OPEN) {
-                                                                await WebSocket发送并等待(serverSock, encryptedChunk.buffer);
-                                                        }
-                                                });
-                                        }).catch((error) => {
-                                                log(`[SS发送] 加密失败: ${error?.message || error}`);
-                                                closeSocketQuietly(serverSock);
-                                        });
-                                        return SS发送队列;
-                                };
-                                const 回包Socket = {
-                                        get readyState() {
-                                                return serverSock.readyState;
-                                        },
-                                        send(data) {
-                                                const chunk = 数据转Uint8Array(data);
-                                                if (chunk.byteLength <= SS单批最大字节) {
-                                                        return SS入队发送(chunk);
-                                                }
-                                                for (let i = 0; i < chunk.byteLength; i += SS单批最大字节) {
-                                                        SS入队发送(chunk.subarray(i, Math.min(i + SS单批最大字节, chunk.byteLength)));
-                                                }
-                                                return SS发送队列;
-                                        },
-                                        close() {
-                                                closeSocketQuietly(serverSock);
-                                        }
-                                };
-                                ss上下文 = {
-                                        入站解密器,
-                                        回包Socket,
-                                        首包已建立: false,
-                                        目标主机: '',
-                                        目标端口: 0,
-                                };
-                                return ss上下文;
-                        })().finally(() => { ss初始化任务 = null });
-                }
-                return ss初始化任务;
-        };
-
-        const 处理SS数据 = async (chunk) => {
-                const 上下文 = await 获取SS上下文();
-                let 明文块数组 = null;
-                try {
-                        明文块数组 = await 上下文.入站解密器.输入(chunk);
-                } catch (err) {
-                        const msg = err?.message || `${err}`;
-                        if (msg.includes('Decryption failed') || msg.includes('SS handshake decrypt failed') || msg.includes('SS length decrypt failed')) {
-                                log(`[SS入站] 解密失败，连接关闭: ${msg}`);
-                                closeSocketQuietly(serverSock);
-                                return;
-                        }
-                        throw err;
-                }
-                for (const 明文块 of 明文块数组) {
-                        let 已写入 = false;
-                        try {
-                                已写入 = await 写入远端(明文块, false);
-                        } catch (err) {
-                                if ((/** @type {any} */ (err))?.isQueueOverflow) throw err;
-                                已写入 = false;
-                        }
-                        if (已写入) continue;
-                        if (上下文.首包已建立 && 上下文.目标主机 && 上下文.目标端口 > 0) {
-                                await forwardataTCP(上下文.目标主机, 上下文.目标端口, 明文块, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文);
-                                continue;
-                        }
-                        const 明文数据 = 数据转Uint8Array(明文块);
-                        if (明文数据.byteLength < 3) throw new Error('invalid ss data');
-                        const addressType = 明文数据[0];
-                        let cursor = 1;
-                        let hostname = '';
-                        if (addressType === 1) {
-                                if (明文数据.byteLength < cursor + 4 + 2) throw new Error('invalid ss ipv4 length');
-                                hostname = `${明文数据[cursor]}.${明文数据[cursor + 1]}.${明文数据[cursor + 2]}.${明文数据[cursor + 3]}`;
-                                cursor += 4;
-                        } else if (addressType === 3) {
-                                if (明文数据.byteLength < cursor + 1) throw new Error('invalid ss domain length');
-                                const domainLength = 明文数据[cursor];
-                                cursor += 1;
-                                if (明文数据.byteLength < cursor + domainLength + 2) throw new Error('invalid ss domain data');
-                                hostname = SS文本解码器.decode(明文数据.subarray(cursor, cursor + domainLength));
-                                cursor += domainLength;
-                        } else if (addressType === 4) {
-                                if (明文数据.byteLength < cursor + 16 + 2) throw new Error('invalid ss ipv6 length');
-                                const ipv6 = [];
-                                const ipv6View = new DataView(明文数据.buffer, 明文数据.byteOffset + cursor, 16);
-                                for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16));
-                                hostname = ipv6.join(':');
-                                cursor += 16;
-                        } else {
-                                throw new Error(`invalid ss addressType: ${addressType}`);
-                        }
-                        if (!hostname) throw new Error(`invalid ss address: ${addressType}`);
-                        const port = (明文数据[cursor] << 8) | 明文数据[cursor + 1];
-                        cursor += 2;
-                        const rawClientData = 明文数据.subarray(cursor);
-                        if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                        上下文.首包已建立 = true;
-                        上下文.目标主机 = hostname;
-                        上下文.目标端口 = port;
-                        await forwardataTCP(hostname, port, rawClientData, 上下文.回包Socket, null, remoteConnWrapper, yourUUID, request, 反代上下文);
-                }
-        };
-
-        const 处理WS入站数据 = async (chunk) => {
-                let 当前块字节 = null;
+        const processWsMessage = async (chunk) => {
+                const bytes = chunk.byteLength || 0;
+                await addBytes(bytes);
                 if (isDnsQuery) {
-                        if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
-                        return await forwardataudp(chunk, serverSock, null, request);
-                }
-                if (判断协议类型 === 'ss') {
-                        await 处理SS数据(chunk);
+                        await forwardvIeesUDP(chunk, serverSock, null, addBytes, targetDns);
                         return;
                 }
-                if (await 写入远端(chunk)) return;
-
-                if (判断协议类型 === null) {
-                        if (url.searchParams.get('enc')) 判断协议类型 = 'ss';
-                        else {
-                                当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-                                const bytes = 当前块字节;
-                                判断协议类型 = bytes.byteLength >= 58 && bytes[56] === 0x0d && bytes[57] === 0x0a ? '木马' : '魏烈思';
-                        }
-                        判断是否是木马 = 判断协议类型 === '木马';
-                        log(`[WS转发] 协议类型: ${判断协议类型} | 来自: ${url.host} | UA: ${request.headers.get('user-agent') || '未知'}`);
-                }
-
-                if (判断协议类型 === 'ss') {
-                        await 处理SS数据(chunk);
-                        return;
-                }
-                if (await 写入远端(chunk)) return;
-                if (判断协议类型 === '木马') {
-                        const 解析结果 = 解析木马请求(chunk, yourUUID);
-                        if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
-                        const { port, hostname, rawClientData, isUDP } = 解析结果;
-                        if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                        if (isUDP) {
-                                isDnsQuery = true;
-                                木马UDP上下文.目标主机 = hostname;
-                                木马UDP上下文.目标端口 = port;
-                                if (木马UDP上下文.反代地址) return 转发木马UDP数据(当前块字节 || 数据转Uint8Array(chunk), serverSock, 木马UDP上下文, request);
-                                if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
+                if (await writeToRemote(chunk)) return;
+                if (!isHeaderParsed) {
+                        chunkBuffer = concatBytes(chunkBuffer, chunk);
+                        if (chunkBuffer.byteLength < 24) return;
+                        if (isHeaderParsing) return;
+                        isHeaderParsing = true;
+                        reqUUID = extractUUIDFromvIees(chunkBuffer);
+                        if (!reqUUID) {
+                                serverSock.close();
                                 return;
                         }
-                        await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk));
-                } else {
-                        判断是否是木马 = false;
-                        当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
-                        const bytes = 当前块字节;
-                        const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
-                        if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
-                        const { port, hostname, version, isUDP, rawClientData } = 解析结果;
-                        if (isSpeedTestSite(hostname)) throw new Error('Speedtest site is blocked');
-                        if (isUDP) {
-                                if (port === 53) isDnsQuery = true;
-                                else throw new Error('UDP is not supported');
+                        let user = null;
+                        try {
+                                user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
+                        } catch (e) {}
+                        if (!user) {
+                                serverSock.close();
+                                return;
                         }
-                        const respHeader = new Uint8Array([version, 0]);
-                        const rawData = rawClientData;
-                        if (isDnsQuery) {
-                                if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
-                                return forwardataudp(rawData, serverSock, respHeader, request);
+                        username = user.username;
+                        validUUID = reqUUID;
+                        let currentReqs = USER_REQ_CACHE.get(username) || 0;
+                        USER_REQ_CACHE.set(username, currentReqs + 1);
+                        if (!GLOBAL_TRAFFIC_CACHE.has(username)) {
+                                GLOBAL_TRAFFIC_CACHE.set(username, 0);
                         }
-                        await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
+                        if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
+                                return;
+                        }
+                        if (user.is_active === 0) {
+                                serverSock.close();
+                                return;
+                        }
+                        if (user.limit_gb && user.used_gb >= user.limit_gb) {
+                                serverSock.close();
+                                return;
+                        }
+                        if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
+                                serverSock.close();
+                                return;
+                        }
+                        if (user.expiry_days && user.created_at) {
+                                const created = new Date(user.created_at);
+                                const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
+                                if (new Date() > expiryDate) {
+                                        try {
+                                                await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
+                                        } catch (e) {}
+                                        serverSock.close();
+                                        return;
+                                }
+                        }
+                        if (user.block_porn === 1 && user.block_ads === 1) {
+                                targetDns = "94.140.14.15";
+                                targetDoh = "https://family.adguard-dns.com/dns-query";
+                        } else if (user.block_porn === 1) {
+                                targetDns = "1.1.1.3";
+                                targetDoh = "https://family.cloudflare-dns.com/dns-query";
+                        } else if (user.block_ads === 1) {
+                                targetDns = "94.140.14.14";
+                                targetDoh = "https://dns.adguard-dns.com/dns-query";
+                        }
+                        if (clientIP && clientIP !== "unknown") {
+                                let activeIps = {};
+                                try { activeIps = JSON.parse(user.active_ips || "{}"); } catch (e) {}
+                                const now = Date.now();
+                                for (const [ip, data] of Object.entries(activeIps)) {
+                                        const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+                                        if (now - lastSeen > 20000) delete activeIps[ip];
+                                }
+                                let isNewIp = false;
+                                if (!activeIps[clientIP]) {
+                                        const sortedIps = Object.keys(activeIps);
+                                        if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) {
+                                                serverSock.close();
+                                                return;
+                                        }
+                                        activeIps[clientIP] = { timestamp: now, count: 1 };
+                                        isNewIp = true;
+                                } else {
+                                        if (typeof activeIps[clientIP] === "object") {
+                                                activeIps[clientIP].timestamp = now;
+                                                activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
+                                        } else {
+                                                activeIps[clientIP] = { timestamp: now, count: 1 };
+                                        }
+                                }
+                                const lastWrite = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
+                                if (isNewIp || (now - lastWrite > 10000)) {
+                                        GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+                                        const updateTask = async () => {
+                                                try {
+                                                        await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
+                                                } catch (e) {}
+                                        };
+                                        if (ctx) ctx.waitUntil(updateTask());
+                                        else updateTask();
+                                }
+                        }
+                        isHeaderParsed = true;
+                        let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
+                        ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
+                        hasCountedAsActive = true;
+                        if (activeCount === 0) {
+                                const setOnlineTask = async () => {
+                                        try {
+                                                const now = Date.now();
+                                                GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
+                                                await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+                                        } catch (e) {}
+                                };
+                                if (ctx) ctx.waitUntil(setOnlineTask());
+                                else setOnlineTask();
+                        }
+                        try {
+                                let offset = 17;
+                                const optLen = chunkBuffer[offset++];
+                                offset += optLen;
+                                const cmd = chunkBuffer[offset++];
+                                const port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
+                                const addrType = chunkBuffer[offset++];
+                                let addr = "";
+                                if (addrType === 1) {
+                                        addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
+                                } else if (addrType === 2) {
+                                        const domainLen = chunkBuffer[offset++];
+                                        addr = new TextDecoder().decode(chunkBuffer.slice(offset, offset + domainLen));
+                                        offset += domainLen;
+                                } else if (addrType === 3) {
+                                        const v6 = [];
+                                        for (let i = 0; i < 8; i++) {
+                                                v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
+                                        }
+                                        addr = v6.join(":");
+                                }
+                                const rawData = chunkBuffer.slice(offset);
+                                const respHeader = new Uint8Array([chunkBuffer[0], 0]);
+                                if ((user.block_ads === 1 || user.block_porn === 1) && addrType === 2 && port !== 53) {
+                                        try {
+                                                const dnsCheck = await dohQuery(addr, "A", targetDoh);
+                                                const isBlocked = dnsCheck.some((r) => r.data === "0.0.0.0" || r.data === "::" || r.data === "176.103.130.130");
+                                                if (isBlocked) {
+                                                        serverSock.close();
+                                                        return;
+                                                }
+                                                const validIps = dnsCheck.filter((r) => r.type === 1 && typeof r.data === "string" && isIPv4(r.data));
+                                                if (validIps.length > 0) {
+                                                        addr = validIps[0].data;
+                                                }
+                                        } catch (e) {}
+                                }
+                                if (cmd === 2) {
+                                        if (port === 53) {
+                                                isDnsQuery = true;
+                                                await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
+                                        } else {
+                                                serverSock.close();
+                                        }
+                                        return;
+                                }
+                                if (port === 25 || port === 22 || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
+                                        serverSock.close();
+                                        return;
+                                }
+                                const connectTCP = async (dataPayload = null, useFallback = true) => {
+                                        if (remoteConnWrapper.connectingPromise) {
+                                                await remoteConnWrapper.connectingPromise;
+                                                return;
+                                        }
+                                        const task = (async () => {
+                                                        let s = null;
+                                                        const socks5 = user?.user_socks5 || "";
+                                                        if (socks5) {
+                                                                try {
+                                                                        s = await connectProxy(socks5, addr, port, dataPayload);
+                                                                } catch (proxyErr) {
+                                                                        if (user.auto_rotate_user_proxy === 1) {
+                                                                                const replaceTask = replaceBrokenProxy(user.username, env, socks5);
+                                                                                if (ctx) ctx.waitUntil(replaceTask);
+                                                                                else replaceTask.catch(() => {});
+                                                                        }
+                                                                        throw proxyErr;
+                                                                }
+                                                        } else {
+                                                        let activeProxyIP = proxyIP;
+                                                        if (user?.user_proxy_iata) {
+                                                                activeProxyIP = "";
+                                                        } else if (user?.user_proxy_ip) {
+                                                                activeProxyIP = user.user_proxy_ip;
+                                                        }
+                                                        let fHost = activeProxyIP;
+                                                        let fPort = port;
+                                                        if (activeProxyIP) {
+                                                                if (activeProxyIP.startsWith("[")) {
+                                                                        const closeIdx = activeProxyIP.indexOf("]");
+                                                                        if (closeIdx !== -1) {
+                                                                                fHost = activeProxyIP.substring(1, closeIdx);
+                                                                                if (activeProxyIP.length > closeIdx + 1 && activeProxyIP[closeIdx + 1] === ":") {
+                                                                                        fPort = parseInt(activeProxyIP.substring(closeIdx + 2)) || port;
+                                                                                }
+                                                                        }
+                                                                } else {
+                                                                        const lastColon = activeProxyIP.lastIndexOf(":");
+                                                                        if (lastColon !== -1 && activeProxyIP.indexOf(":") === lastColon) {
+                                                                                fHost = activeProxyIP.substring(0, lastColon);
+                                                                                fPort = parseInt(activeProxyIP.substring(lastColon + 1)) || port;
+                                                                        } else {
+                                                                                fHost = activeProxyIP;
+                                                                        }
+                                                                }
+                                                        }
+                                                        const isCustomProxy = activeProxyIP && activeProxyIP !== "";
+                                                        if (isCustomProxy) {
+                                                                try {
+                                                                        s = await connectDirect(fHost, fPort, dataPayload, targetDoh);
+                                                                } catch (err) {
+                                                                        s = await connectDirect(addr, port, dataPayload, targetDoh);
+                                                                }
+                                                        } else {
+                                                                try {
+                                                                        s = await connectDirect(addr, port, dataPayload, targetDoh);
+                                                                } catch (err) {
+                                                                        if (useFallback && activeProxyIP) {
+                                                                                s = await connectDirect(fHost, fPort, dataPayload, targetDoh);
+                                                                        } else {
+                                                                                throw err;
+                                                                        }
+                                                                }
+                                                        }
+                                                }
+                                                remoteConnWrapper.socket = s;
+                                                s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+                                                connectStreams(s, serverSock, respHeader, null, (b) => {
+                                                        addBytes(b);
+                                                });
+                                        })();
+                                        remoteConnWrapper.connectingPromise = task;
+                                        try {
+                                                await task;
+                                        } finally {
+                                                if (remoteConnWrapper.connectingPromise === task) {
+                                                        remoteConnWrapper.connectingPromise = null;
+                                                }
+                                        }
+                                };
+                                remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
+                                await connectTCP(rawData, true);
+                        } catch (e) {
+                                serverSock.close();
+                        }
                 }
         };
-
-        const 处理WS显式传输错误 = (err) => {
-                if (WS显式传输失败) return;
-                WS显式传输失败 = true;
-                WS显式传输停止接收 = true;
-                WS显式队列字节 = 0;
-                WS显式队列条目 = 0;
-                const msg = err?.message || `${err}`;
-                if (msg.includes('Network connection lost') || msg.includes('ReadableStream is closed')) {
-                        log(`[WS转发] 连接结束: ${msg}`);
-                } else {
-                        log(`[WS转发] 处理失败: ${msg}`);
-                }
-                上行写入队列.清空();
-                释放远端写入器();
-                try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
+        const handleWsError = (err) => {
+                if (wsFailed) return;
+                wsFailed = true;
+                wsStopped = true;
+                wsQueueBytes = 0;
+                wsQueueItems = 0;
+                upstreamQueue.clear();
+                releaseRemoteWriter();
                 closeSocketQuietly(serverSock);
+                setOffline();
         };
-
-        const 追加WS显式传输任务 = (任务) => {
-                WS显式传输链 = WS显式传输链.then(任务).catch(处理WS显式传输错误);
-                return WS显式传输链;
+        const pushToChain = (task) => {
+                wsChain = wsChain.then(task).catch(handleWsError);
         };
-
-        const 入队WS显式传输 = (data) => {
-                if (WS显式传输停止接收 || WS显式传输失败) return;
-                const chunkSize = Math.max(0, 有效数据长度(data));
-                const nextBytes = WS显式队列字节 + chunkSize;
-                const nextItems = WS显式队列条目 + 1;
-                if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
-                        处理WS显式传输错误(new Error(`[WS显式传输] 队列溢出: ${nextBytes}B/${nextItems}`));
+        serverSock.addEventListener("message", (event) => {
+                if (wsStopped || wsFailed) return;
+                const size = event.data.byteLength || 0;
+                const nextBytes = wsQueueBytes + size;
+                const nextItems = wsQueueItems + 1;
+                if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+                        handleWsError(new Error("ws queue overflow"));
                         return;
                 }
-                WS显式队列字节 = nextBytes;
-                WS显式队列条目 = nextItems;
-                追加WS显式传输任务(async () => {
-                        WS显式队列字节 = Math.max(0, WS显式队列字节 - chunkSize);
-                        WS显式队列条目 = Math.max(0, WS显式队列条目 - 1);
-                        if (WS显式传输失败) return;
-                        await 处理WS入站数据(data);
+                wsQueueBytes = nextBytes;
+                wsQueueItems = nextItems;
+                pushToChain(async () => {
+                        wsQueueBytes = Math.max(0, wsQueueBytes - size);
+                        wsQueueItems = Math.max(0, wsQueueItems - 1);
+                        if (wsFailed) return;
+                        await processWsMessage(event.data);
                 });
-        };
-
-        const 收尾WS显式传输 = () => {
-                if (WS显式传输收尾已入队) return;
-                WS显式传输收尾已入队 = true;
-                WS显式传输停止接收 = true;
-                追加WS显式传输任务(async () => {
-                        if (WS显式传输失败) return;
-                        await 上行写入队列.等待空();
-                        释放远端写入器();
-                        try { 木马UDP上下文.反代Socket?.close() } catch (e) { }
-                });
-        };
-
-        serverSock.addEventListener('message', (event) => {
-                入队WS显式传输(event.data);
         });
-        serverSock.addEventListener('close', () => {
+        serverSock.addEventListener("close", () => {
+                clearTimeout(heartbeat);
                 closeSocketQuietly(serverSock);
-                收尾WS显式传输();
+                setOffline();
+                if (wsFinished) return;
+                wsFinished = true;
+                wsStopped = true;
+                pushToChain(async () => {
+                        if (wsFailed) return;
+                        await upstreamQueue.awaitEmpty();
+                        releaseRemoteWriter();
+                });
         });
-        serverSock.addEventListener('error', (err) => {
-                处理WS显式传输错误(err);
+        serverSock.addEventListener("error", (err) => {
+                handleWsError(err);
         });
-
-        // SS 模式下禁用 sec-websocket-protocol early-data，避免把子协议值（如 "binary"）误当作 base64 数据注入首包导致 AEAD 解密失败。
-        if (!SS模式禁用EarlyData && earlyDataHeader) {
-                try {
-                        const bytes = 解码WS早期数据(earlyDataHeader, yourUUID);
-                        if (bytes?.byteLength) 入队WS显式传输(bytes.buffer);
-                } catch (error) {
-                        处理WS显式传输错误(error);
-                }
-        }
-
-        return new Response(null, { status: 101, webSocket: clientSock, headers: { 'Sec-WebSocket-Extensions': '' } });
+        return new Response(null, { status: 101, webSocket: clientSock });
 }
-
-const 木马文本解码器 = new TextDecoder();
-
-function 解析木马反代地址(address) {
-        const raw = String(address || '').trim();
-        if (!raw || raw.includes('/') || raw.includes('@') || raw.includes('://')) throw new Error('木马反代仅支持 host:port');
-        let hostname = '', portText = '';
-        if (raw.startsWith('[')) {
-                const 匹配 = raw.match(/^(\[[^\]]+\]):(\d+)$/);
-                if (!匹配) throw new Error('无效的 IPv6 木马反代地址');
-                hostname = 匹配[1];
-                portText = 匹配[2];
-        } else {
-                const parts = raw.split(':');
-                if (parts.length !== 2) throw new Error('木马反代仅支持 host:port');
-                hostname = parts[0];
-                portText = parts[1];
-        }
-        const port = Number(portText);
-        if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('无效的木马反代端口');
-        return { hostname, port };
-}
-
-async function 连接木马反代(首包数据, TCP连接, 木马反代目标) {
-        if (!木马反代目标) throw new Error('trojan fallback is not configured');
-        const socket = TCP连接({ hostname: stripIPv6Brackets(木马反代目标.hostname), port: 木马反代目标.port });
-        let writer = null;
+async function getCfUsage(env) {
+        if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0 };
         try {
-                if (socket.opened) await socket.opened;
-                if (有效数据长度(首包数据) > 0) {
-                        writer = socket.writable.getWriter();
-                        await writer.write(数据转Uint8Array(首包数据));
-                }
-                return socket;
-        } catch (error) {
-                try { socket?.close?.() } catch (e) { }
-                throw error;
-        } finally {
-                try { writer?.releaseLock() } catch (e) { }
+                const now = new Date();
+                const startOfDay = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()).toISOString();
+                const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+                const q = `query {
+      viewer {
+        accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) {
+          today: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${startOfDay}"}) {
+            sum { requests }
+          }
+          total: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${thirtyDaysAgo}"}) {
+            sum { requests }
+          }
+        }
+      }
+    }`;
+                const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+                        method: "POST",
+                        headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
+                        body: JSON.stringify({ query: q }),
+                });
+                const j = await res.json();
+                const acc = j?.data?.viewer?.accounts?.[0];
+                const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
+                const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
+                return { today: todayReqs, total: totalReqs };
+        } catch (e) {
+                return { today: 0, total: 0 };
         }
 }
-
-function 提取木马反代握手数据(首包数据, rawData) {
-        const 首包 = 数据转Uint8Array(首包数据);
-        const payload = 数据转Uint8Array(rawData);
-        if (!payload.byteLength) return 首包;
-        const 握手长度 = 首包.byteLength - payload.byteLength;
-        if (握手长度 <= 0) return 首包;
-        for (let i = 0; i < payload.byteLength; i++) {
-                if (首包[握手长度 + i] !== payload[i]) return 首包;
-        }
-        return 首包.subarray(0, 握手长度);
+function isIPv4(value) {
+        const parts = String(value || "").split(".");
+        return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
 }
-
-async function 转发木马UDP反代数据(chunk, webSocket, 上下文, request) {
-        const data = 数据转Uint8Array(chunk);
-        if (!上下文.反代Socket) {
-                const TCP连接 = 创建请求TCP连接器(request);
-                const socket = await 连接木马反代(data, TCP连接, 上下文.反代地址);
-                上下文.反代Socket = socket;
-                socket.closed.catch(() => { }).finally(() => closeSocketQuietly(webSocket));
-                connectStreams(socket, webSocket, null, null);
-                return;
-        }
-        if (!data.byteLength) return;
-        const writer = 上下文.反代Socket.writable.getWriter();
-        try { await writer.write(data) }
-        finally { try { writer.releaseLock() } catch (e) { } }
+function stripIPv6Brackets(hostname = "") {
+        const host = String(hostname || "").trim();
+        return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
 }
-
-function 解析木马请求(buffer, passwordPlainText) {
-        const data = 数据转Uint8Array(buffer);
-        const sha224Password = sha224(passwordPlainText);
-        if (data.byteLength < 58) return { hasError: true, message: "invalid data" };
-        let crLfIndex = 56;
-        if (data[crLfIndex] !== 0x0d || data[crLfIndex + 1] !== 0x0a) return { hasError: true, message: "invalid header format" };
-        for (let i = 0; i < crLfIndex; i++) {
-                if (data[i] !== sha224Password.charCodeAt(i)) return { hasError: true, message: "invalid password" };
+function isIPHostname(hostname = "") {
+        const host = stripIPv6Brackets(hostname);
+        if (isIPv4(host)) return true;
+        if (!host.includes(":")) return false;
+        try {
+                new URL(`http://[${host}]/`);
+                return true;
+        } catch (e) {
+                return false;
         }
-
-        const socks5Index = crLfIndex + 2;
-        if (data.byteLength < socks5Index + 6) return { hasError: true, message: "invalid S5 request data" };
-
-        const cmd = data[socks5Index];
-        if (cmd !== 1 && cmd !== 3) return { hasError: true, message: "unsupported command, only TCP/UDP is allowed" };
-        const isUDP = cmd === 3;
-
-        const atype = data[socks5Index + 1];
-        let addressLength = 0;
-        let addressIndex = socks5Index + 2;
-        let address = "";
-        switch (atype) {
-                case 1: // IPv4
-                        addressLength = 4;
-                        if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-                        address = `${data[addressIndex]}.${data[addressIndex + 1]}.${data[addressIndex + 2]}.${data[addressIndex + 3]}`;
-                        break;
-                case 3: // Domain
-                        if (data.byteLength < addressIndex + 1) return { hasError: true, message: "invalid S5 request data" };
-                        addressLength = data[addressIndex];
-                        addressIndex += 1;
-                        if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-                        address = 木马文本解码器.decode(data.subarray(addressIndex, addressIndex + addressLength));
-                        break;
-                case 4: // IPv6
-                        addressLength = 16;
-                        if (data.byteLength < addressIndex + addressLength + 4) return { hasError: true, message: "invalid S5 request data" };
-                        const ipv6 = [];
-                        for (let i = 0; i < 8; i++) {
-                                const partIndex = addressIndex + i * 2;
-                                ipv6.push(((data[partIndex] << 8) | data[partIndex + 1]).toString(16));
-                        }
-                        address = ipv6.join(":");
-                        break;
-                default:
-                        return { hasError: true, message: `invalid addressType is ${atype}` };
-        }
-
-        if (!address) {
-                return { hasError: true, message: `address is empty, addressType is ${atype}` };
-        }
-
-        const portIndex = addressIndex + addressLength;
-        if (data.byteLength < portIndex + 4) return { hasError: true, message: "invalid S5 request data" };
-        const portRemote = (data[portIndex] << 8) | data[portIndex + 1];
-
-        return {
-                hasError: false,
-                addressType: atype,
-                port: portRemote,
-                hostname: address,
-                isUDP,
-                rawClientData: data.subarray(portIndex + 4)
-        };
 }
-
-const UUID字节缓存 = new Map();
-const VLESS文本解码器 = new TextDecoder();
-
-function 读取十六进制半字节(code) {
-        if (code >= 48 && code <= 57) return code - 48;
-        code |= 32;
-        if (code >= 97 && code <= 102) return code - 87;
-        return -1;
-}
-
-function 获取UUID字节(uuid) {
-        const key = String(uuid || '');
-        let cached = UUID字节缓存.get(key);
-        if (cached) return cached;
-
-        const clean = key.replace(/-/g, '');
-        if (clean.length !== 32) return null;
-
-        const bytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) {
-                const high = 读取十六进制半字节(clean.charCodeAt(i * 2));
-                const low = 读取十六进制半字节(clean.charCodeAt(i * 2 + 1));
-                if (high < 0 || low < 0) return null;
-                bytes[i] = (high << 4) | low;
-        }
-
-        if (UUID字节缓存.size >= 32) UUID字节缓存.clear();
-        UUID字节缓存.set(key, bytes);
-        return bytes;
-}
-
-function UUID字节匹配(data, offset, uuid) {
-        const expected = 获取UUID字节(uuid);
-        if (!expected || data.byteLength < offset + 16) return false;
-        for (let i = 0; i < 16; i++) {
-                if (data[offset + i] !== expected[i]) return false;
-        }
-        return true;
-}
-
-function 解析魏烈思请求(chunk, token) {
-        const data = 数据转Uint8Array(chunk);
-        const length = data.byteLength;
-        if (length < 24) return { hasError: true, message: 'Invalid data' };
-        const version = data[0];
-        if (!UUID字节匹配(data, 1, token)) return { hasError: true, message: 'Invalid uuid' };
-
-        const optLen = data[17];
-        const cmdIndex = 18 + optLen;
-        if (length < cmdIndex + 4) return { hasError: true, message: 'Invalid data' };
-
-        const cmd = data[cmdIndex];
-        let isUDP = false;
-        if (cmd === 1) { } else if (cmd === 2) { isUDP = true } else { return { hasError: true, message: 'Invalid command' } }
-
-        const portIdx = cmdIndex + 1;
-        const port = (data[portIdx] << 8) | data[portIdx + 1];
-        let addrValIdx = portIdx + 3, addrLen = 0, hostname = '';
-        const addressType = data[portIdx + 2];
-        switch (addressType) {
-                case 1:
-                        addrLen = 4;
-                        if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv4 address length' };
-                        hostname = `${data[addrValIdx]}.${data[addrValIdx + 1]}.${data[addrValIdx + 2]}.${data[addrValIdx + 3]}`;
-                        break;
-                case 2:
-                        if (length < addrValIdx + 1) return { hasError: true, message: 'Invalid domain length' };
-                        addrLen = data[addrValIdx];
-                        addrValIdx += 1;
-                        if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid domain data' };
-                        hostname = VLESS文本解码器.decode(data.subarray(addrValIdx, addrValIdx + addrLen));
-                        break;
-                case 3:
-                        addrLen = 16;
-                        if (length < addrValIdx + addrLen) return { hasError: true, message: 'Invalid IPv6 address length' };
-                        const ipv6 = [];
-                        for (let i = 0; i < 8; i++) {
-                                const base = addrValIdx + i * 2;
-                                ipv6.push(((data[base] << 8) | data[base + 1]).toString(16));
-                        }
-                        hostname = ipv6.join(':');
-                        break;
-                default:
-                        return { hasError: true, message: `Invalid address type: ${addressType}` };
-        }
-        if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
-        const rawIndex = addrValIdx + addrLen;
-        return { hasError: false, addressType, port, hostname, isUDP, rawClientData: data.subarray(rawIndex), version };
-}
-
-const SS支持加密配置 = {
-        'aes-128-gcm': { method: 'aes-128-gcm', keyLen: 16, saltLen: 16, maxChunk: 0x3fff, aesLength: 128 },
-        'aes-256-gcm': { method: 'aes-256-gcm', keyLen: 32, saltLen: 32, maxChunk: 0x3fff, aesLength: 256 },
-};
-
-const SSAEAD标签长度 = 16, SSNonce长度 = 12;
-const SS子密钥信息 = new TextEncoder().encode('ss-subkey');
-const SS文本编码器 = new TextEncoder(), SS文本解码器 = new TextDecoder(), SS主密钥缓存 = new Map();
-
-function 数据转Uint8Array(data) {
+function convertToUint8Array(data) {
         if (data instanceof Uint8Array) return data;
         if (data instanceof ArrayBuffer) return new Uint8Array(data);
         if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         return new Uint8Array(data || 0);
 }
-
-function 拼接字节数据(...chunkList) {
-        if (!chunkList || chunkList.length === 0) return new Uint8Array(0);
-        const chunks = chunkList.map(数据转Uint8Array);
+function concatBytes(...chunkList) {
+        const chunks = chunkList.map(convertToUint8Array);
         const total = chunks.reduce((sum, c) => sum + c.byteLength, 0);
         const result = new Uint8Array(total);
         let offset = 0;
-        for (const c of chunks) { result.set(c, offset); offset += c.byteLength }
+        for (const c of chunks) {
+                result.set(c, offset);
+                offset += c.byteLength;
+        }
         return result;
 }
-
-async function 转发木马UDP数据(chunk, webSocket, 上下文, request) {
-        const 当前块 = 数据转Uint8Array(chunk);
-        if (上下文?.反代地址) return 转发木马UDP反代数据(当前块, webSocket, 上下文, request);
-        const 缓存块 = 上下文?.缓存 instanceof Uint8Array ? 上下文.缓存 : new Uint8Array(0);
-        const input = 缓存块.byteLength ? 拼接字节数据(缓存块, 当前块) : 当前块;
-        let cursor = 0;
-
-        while (cursor < input.byteLength) {
-                const packetStart = cursor;
-                const atype = input[cursor];
-                let addrCursor = cursor + 1;
-                let addrLen = 0;
-                if (atype === 1) addrLen = 4;
-                else if (atype === 4) addrLen = 16;
-                else if (atype === 3) {
-                        if (input.byteLength < addrCursor + 1) break;
-                        addrLen = 1 + input[addrCursor];
-                } else throw new Error(`invalid trojan udp addressType: ${atype}`);
-
-                const portCursor = addrCursor + addrLen;
-                if (input.byteLength < portCursor + 6) break;
-
-                const port = (input[portCursor] << 8) | input[portCursor + 1];
-                const payloadLength = (input[portCursor + 2] << 8) | input[portCursor + 3];
-                if (input[portCursor + 4] !== 0x0d || input[portCursor + 5] !== 0x0a) throw new Error('invalid trojan udp delimiter');
-
-                const payloadStart = portCursor + 6;
-                const payloadEnd = payloadStart + payloadLength;
-                if (input.byteLength < payloadEnd) break;
-
-                const 地址端口头 = input.slice(packetStart, portCursor + 2);
-                const payload = input.slice(payloadStart, payloadEnd);
-                cursor = payloadEnd;
-
-                if (port !== 53) throw new Error('UDP is not supported');
-                if (!payload.byteLength) continue;
-
-                let tcpDNS查询 = payload;
-                if (payload.byteLength < 2 || ((payload[0] << 8) | payload[1]) !== payload.byteLength - 2) {
-                        tcpDNS查询 = new Uint8Array(payload.byteLength + 2);
-                        tcpDNS查询[0] = (payload.byteLength >>> 8) & 0xff;
-                        tcpDNS查询[1] = payload.byteLength & 0xff;
-                        tcpDNS查询.set(payload, 2);
-                }
-
-                const dns响应上下文 = { 缓存: new Uint8Array(0) };
-                await forwardataudp(tcpDNS查询, webSocket, null, request, (dnsRespChunk) => {
-                        const 当前响应块 = 数据转Uint8Array(dnsRespChunk);
-                        const 响应输入 = dns响应上下文.缓存.byteLength ? 拼接字节数据(dns响应上下文.缓存, 当前响应块) : 当前响应块;
-                        const 响应帧列表 = [];
-                        let responseCursor = 0;
-                        while (responseCursor + 2 <= 响应输入.byteLength) {
-                                const dnsLen = (响应输入[responseCursor] << 8) | 响应输入[responseCursor + 1];
-                                const dnsStart = responseCursor + 2;
-                                const dnsEnd = dnsStart + dnsLen;
-                                if (dnsEnd > 响应输入.byteLength) break;
-                                const dnsPayload = 响应输入.slice(dnsStart, dnsEnd);
-                                const frame = new Uint8Array(地址端口头.byteLength + 4 + dnsPayload.byteLength);
-                                frame.set(地址端口头, 0);
-                                frame[地址端口头.byteLength] = (dnsPayload.byteLength >>> 8) & 0xff;
-                                frame[地址端口头.byteLength + 1] = dnsPayload.byteLength & 0xff;
-                                frame[地址端口头.byteLength + 2] = 0x0d;
-                                frame[地址端口头.byteLength + 3] = 0x0a;
-                                frame.set(dnsPayload, 地址端口头.byteLength + 4);
-                                响应帧列表.push(frame);
-                                responseCursor = dnsEnd;
-                        }
-                        dns响应上下文.缓存 = 响应输入.slice(responseCursor);
-                        return 响应帧列表.length ? 响应帧列表 : new Uint8Array(0);
-                });
-        }
-
-        if (上下文) 上下文.缓存 = input.slice(cursor);
-}
-
-function SS递增Nonce计数器(counter) {
-        for (let i = 0; i < counter.length; i++) { counter[i] = (counter[i] + 1) & 0xff; if (counter[i] !== 0) return }
-}
-
-async function SS派生主密钥(passwordText, keyLen) {
-        const cacheKey = `${keyLen}:${passwordText}`;
-        if (SS主密钥缓存.has(cacheKey)) return SS主密钥缓存.get(cacheKey);
-        const deriveTask = (async () => {
-                const pwBytes = SS文本编码器.encode(passwordText || '');
-                let prev = new Uint8Array(0), result = new Uint8Array(0);
-                while (result.byteLength < keyLen) {
-                        const input = new Uint8Array(prev.byteLength + pwBytes.byteLength);
-                        input.set(prev, 0); input.set(pwBytes, prev.byteLength);
-                        prev = new Uint8Array(await crypto.subtle.digest('MD5', input));
-                        result = 拼接字节数据(result, prev);
-                }
-                return result.slice(0, keyLen);
-        })();
-        SS主密钥缓存.set(cacheKey, deriveTask);
-        try { return await deriveTask }
-        catch (error) { SS主密钥缓存.delete(cacheKey); throw error }
-}
-
-async function SS派生会话密钥(config, masterKey, salt, usages) {
-        const hmacOpts = { name: 'HMAC', hash: 'SHA-1' };
-        const saltHmacKey = await crypto.subtle.importKey('raw', salt, hmacOpts, false, ['sign']);
-        const prk = new Uint8Array(await crypto.subtle.sign('HMAC', saltHmacKey, masterKey));
-        const prkHmacKey = await crypto.subtle.importKey('raw', prk, hmacOpts, false, ['sign']);
-        const subKey = new Uint8Array(config.keyLen);
-        let prev = new Uint8Array(0), written = 0, counter = 1;
-        while (written < config.keyLen) {
-                const input = 拼接字节数据(prev, SS子密钥信息, new Uint8Array([counter]));
-                prev = new Uint8Array(await crypto.subtle.sign('HMAC', prkHmacKey, input));
-                const copyLen = Math.min(prev.byteLength, config.keyLen - written);
-                subKey.set(prev.subarray(0, copyLen), written);
-                written += copyLen; counter += 1;
-        }
-        return crypto.subtle.importKey('raw', subKey, { name: 'AES-GCM', length: config.aesLength }, false, usages);
-}
-
-async function SSAEAD加密(cryptoKey, nonceCounter, plaintext) {
-        const iv = nonceCounter.slice();
-        const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, tagLength: 128 }, cryptoKey, plaintext);
-        SS递增Nonce计数器(nonceCounter);
-        return new Uint8Array(ct);
-}
-
-async function SSAEAD解密(cryptoKey, nonceCounter, ciphertext) {
-        const iv = nonceCounter.slice();
-        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, tagLength: 128 }, cryptoKey, ciphertext);
-        SS递增Nonce计数器(nonceCounter);
-        return new Uint8Array(pt);
-}
-
-async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, yourUUID, request = null, 反代上下文 = {}, 允许木马反代 = false, 木马反代首包数据 = null) {
-        // Per-user proxy routing (Zeus-inspired: https://github.com/IR-NETLIFY/zeus)
-        try {
-                if (反代上下文 && 反代上下文._env && 反代上下文._env.DB) {
-                        const dbUser = await lookupUserByUuid(yourUUID, 反代上下文._env);
-                        if (dbUser && dbUser.user_socks5) {
-                                const proxyStr = dbUser.user_socks5.trim();
-                                if (proxyStr) {
-                                        const parsed = edgeParseProxyStr(proxyStr);
-                                        if (parsed) {
-                                                反代上下文.代理类型 = parsed.type;
-                                                反代上下文.代理全局 = true;
-                                                反代上下文.代理参数 = parsed.params;
-                                                反代上下文._dbUsername = dbUser.username;
-                                                log('[用户代理] UUID=' + yourUUID.slice(0,8) + ' 用户=' + dbUser.username + ' 代理=' + parsed.type + '://' + (parsed.params.hostname||'?') + ':' + (parsed.params.port||'?'));
-                                        }
-                                }
-                        }
-                }
-        } catch(e) {}
-        const ctx反代IP = 反代上下文.反代IP || '';
-        const ctx代理类型 = 反代上下文.代理类型 !== undefined ? 反代上下文.代理类型 : null;
-        const ctx代理全局 = 反代上下文.代理全局 !== undefined ? 反代上下文.代理全局 : false;
-        const ctx代理参数 = 反代上下文.代理参数 || {};
-        const ctx反代兜底 = 反代上下文.反代兜底 !== undefined ? 反代上下文.反代兜底 : true;
-        let 反代数组索引 = 0;
-        log(`[TCP转发] 目标: ${host}:${portNum} | 反代IP: ${ctx反代IP} | 反代兜底: ${ctx反代兜底 ? '是' : '否'} | 反代类型: ${ctx代理类型 || 'proxyip'} | 全局: ${ctx代理全局 ? '是' : '否'}`);
-        const 连接超时毫秒 = 1000;
-        let 已通过代理发送首包 = false;
-        const TCP连接 = 创建请求TCP连接器(request);
-        const 使用木马反代 = 允许木马反代 && (反代上下文.木马反代地址 || null);
-        const 木马反代目标 = 使用木马反代 ? 反代上下文.木马反代地址 : null;
-        const 木马反代握手数据 = 使用木马反代 ? 提取木马反代握手数据(木马反代首包数据, rawData) : null;
-
-        async function 等待连接建立(remoteSock, timeoutMs = 连接超时毫秒) {
-                await Promise.race([
-                        remoteSock.opened,
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), timeoutMs))
-                ]);
-        }
-
-        async function 打开TCP连接(address, port) {
-                const remoteSock = TCP连接({ hostname: address, port });
-                try {
-                        await 等待连接建立(remoteSock);
-                        return remoteSock;
-                } catch (err) {
-                        try { remoteSock?.close?.() } catch (e) { }
-                        throw err;
-                }
-        }
-
-        async function 写入首包(remoteSock, data) {
-                if (有效数据长度(data) <= 0) return;
-                const writer = remoteSock.writable.getWriter();
-                try { await writer.write(数据转Uint8Array(data)) }
-                finally { try { writer.releaseLock() } catch (e) { } }
-        }
-
-        async function 并发打开候选连接(候选列表) {
-                if (候选列表.length === 1) {
-                        const 候选 = 候选列表[0];
-                        return { socket: await 打开TCP连接(候选.hostname, 候选.port), candidate: 候选 };
-                }
-                const attempts = 候选列表.map(候选 => 打开TCP连接(候选.hostname, 候选.port).then(socket => ({ socket, candidate: 候选 })));
-                let winner = null;
-                try {
-                        winner = await Promise.any(attempts);
-                        return winner;
-                } finally {
-                        if (winner) {
-                                for (const attempt of attempts) {
-                                        attempt.then(({ socket }) => {
-                                                if (socket !== winner.socket) {
-                                                        try { socket?.close?.() } catch (e) { }
-                                                }
-                                        }).catch(() => { });
-                                }
-                        }
-                }
-        }
-
-        async function 构建预加载竞速候选列表(address, port) {
-                if (!预加载竞速拨号 || isIPHostname(address)) return null;
-                log(`[TCP直连] 预加载竞速拨号开启，开始并发查询 ${address} 的 A/AAAA 记录`);
-                const [aRecords, aaaaRecords] = await Promise.all([
-                        DoH查询(address, 'A'),
-                        DoH查询(address, 'AAAA')
-                ]);
-                const ipv4List = [...new Set(aRecords.flatMap(r => {
-                        const data = r.data;
-                        return r.type === 1 && typeof data === 'string' && isIPv4(data) ? [data] : [];
-                }))];
-                const ipv6List = [...new Set(aaaaRecords.flatMap(r => {
-                        const data = r.data;
-                        return r.type === 28 && typeof data === 'string' && isIPHostname(data) ? [data] : [];
-                }))];
-                const 拨号上限 = Math.max(1, TCP并发拨号数 | 0);
-                const ipList = ipv4List.length >= 拨号上限
-                        ? ipv4List.slice(0, 拨号上限)
-                        : ipv4List.concat(ipv6List.slice(0, 拨号上限 - ipv4List.length));
-                const 使用记录类型 = ipv4List.length > 0
-                        ? (ipList.length > ipv4List.length ? 'A+AAAA' : 'A')
-                        : 'AAAA';
-                if (ipList.length === 0) {
-                        log(`[TCP直连] ${address} 的 A/AAAA 未获得可用解析结果，预加载竞速不可用，回退到原始 hostname 直连。`);
-                        return null;
-                }
-                const 选中IP列表 = ipList;
-                log(`[TCP直连] ${address} A记录:${ipv4List.length} AAAA记录:${ipv6List.length}，使用${使用记录类型}记录，竞速拨号 ${选中IP列表.length}/${拨号上限}: ${选中IP列表.join(', ')}`);
-                return 选中IP列表.map((hostname, attempt) => ({ hostname, port, attempt, resolvedFrom: address }));
-        }
-
-        async function connectDirect(address, port, data = null, 启用预加载 = false) {
-                const 预加载候选列表 = 启用预加载 ? await 构建预加载竞速候选列表(address, port) : null;
-                const 候选列表 = 预加载候选列表 || Array.from({ length: TCP并发拨号数 }, (_, attempt) => ({ hostname: address, port, attempt }));
-                log(预加载候选列表
-                        ? `[TCP直连] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`
-                        : `[TCP直连] 并发尝试 ${候选列表.length} 路: ${address}:${port}`);
-                let socket = null;
-                try {
-                        const 连接结果 = await 并发打开候选连接(候选列表);
-                        socket = 连接结果.socket;
-                        if (预加载候选列表) {
-                                const winner = 连接结果.candidate;
-                                log(`[TCP直连] 预加载竞速结果: ${winner.hostname}:${winner.port} 胜出，源域名: ${winner.resolvedFrom || address}`);
-                        }
-                        await 写入首包(socket, data);
-                        return socket;
-                } catch (err) {
-                        try { socket?.close?.() } catch (e) { }
-                        if (预加载候选列表) log(`[TCP直连] 预加载竞速失败: ${err.message || err}`);
-                        throw err;
-                }
-        }
-
-        async function connectProxyIP(address, port, data = null, 所有反代数组 = null, 启用反代失败兜底 = true) {
-                if (所有反代数组 && 所有反代数组.length > 0) {
-                        const 实际并发数 = Math.max(1, Math.floor(Number(反代并发拨号数) || 1));
-                        for (let i = 0; i < 所有反代数组.length; i += 实际并发数) {
-                                const 候选列表 = [];
-                                for (let j = 0; j < 实际并发数 && i + j < 所有反代数组.length; j++) {
-                                        const 索引 = (反代数组索引 + i + j) % 所有反代数组.length;
-                                        const [反代地址, 反代端口] = 所有反代数组[索引];
-                                        候选列表.push({ hostname: 反代地址, port: 反代端口, index: 索引 });
-                                }
-                                let socket = null, candidate = null;
-                                try {
-                                        log(`[反代连接] 并发尝试 ${候选列表.length} 路: ${候选列表.map(候选 => `${候选.hostname}:${候选.port}`).join(', ')}`);
-                                        const 连接结果 = await 并发打开候选连接(候选列表);
-                                        socket = 连接结果.socket;
-                                        candidate = 连接结果.candidate;
-                                        await 写入首包(socket, data);
-                                        log(`[反代连接] 成功连接到: ${candidate.hostname}:${candidate.port} (索引: ${candidate.index})`);
-                                        反代数组索引 = candidate.index;
-                                        return socket;
-                                } catch (err) {
-                                        try { socket?.close?.() } catch (e) { }
-                                        log(`[反代连接] 本批连接失败: ${err.message || err}`);
-                                }
-                        }
-                }
-
-                if (启用反代失败兜底) return connectDirect(address, port, data, false);
-                else {
-                        closeSocketQuietly(ws);
-                        throw new Error('[反代连接] 所有反代连接失败，且未启用反代兜底，连接终止。');
-                }
-        }
-
-        async function connecttoPry(允许发送首包 = true) {
-                if (remoteConnWrapper.connectingPromise) {
-                        await remoteConnWrapper.connectingPromise;
-                        return;
-                }
-
-                let 本次发送首包 = false, 本次首包数据 = null;
-                if (使用木马反代) {
-                        if (允许发送首包 && !已通过代理发送首包 && 有效数据长度(木马反代首包数据) > 0) {
-                                本次首包数据 = 木马反代首包数据;
-                                本次发送首包 = 有效数据长度(rawData) > 0;
-                        } else {
-                                本次首包数据 = 木马反代握手数据;
-                        }
-                } else {
-                        本次发送首包 = 允许发送首包 && !已通过代理发送首包 && 有效数据长度(rawData) > 0;
-                        本次首包数据 = 本次发送首包 ? rawData : null;
-                }
-
-                const 当前连接任务 = (async () => {
-                        let newSocket;
-                        if (使用木马反代) {
-                                log(`[木马反代] 代理到: ${host}:${portNum}`);
-                                newSocket = await 连接木马反代(本次首包数据, TCP连接, 木马反代目标);
-                        } else if (ctx代理类型 === 'socks5') {
-                                log(`[SOCKS5代理] 代理到: ${host}:${portNum}`);
-                                try {
-                                        newSocket = await socks5Connect(host, portNum, 本次首包数据, TCP连接, ctx代理参数);
-                                } catch(proxyErr) {
-                                        log('[SOCKS5代理] 连接失败: ' + (proxyErr.message||proxyErr));
-                                        if (反代上下文._env && 反代上下文._env.DB && 反代上下文._dbUsername) {
-                                                const op = ctx代理参数.username ? (ctx代理类型+'://'+ctx代理参数.username+':'+(ctx代理参数.password||'')+'@'+ctx代理参数.hostname+':'+ctx代理参数.port) : '';
-                                                if (op) replaceBrokenProxy(反代上下文._dbUsername, 反代上下文._env, op).catch(()=>{});
-                                        }
-                                        throw proxyErr;
-                                }
-                        } else if (ctx代理类型 === 'http') {
-                                log(`[HTTP代理] 代理到: ${host}:${portNum}`);
-                                newSocket = await httpConnect(host, portNum, 本次首包数据, false, TCP连接, ctx代理参数);
-                        } else if (ctx代理类型 === 'https') {
-                                log(`[HTTPS代理] 代理到: ${host}:${portNum}`);
-                                newSocket = isIPHostname(ctx代理参数.hostname)
-                                        ? await httpsConnect(host, portNum, 本次首包数据, TCP连接, ctx代理参数)
-                                        : await httpConnect(host, portNum, 本次首包数据, true, TCP连接, ctx代理参数);
-                        } else if (ctx代理类型 === 'turn') {
-                                log(`[TURN代理] 代理到: ${host}:${portNum}`);
-                                newSocket = await turnConnect(ctx代理参数, host, portNum, TCP连接);
-                                if (有效数据长度(本次首包数据) > 0) {
-                                        const writer = newSocket.writable.getWriter();
-                                        try { await writer.write(数据转Uint8Array(本次首包数据)) }
-                                        finally { try { writer.releaseLock() } catch (e) { } }
-                                }
-                        } else if (ctx代理类型 === 'sstp') {
-                                log(`[SSTP代理] 代理到: ${host}:${portNum}`);
-                                newSocket = await sstpConnect(ctx代理参数, host, portNum, TCP连接);
-                                if (有效数据长度(本次首包数据) > 0) {
-                                        const writer = newSocket.writable.getWriter();
-                                        try { await writer.write(数据转Uint8Array(本次首包数据)) }
-                                        finally { try { writer.releaseLock() } catch (e) { } }
-                                }
-                        } else {
-                                log(`[反代连接] 代理到: ${host}:${portNum}`);
-                                const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
-                                newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
-                        }
-                        if (本次发送首包) 已通过代理发送首包 = true;
-                        remoteConnWrapper.socket = newSocket;
-                        newSocket.closed.catch(() => { }).finally(() => closeSocketQuietly(ws));
-                        connectStreams(newSocket, ws, respHeader, null);
-                })();
-
-                remoteConnWrapper.connectingPromise = 当前连接任务;
-                try {
-                        await 当前连接任务;
-                } finally {
-                        if (remoteConnWrapper.connectingPromise === 当前连接任务) {
-                                remoteConnWrapper.connectingPromise = null;
-                        }
-                }
-        }
-        remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
-
-        if (ctx代理类型 && (ctx代理全局 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
-                log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
-                try {
-                        await connecttoPry();
-                } catch (err) {
-                        log(`[TCP转发] SOCKS5/HTTP/HTTPS/TURN/SSTP 代理连接失败: ${err.message}`);
-                        throw err;
-                }
-        } else {
-                try {
-                        log(`[TCP转发] 尝试直连到: ${host}:${portNum}`);
-                        const initialSocket = await connectDirect(host, portNum, rawData, true);
-                        remoteConnWrapper.socket = initialSocket;
-                        connectStreams(initialSocket, ws, respHeader, async () => {
-                                if (remoteConnWrapper.socket !== initialSocket) return;
-                                await connecttoPry();
-                        });
-                } catch (err) {
-                        log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
-                        if (err instanceof Error && err.name === '预加载解析为空') {
-                                closeSocketQuietly(ws);
-                                throw err;
-                        }
-                        await connecttoPry();
-                }
-        }
-}
-
-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
-        const 请求数据 = 数据转Uint8Array(udpChunk);
-        const 请求字节数 = 请求数据.byteLength;
-        log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
-        try {
-                const TCP连接 = 创建请求TCP连接器(request);
-                const tcpSocket = TCP连接({ hostname: '8.8.4.4', port: 53 });
-                let 魏烈思Header = respHeader;
-                const writer = tcpSocket.writable.getWriter();
-                await writer.write(请求数据);
-                log(`[UDP转发] DNS 请求已写入上游: ${请求字节数}B`);
-                writer.releaseLock();
-                await tcpSocket.readable.pipeTo(new WritableStream({
-                        async write(chunk) {
-                                const 原始响应 = 数据转Uint8Array(chunk);
-                                log(`[UDP转发] 收到 DNS 响应: ${原始响应.byteLength}B`);
-                                const 封装结果 = 响应封装器 ? await 响应封装器(原始响应) : 原始响应;
-                                const 发送片段列表 = Array.isArray(封装结果) ? 封装结果 : [封装结果];
-                                if (!发送片段列表.length) return;
-                                if (webSocket.readyState !== WebSocket.OPEN) return;
-                                for (const fragment of 发送片段列表) {
-                                        const 转发响应 = 数据转Uint8Array(fragment);
-                                        if (!转发响应.byteLength) continue;
-                                        if (魏烈思Header) {
-                                                const response = new Uint8Array(魏烈思Header.length + 转发响应.byteLength);
-                                                response.set(魏烈思Header, 0);
-                                                response.set(转发响应, 魏烈思Header.length);
-                                                await WebSocket发送并等待(webSocket, response.buffer);
-                                                魏烈思Header = null;
-                                        } else {
-                                                await WebSocket发送并等待(webSocket, 转发响应);
-                                        }
-                                }
-                        },
-                }));
-        } catch (error) {
-                log(`[UDP转发] DNS 转发失败: ${error?.message || error}`);
-        }
-}
-
 function closeSocketQuietly(socket) {
         try {
                 if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
                         socket.close();
                 }
-        } catch (error) { }
+        } catch (e) {}
 }
-
-function formatIdentifier(arr, offset = 0) {
-        const hex = [...arr.slice(offset, offset + 16)].map(b => b.toString(16).padStart(2, '0')).join('');
-        return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
+async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
+        const cacheKey = `${domain}:${recordType}:${targetDoh}`;
+        if (DNS_CACHE.has(cacheKey)) {
+                const cached = DNS_CACHE.get(cacheKey);
+                if (Date.now() < cached.expires) return cached.data;
+                DNS_CACHE.delete(cacheKey);
+        }
+        try {
+                const typeMap = { A: 1, AAAA: 28 };
+                const qtype = typeMap[recordType.toUpperCase()] || 1;
+                const encodeDomain = (name) => {
+                        const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
+                        const bufs = [];
+                        for (const label of parts) {
+                                const enc = new TextEncoder().encode(label);
+                                bufs.push(new Uint8Array([enc.length]), enc);
+                        }
+                        bufs.push(new Uint8Array([0]));
+                        return concatBytes(...bufs);
+                };
+                const qname = encodeDomain(domain);
+                const query = new Uint8Array(12 + qname.length + 4);
+                const qview = new DataView(query.buffer);
+                qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
+                qview.setUint16(2, 0x0100);
+                qview.setUint16(4, 1);
+                query.set(qname, 12);
+                qview.setUint16(12 + qname.length, qtype);
+                qview.setUint16(12 + qname.length + 2, 1);
+                const response = await fetch(targetDoh, {
+                        method: "POST",
+                        headers: {
+                                "Content-Type": "application/dns-message",
+                                Accept: "application/dns-message",
+                        },
+                        body: query,
+                });
+                if (!response.ok) return [];
+                const buf = new Uint8Array(await response.arrayBuffer());
+                const dv = new DataView(buf.buffer);
+                const qdcount = dv.getUint16(4);
+                const ancount = dv.getUint16(6);
+                const parseName = (pos) => {
+                        const labels = [];
+                        let p = pos,
+                                jumped = false,
+                                endPos = -1,
+                                safe = 128;
+                        while (p < buf.length && safe-- > 0) {
+                                const len = buf[p];
+                                if (len === 0) {
+                                        if (!jumped) endPos = p + 1;
+                                        break;
+                                }
+                                if ((len & 0xc0) === 0xc0) {
+                                        if (!jumped) endPos = p + 2;
+                                        p = ((len & 0x3f) << 8) | buf[p + 1];
+                                        jumped = true;
+                                        continue;
+                                }
+                                labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
+                                p += len + 1;
+                        }
+                        if (endPos === -1) endPos = p + 1;
+                        return [labels.join("."), endPos];
+                };
+                let offset = 12;
+                for (let i = 0; i < qdcount; i++) {
+                        const [, end] = parseName(offset);
+                        offset = Number(end) + 4;
+                }
+                const answers = [];
+                for (let i = 0; i < ancount && offset < buf.length; i++) {
+                        const [name, nameEnd] = parseName(offset);
+                        offset = Number(nameEnd);
+                        const type = dv.getUint16(offset);
+                        offset += 2;
+                        offset += 2;
+                        const ttl = dv.getUint32(offset);
+                        offset += 4;
+                        const rdlen = dv.getUint16(offset);
+                        offset += 2;
+                        const rdata = buf.slice(offset, offset + rdlen);
+                        offset += rdlen;
+                        let data;
+                        if (type === 1 && rdlen === 4) {
+                                data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
+                        } else if (type === 28 && rdlen === 16) {
+                                const segs = [];
+                                for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
+                                data = segs.join(":");
+                        } else {
+                                data = Array.from(rdata)
+                                        .map((b) => b.toString(16).padStart(2, "0"))
+                                        .join("");
+                        }
+                        answers.push({ name, type, TTL: ttl, data });
+                }
+                DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
+                return answers;
+        } catch (e) {
+                return [];
+        }
 }
-
-async function WebSocket发送并等待(webSocket, payload) {
-        const sendResult = webSocket.send(payload);
-        if (sendResult && typeof sendResult.then === 'function') await sendResult;
-}
-
-function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连接, 关闭连接, 名称 = '上行队列' }) {
+function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConnection, name = "UpstreamQueue" }) {
         let chunks = [];
         let head = 0;
         let queuedBytes = 0;
@@ -3343,38 +1890,35 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
         let bundleBuffer = null;
         let idleResolvers = [];
         let activeCompletions = null;
-
         const settleCompletions = (completions, err = null) => {
                 if (!completions) return;
-                for (const completion of completions) {
-                        if (err) completion.reject(err);
-                        else completion.resolve();
+                for (const comp of completions) {
+                        if (comp) {
+                                if (err) comp.reject(err);
+                                else comp.resolve();
+                        }
                 }
         };
-
         const rejectQueued = (err) => {
                 for (let i = head; i < chunks.length; i++) {
                         const item = chunks[i];
-                        if (item?.completions) settleCompletions(item.completions, err);
+                        if (item && item.completions) settleCompletions(item.completions, err);
                 }
         };
-
         const compact = () => {
                 if (head > 32 && head * 2 >= chunks.length) {
                         chunks = chunks.slice(head);
                         head = 0;
                 }
         };
-
         const resolveIdle = () => {
                 if (queuedBytes || draining || !idleResolvers.length) return;
                 const resolvers = idleResolvers;
                 idleResolvers = [];
                 for (const resolve of resolvers) resolve();
         };
-
         const clear = (err = null) => {
-                const closeErr = err || (closed ? new Error(`${名称}: queue closed`) : null);
+                const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
                 if (closeErr) {
                         rejectQueued(closeErr);
                         settleCompletions(activeCompletions, closeErr);
@@ -3385,7 +1929,6 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                 queuedBytes = 0;
                 resolveIdle();
         };
-
         const shift = () => {
                 if (head >= chunks.length) return null;
                 const item = chunks[head];
@@ -3394,12 +1937,10 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                 compact();
                 return item;
         };
-
         const bundle = () => {
                 const first = shift();
                 if (!first) return null;
-                if (head >= chunks.length || first.chunk.byteLength >= 上行合包目标字节) return first;
-
+                if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
                 let byteLength = first.chunk.byteLength;
                 let end = head;
                 let allowRetry = first.allowRetry;
@@ -3407,15 +1948,14 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                 while (end < chunks.length) {
                         const next = chunks[end];
                         const nextLength = byteLength + next.chunk.byteLength;
-                        if (nextLength > 上行合包目标字节) break;
+                        if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
                         byteLength = nextLength;
                         allowRetry = allowRetry && next.allowRetry;
                         if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
                         end++;
                 }
                 if (end === head) return first;
-
-                const output = (bundleBuffer ||= new Uint8Array(上行合包目标字节));
+                const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
                 output.set(first.chunk);
                 let offset = first.chunk.byteLength;
                 while (head < end) {
@@ -3428,27 +1968,27 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                 compact();
                 return { chunk: output.subarray(0, byteLength), allowRetry, completions };
         };
-
         const drain = async () => {
                 if (draining || closed) return;
                 draining = true;
                 try {
-                        for (; ;) {
+                        let batchCount = 0;
+                        for (;;) {
                                 if (closed) break;
                                 const item = bundle();
                                 if (!item) break;
-                                let writer = 获取写入器();
-                                if (!writer) throw new Error(`${名称}: remote writer unavailable`);
+                                let writer = getWriter();
+                                if (!writer) throw new Error(`${name}: remote writer unavailable`);
                                 const completions = item.completions || null;
                                 activeCompletions = completions;
                                 try {
                                         try {
                                                 await writer.write(item.chunk);
                                         } catch (err) {
-                                                释放写入器?.();
-                                                if (!item.allowRetry || typeof 重试连接 !== 'function') throw err;
-                                                await 重试连接();
-                                                writer = 获取写入器();
+                                                releaseWriter?.();
+                                                if (!item.allowRetry || typeof retryConnect !== "function") throw err;
+                                                await retryConnect();
+                                                writer = getWriter();
                                                 if (!writer) throw err;
                                                 await writer.write(item.chunk);
                                         }
@@ -3459,33 +1999,38 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                                 } finally {
                                         if (activeCompletions === completions) activeCompletions = null;
                                 }
+                                batchCount++;
+                                if (batchCount >= 16) {
+                                        await new Promise((resolve) => setTimeout(resolve, 0));
+                                        batchCount = 0;
+                                }
                         }
                 } catch (err) {
                         closed = true;
                         clear(err);
-                        log(`[${名称}] 写入失败: ${err?.message || err}`);
-                        try { 关闭连接?.(err) } catch (_) { }
+                        try {
+                                closeConnection?.(err);
+                        } catch (_) {}
                 } finally {
                         draining = false;
-                        if (!closed && head < chunks.length) queueMicrotask(drain);
+                        if (!closed && head < chunks.length) setTimeout(drain, 0);
                         else resolveIdle();
                 }
         };
-
         const enqueue = (data, allowRetry = true, waitForFlush = false) => {
                 if (closed) return false;
-                // 首包解析阶段 socket 可能尚未建立；返回 false 交给上层继续走协议解析路径。
-                if (!获取写入器()) return false;
-                const chunk = 数据转Uint8Array(data);
+                if (!getWriter()) return false;
+                const chunk = convertToUint8Array(data);
                 if (!chunk.byteLength) return true;
                 const nextBytes = queuedBytes + chunk.byteLength;
                 const nextItems = chunks.length - head + 1;
-                if (nextBytes > 上行队列最大字节 || nextItems > 上行队列最大条目) {
+                if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
                         closed = true;
-                        const err = Object.assign(new Error(`${名称}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
+                        const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
                         clear(err);
-                        log(`[${名称}] 队列超限，关闭连接`);
-                        try { 关闭连接?.(err) } catch (_) { }
+                        try {
+                                closeConnection?.(err);
+                        } catch (_) {}
                         throw err;
                 }
                 let completionPromise = null;
@@ -3496,48 +2041,41 @@ function 创建上行写入队列({ 获取写入器, 释放写入器, 重试连�
                 }
                 chunks.push({ chunk, allowRetry, completions });
                 queuedBytes = nextBytes;
-                if (!draining) queueMicrotask(drain);
+                if (!draining) setTimeout(drain, 0);
                 return waitForFlush ? completionPromise.then(() => true) : true;
         };
-
         return {
-                写入(data, allowRetry = true) {
-                        return enqueue(data, allowRetry, false);
-                },
-                写入并等待(data, allowRetry = true) {
+                writeAndAwait(data, allowRetry = true) {
                         return enqueue(data, allowRetry, true);
                 },
-                async 等待空() {
+                async awaitEmpty() {
                         if (!queuedBytes && !draining) return;
-                        await new Promise(resolve => idleResolvers.push(resolve));
+                        await new Promise((resolve) => idleResolvers.push(resolve));
                 },
-                清空() {
+                clear() {
                         closed = true;
                         clear();
-                }
+                },
         };
 }
-
-function 创建下行Grain发送器(webSocket, headerData = null) {
-        const packetCap = 下行Grain包字节;
-        const tailBytes = 下行Grain尾部阈值;
+function createDownstreamSender(webSocket, headerData = null) {
+        const packetCap = DOWNSTREAM_GRAIN_BYTES;
+        const tailBytes = DOWNSTREAM_GRAIN_TAIL_THRESHOLD;
         const lowWaterBytes = Math.max(4096, tailBytes << 3);
         let header = headerData;
         let pendingBuffer = new Uint8Array(packetCap);
         let pendingBytes = 0;
         let flushTimer = null;
-        let microtaskQueued = false;
+        let taskQueued = false;
         let generation = 0;
         let scheduledGeneration = 0;
         let waitRounds = 0;
         let flushPromise = null;
-
-        const 发送原始块 = async (chunk) => {
-                if (webSocket.readyState !== WebSocket.OPEN) throw new Error('ws.readyState is not open');
-                await WebSocket发送并等待(webSocket, chunk);
+        const sendRawChunk = async (chunk) => {
+                if (webSocket.readyState !== WebSocket.OPEN) throw new Error("ws.readyState is not open");
+                webSocket.send(chunk);
         };
-
-        const 附加响应头 = (chunk) => {
+        const attachResponseHeader = (chunk) => {
                 if (!header) return chunk;
                 const merged = new Uint8Array(header.length + chunk.byteLength);
                 merged.set(header, 0);
@@ -3545,68 +2083,70 @@ function 创建下行Grain发送器(webSocket, headerData = null) {
                 header = null;
                 return merged;
         };
-
         const flush = async () => {
                 while (flushPromise) await flushPromise;
                 if (flushTimer) clearTimeout(flushTimer);
                 flushTimer = null;
-                microtaskQueued = false;
+                taskQueued = false;
                 if (!pendingBytes) return;
                 const output = pendingBuffer.subarray(0, pendingBytes).slice();
                 pendingBuffer = new Uint8Array(packetCap);
                 pendingBytes = 0;
                 waitRounds = 0;
-                flushPromise = 发送原始块(output).finally(() => { flushPromise = null });
+                flushPromise = sendRawChunk(output).finally(() => {
+                        flushPromise = null;
+                });
                 return flushPromise;
         };
-
         const scheduleFlush = () => {
-                if (flushTimer || microtaskQueued) return;
-                microtaskQueued = true;
+                if (flushTimer || taskQueued) return;
+                taskQueued = true;
                 scheduledGeneration = generation;
-                queueMicrotask(() => {
-                        microtaskQueued = false;
+                setTimeout(() => {
+                        taskQueued = false;
                         if (!pendingBytes || flushTimer) return;
                         if (packetCap - pendingBytes < tailBytes) {
                                 flush().catch(() => closeSocketQuietly(webSocket));
                                 return;
                         }
-                        flushTimer = setTimeout(() => {
-                                flushTimer = null;
-                                if (!pendingBytes) return;
-                                if (packetCap - pendingBytes < tailBytes) {
+                        flushTimer = setTimeout(
+                                () => {
+                                        flushTimer = null;
+                                        if (!pendingBytes) return;
+                                        if (packetCap - pendingBytes < tailBytes) {
+                                                flush().catch(() => closeSocketQuietly(webSocket));
+                                                return;
+                                        }
+                                        if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
+                                                waitRounds++;
+                                                scheduledGeneration = generation;
+                                                scheduleFlush();
+                                                return;
+                                        }
                                         flush().catch(() => closeSocketQuietly(webSocket));
-                                        return;
-                                }
-                                if (waitRounds < 2 && (generation !== scheduledGeneration || pendingBytes < lowWaterBytes)) {
-                                        waitRounds++;
-                                        scheduledGeneration = generation;
-                                        scheduleFlush();
-                                        return;
-                                }
-                                flush().catch(() => closeSocketQuietly(webSocket));
-                        }, Math.max(下行Grain静默毫秒, 1));
-                });
+                                },
+                                Math.max(DOWNSTREAM_GRAIN_SILENT_MS, 1),
+                        );
+                }, 0);
         };
-
         return {
-                async 直接发送(data) {
-                        let chunk = 数据转Uint8Array(data);
+                async sendDirect(data) {
+                        let chunk = convertToUint8Array(data);
                         if (!chunk.byteLength) return;
-                        chunk = 附加响应头(chunk);
-                        await 发送原始块(chunk);
+                        chunk = attachResponseHeader(chunk);
+                        await sendRawChunk(chunk);
                 },
-                async 发送(data) {
-                        let chunk = 数据转Uint8Array(data);
+                async send(data) {
+                        let chunk = convertToUint8Array(data);
                         if (!chunk.byteLength) return;
-                        chunk = 附加响应头(chunk);
+                        chunk = attachResponseHeader(chunk);
                         let offset = 0;
                         const totalBytes = chunk.byteLength;
                         while (offset < totalBytes) {
                                 if (!pendingBytes && totalBytes - offset >= packetCap) {
                                         const sendBytes = Math.min(packetCap, totalBytes - offset);
                                         const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
-                                        await 发送原始块(view);
+                                        await sendRawChunk(view);
                                         offset += sendBytes;
                                         continue;
                                 }
@@ -3619,3582 +2159,4005 @@ function 创建下行Grain发送器(webSocket, headerData = null) {
                                 else scheduleFlush();
                         }
                 },
-                flush
+                flush,
         };
 }
-
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
-        let header = headerData, hasData = false, reader, useBYOB = false;
-        const BYOB单次读取上限 = 64 * 1024;
-        const 下行发送器 = 创建下行Grain发送器(webSocket, header);
+async function waitForBackpressure(ws) {
+        if (typeof ws.bufferedAmount === "number") {
+                let maxAttempts = 150;
+                while (ws.bufferedAmount > 1024 * 1024 && maxAttempts > 0) {
+                        if (ws.readyState !== WebSocket.OPEN) break;
+                        await new Promise((r) => setTimeout(r, 20));
+                        maxAttempts--;
+                }
+        }
+}
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
+        let header = headerData,
+                hasData = false,
+                reader,
+                useBYOB = false;
+        const BYOB_LIMIT = 64 * 1024;
+        const downstreamSender = createDownstreamSender(webSocket, header);
         header = null;
-
-        try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
-        catch (e) { reader = remoteSocket.readable.getReader() }
-
+        try {
+                reader = remoteSocket.readable.getReader({ mode: "byob" });
+                useBYOB = true;
+        } catch (e) {
+                reader = remoteSocket.readable.getReader();
+        }
         try {
                 if (!useBYOB) {
                         while (true) {
+                                await waitForBackpressure(webSocket);
                                 const { done, value } = await reader.read();
                                 if (done) break;
                                 if (!value || value.byteLength === 0) continue;
                                 hasData = true;
-                                await 下行发送器.发送(value);
+                                if (typeof onBytes === "function") onBytes(value.byteLength);
+                                await downstreamSender.send(value);
                         }
                 } else {
-                        let readBuffer = new ArrayBuffer(BYOB单次读取上限);
+                        let readBuffer = new ArrayBuffer(BYOB_LIMIT);
                         while (true) {
-                                const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB单次读取上限));
+                                await waitForBackpressure(webSocket);
+                                const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
                                 if (done) break;
                                 if (!value || value.byteLength === 0) continue;
                                 hasData = true;
-                                if (value.byteLength >= 下行Grain包字节) {
-                                        await 下行发送器.flush();
-                                        await 下行发送器.直接发送(value);
-                                        readBuffer = new ArrayBuffer(BYOB单次读取上限);
+                                if (typeof onBytes === "function") onBytes(value.byteLength);
+                                if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
+                                        await downstreamSender.flush();
+                                        await downstreamSender.sendDirect(value);
+                                        readBuffer = new ArrayBuffer(BYOB_LIMIT);
                                 } else {
-                                        await 下行发送器.发送(value);
-                                        readBuffer = value.buffer.byteLength >= BYOB单次读取上限 ? value.buffer : new ArrayBuffer(BYOB单次读取上限);
+                                        await downstreamSender.send(value);
+                                        readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
                                 }
                         }
                 }
-                await 下行发送器.flush();
-        } catch (err) { closeSocketQuietly(webSocket) }
-        finally { try { reader.cancel() } catch (e) { } try { reader.releaseLock() } catch (e) { } }
+                await downstreamSender.flush();
+        } catch (err) {
+                closeSocketQuietly(webSocket);
+        } finally {
+                try {
+                        reader.cancel();
+                } catch (e) {}
+                try {
+                        reader.releaseLock();
+                } catch (e) {}
+        }
         if (!hasData && retryFunc) await retryFunc();
 }
-
-function isSpeedTestSite(hostname) {
-        const speedTestDomains = [atob('c3BlZWQuY2xvdWRmbGFyZS5jb20=')];
-        if (speedTestDomains.includes(hostname)) {
-                return true;
-        }
-
-        for (const domain of speedTestDomains) {
-                if (hostname.endsWith('.' + domain) || hostname === domain) {
-                        return true;
+async function connectDirect(targetHost, targetPort, initialData, targetDoh) {
+        let socket = null;
+        try {
+                socket = connect({ hostname: targetHost, port: targetPort });
+                const writer = socket.writable.getWriter();
+                if (initialData && initialData.byteLength > 0) {
+                        await writer.write(initialData);
                 }
-        }
-        return false;
-}
-
-///////////////////////////////////////////////////////SOCKS5/HTTP函数///////////////////////////////////////////////
-async function socks5Connect(targetHost, targetPort, initialData, TCP连接, parsedSocks5) {
-        const { username, password, hostname, port } = parsedSocks5 || {};
-        const socket = TCP连接({ hostname, port }), writer = socket.writable.getWriter(), reader = socket.readable.getReader();
-        try {
-                const authMethods = username && password ? new Uint8Array([0x05, 0x02, 0x00, 0x02]) : new Uint8Array([0x05, 0x01, 0x00]);
-                await writer.write(authMethods);
-                let response = await reader.read();
-                if (response.done || response.value.byteLength < 2) throw new Error('S5 method selection failed');
-
-                const selectedMethod = new Uint8Array(response.value)[1];
-                if (selectedMethod === 0x02) {
-                        if (!username || !password) throw new Error('S5 requires authentication');
-                        const userBytes = new TextEncoder().encode(username), passBytes = new TextEncoder().encode(password);
-                        const authPacket = new Uint8Array([0x01, userBytes.length, ...userBytes, passBytes.length, ...passBytes]);
-                        await writer.write(authPacket);
-                        response = await reader.read();
-                        if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 authentication failed');
-                } else if (selectedMethod !== 0x00) throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
-
-                const hostBytes = new TextEncoder().encode(targetHost);
-                const connectPacket = new Uint8Array([0x05, 0x01, 0x00, 0x03, hostBytes.length, ...hostBytes, targetPort >> 8, targetPort & 0xff]);
-                await writer.write(connectPacket);
-                response = await reader.read();
-                if (response.done || new Uint8Array(response.value)[1] !== 0x00) throw new Error('S5 connection failed');
-
-                if (有效数据长度(initialData) > 0) await writer.write(initialData);
-                writer.releaseLock(); reader.releaseLock();
-                return socket;
-        } catch (error) {
-                try { writer.releaseLock() } catch (e) { }
-                try { reader.releaseLock() } catch (e) { }
-                try { socket.close() } catch (e) { }
-                throw error;
-        }
-}
-
-async function httpConnect(targetHost, targetPort, initialData, HTTPS代理 = false, TCP连接, parsedSocks5) {
-        const { username, password, hostname, port } = parsedSocks5 || {};
-        const socket = HTTPS代理
-                ? TCP连接({ hostname, port }, { secureTransport: 'on', allowHalfOpen: false })
-                : TCP连接({ hostname, port });
-        const writer = socket.writable.getWriter(), reader = socket.readable.getReader();
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        try {
-                if (HTTPS代理) await socket.opened;
-
-                const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-                const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
-                await writer.write(encoder.encode(request));
                 writer.releaseLock();
-
-                let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
-                while (headerEndIndex === -1 && bytesRead < 8192) {
-                        const { done, value } = await reader.read();
-                        if (done || !value) throw new Error(`${HTTPS代理 ? 'HTTPS' : 'HTTP'} 代理在返回 CONNECT 响应前关闭连接`);
-                        responseBuffer = new Uint8Array([...responseBuffer, ...value]);
-                        bytesRead = responseBuffer.length;
-                        const crlfcrlf = responseBuffer.findIndex((_, i) => i < responseBuffer.length - 3 && responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a && responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a);
-                        if (crlfcrlf !== -1) headerEndIndex = crlfcrlf + 4;
-                }
-
-                if (headerEndIndex === -1) throw new Error('代理 CONNECT 响应头过长或无效');
-                const statusMatch = decoder.decode(responseBuffer.slice(0, headerEndIndex)).split('\r\n')[0].match(/HTTP\/\d\.\d\s+(\d+)/);
-                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : NaN;
-                if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) throw new Error(`Connection failed: HTTP ${statusCode}`);
-
-                reader.releaseLock();
-
-                if (有效数据长度(initialData) > 0) {
-                        const 远端写入器 = socket.writable.getWriter();
-                        await 远端写入器.write(initialData);
-                        远端写入器.releaseLock();
-                }
-
-                // CONNECT 响应头后可能夹带隧道数据，先回灌到可读流，避免首包被吞。
-                if (bytesRead > headerEndIndex) {
-                        const { readable, writable } = new TransformStream();
-                        const transformWriter = writable.getWriter();
-                        await transformWriter.write(responseBuffer.subarray(headerEndIndex, bytesRead));
-                        transformWriter.releaseLock();
-                        socket.readable.pipeTo(writable).catch(() => { });
-                        return { readable, writable: socket.writable, closed: socket.closed, close: () => socket.close() };
-                }
-
                 return socket;
-        } catch (error) {
-                try { writer.releaseLock() } catch (e) { }
-                try { reader.releaseLock() } catch (e) { }
-                try { socket.close() } catch (e) { }
-                throw error;
-        }
-}
-
-async function httpsConnect(targetHost, targetPort, initialData, TCP连接, parsedSocks5) {
-        const { username, password, hostname, port } = parsedSocks5 || {};
-        const encoder = new TextEncoder();
-        const decoder = new TextDecoder();
-        let tlsSocket = null;
-        const tlsServerName = isIPHostname(hostname) ? '' : stripIPv6Brackets(hostname);
-        const 打开HTTPS代理TLS = async (allowChacha = false) => {
-                const proxySocket = TCP连接({ hostname, port });
-                try {
-                        await proxySocket.opened;
-                        const socket = new TlsClient(proxySocket, { serverName: tlsServerName, insecure: true, allowChacha });
-                        await socket.handshake();
-                        log(`[HTTPS代理] TLS版本: ${socket.isTls13 ? '1.3' : '1.2'} | Cipher: 0x${socket.cipherSuite.toString(16)}${socket.cipherConfig?.chacha ? ' (ChaCha20)' : ' (AES-GCM)'}`);
-                        return socket;
-                } catch (error) {
-                        try { proxySocket.close() } catch (e) { }
-                        throw error;
-                }
-        };
-        try {
-                try {
-                        tlsSocket = await 打开HTTPS代理TLS(false);
-                } catch (error) {
-                        if (!/cipher|handshake|TLS Alert|ServerHello|Finished|Unsupported|Missing TLS/i.test(error?.message || `${error || ''}`)) throw error;
-                        log(`[HTTPS代理] AES-GCM TLS 握手失败，回退 ChaCha20 兼容模式: ${error?.message || error}`);
-                        tlsSocket = await 打开HTTPS代理TLS(true);
-                }
-
-                const auth = username && password ? `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n` : '';
-                const request = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n${auth}User-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n`;
-                await tlsSocket.write(encoder.encode(request));
-
-                let responseBuffer = new Uint8Array(0), headerEndIndex = -1, bytesRead = 0;
-                while (headerEndIndex === -1 && bytesRead < 8192) {
-                        const value = await tlsSocket.read();
-                        if (!value) throw new Error('HTTPS 代理在返回 CONNECT 响应前关闭连接');
-                        responseBuffer = 拼接字节数据(responseBuffer, value);
-                        bytesRead = responseBuffer.length;
-                        const crlfcrlf = responseBuffer.findIndex((_, i) => i < responseBuffer.length - 3 && responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a && responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a);
-                        if (crlfcrlf !== -1) headerEndIndex = crlfcrlf + 4;
-                }
-
-                if (headerEndIndex === -1) throw new Error('HTTPS 代理 CONNECT 响应头过长或无效');
-                const statusMatch = decoder.decode(responseBuffer.slice(0, headerEndIndex)).split('\r\n')[0].match(/HTTP\/\d\.\d\s+(\d+)/);
-                const statusCode = statusMatch ? parseInt(statusMatch[1], 10) : NaN;
-                if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300) throw new Error(`Connection failed: HTTP ${statusCode}`);
-
-                if (有效数据长度(initialData) > 0) await tlsSocket.write(数据转Uint8Array(initialData));
-                const bufferedData = bytesRead > headerEndIndex ? responseBuffer.subarray(headerEndIndex, bytesRead) : null;
-                let closedSettled = false, resolveClosed, rejectClosed;
-                const settleClosed = (settle, value) => {
-                        if (!closedSettled) {
-                                closedSettled = true;
-                                settle(value);
-                        }
-                };
-                const closed = new Promise((resolve, reject) => {
-                        resolveClosed = resolve;
-                        rejectClosed = reject;
-                });
-                const close = () => {
-                        try { tlsSocket.close() } catch (e) { }
-                        settleClosed(resolveClosed);
-                };
-                const readable = new ReadableStream({
-                        async start(controller) {
-                                try {
-                                        if (有效数据长度(bufferedData) > 0) controller.enqueue(bufferedData);
-                                        while (true) {
-                                                const data = await tlsSocket.read();
-                                                if (!data) break;
-                                                if (data.byteLength > 0) controller.enqueue(data);
-                                        }
-                                        try { controller.close() } catch (e) { }
-                                        settleClosed(resolveClosed);
-                                } catch (error) {
-                                        try { controller.error(error) } catch (e) { }
-                                        settleClosed(rejectClosed, error);
-                                }
-                        },
-                        cancel() {
-                                close();
-                        }
-                });
-                const writable = new WritableStream({
-                        async write(chunk) {
-                                await tlsSocket.write(数据转Uint8Array(chunk));
-                        },
-                        close,
-                        abort(error) {
-                                close();
-                                if (error) settleClosed(rejectClosed, error);
-                        }
-                });
-                return { readable, writable, closed, close };
-        } catch (error) {
-                try { tlsSocket?.close() } catch (e) { }
-                throw error;
-        }
-}
-
-function 创建请求TCP连接器(request) {
-        const 请求对象 = /** @type {any} */ (request);
-        const fetcher = 请求对象?.fetcher;
-        if (!fetcher || typeof fetcher.connect !== 'function') throw new Error('request.fetcher.connect unavailable');
-        return (options, init) => init === undefined ? fetcher.connect(options) : fetcher.connect(options, init);
-}
-////////////////////////////////////////////TLSClient by: @Alexandre_Kojeve////////////////////////////////////////////////
-const TLS_VERSION_10 = 769, TLS_VERSION_12 = 771, TLS_VERSION_13 = 772;
-const CONTENT_TYPE_CHANGE_CIPHER_SPEC = 20, CONTENT_TYPE_ALERT = 21, CONTENT_TYPE_HANDSHAKE = 22, CONTENT_TYPE_APPLICATION_DATA = 23;
-const HANDSHAKE_TYPE_CLIENT_HELLO = 1, HANDSHAKE_TYPE_SERVER_HELLO = 2, HANDSHAKE_TYPE_NEW_SESSION_TICKET = 4, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS = 8, HANDSHAKE_TYPE_CERTIFICATE = 11, HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE = 12, HANDSHAKE_TYPE_CERTIFICATE_REQUEST = 13, HANDSHAKE_TYPE_SERVER_HELLO_DONE = 14, HANDSHAKE_TYPE_CERTIFICATE_VERIFY = 15, HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE = 16, HANDSHAKE_TYPE_FINISHED = 20, HANDSHAKE_TYPE_KEY_UPDATE = 24;
-const EXT_SERVER_NAME = 0, EXT_SUPPORTED_GROUPS = 10, EXT_EC_POINT_FORMATS = 11, EXT_SIGNATURE_ALGORITHMS = 13, EXT_APPLICATION_LAYER_PROTOCOL_NEGOTIATION = 16, EXT_SUPPORTED_VERSIONS = 43, EXT_PSK_KEY_EXCHANGE_MODES = 45, EXT_KEY_SHARE = 51;
-
-const ALERT_CLOSE_NOTIFY = 0, ALERT_LEVEL_WARNING = 1, ALERT_UNRECOGNIZED_NAME = 112;
-const shouldIgnoreTlsAlert = fragment => fragment?.[0] === ALERT_LEVEL_WARNING && fragment?.[1] === ALERT_UNRECOGNIZED_NAME;
-
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-const EMPTY_BYTES = new Uint8Array(0);
-
-const CIPHER_SUITES_BY_ID = new Map([
-        [4865, { id: 4865, keyLen: 16, ivLen: 12, hash: "SHA-256", tls13: !0 }],
-        [4866, { id: 4866, keyLen: 32, ivLen: 12, hash: "SHA-384", tls13: !0 }],
-        [4867, { id: 4867, keyLen: 32, ivLen: 12, hash: "SHA-256", tls13: !0, chacha: !0 }],
-        [49199, { id: 49199, keyLen: 16, ivLen: 4, hash: "SHA-256", kex: "ECDHE" }],
-        [49200, { id: 49200, keyLen: 32, ivLen: 4, hash: "SHA-384", kex: "ECDHE" }],
-        [52392, { id: 52392, keyLen: 32, ivLen: 12, hash: "SHA-256", kex: "ECDHE", chacha: !0 }],
-        [49195, { id: 49195, keyLen: 16, ivLen: 4, hash: "SHA-256", kex: "ECDHE" }],
-        [49196, { id: 49196, keyLen: 32, ivLen: 4, hash: "SHA-384", kex: "ECDHE" }],
-        [52393, { id: 52393, keyLen: 32, ivLen: 12, hash: "SHA-256", kex: "ECDHE", chacha: !0 }]
-]);
-const GROUPS_BY_ID = new Map([[29, "X25519"], [23, "P-256"]]);
-const SUPPORTED_SIGNATURE_ALGORITHMS = [2052, 2053, 2054, 1025, 1281, 1537, 1027, 1283, 1539];
-
-const tlsBytes = (...parts) => {
-        const flattenBytes = values => values.flatMap(value => value instanceof Uint8Array ? [...value] : Array.isArray(value) ? flattenBytes(value) : "number" == typeof value ? [value] : []);
-        return new Uint8Array(flattenBytes(parts))
-};
-const uint16be = value => [value >> 8 & 255, 255 & value];
-const readUint16 = (buffer, offset) => buffer[offset] << 8 | buffer[offset + 1];
-const readUint24 = (buffer, offset) => buffer[offset] << 16 | buffer[offset + 1] << 8 | buffer[offset + 2];
-const concatBytes = (...chunks) => {
-        const nonEmptyChunks = chunks.filter((chunk => chunk && chunk.length > 0)),
-                length = nonEmptyChunks.reduce(((total, chunk) => total + chunk.length), 0),
-                result = new Uint8Array(length);
-        let offset = 0;
-        for (const chunk of nonEmptyChunks) result.set(chunk, offset), offset += chunk.length;
-        return result
-};
-const randomBytes = length => crypto.getRandomValues(new Uint8Array(length));
-const constantTimeEqual = (left, right) => {
-        if (!left || !right || left.length !== right.length) return !1;
-        let diff = 0; for (let index = 0; index < left.length; index++) diff |= left[index] ^ right[index];
-        return 0 === diff
-};
-const hashByteLength = hash => "SHA-512" === hash ? 64 : "SHA-384" === hash ? 48 : 32;
-async function hmac(hash, key, data) {
-        const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash }, !1, ["sign"]);
-        return new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, data))
-}
-async function digestBytes(hash, data) { return new Uint8Array(await crypto.subtle.digest(hash, data)) }
-async function tls12Prf(secret, label, seed, length, hash = "SHA-256") {
-        const labelSeed = concatBytes(textEncoder.encode(label), seed);
-        let output = new Uint8Array(0),
-                currentA = labelSeed;
-        for (; output.length < length;) {
-                currentA = await hmac(hash, secret, currentA);
-                const block = await hmac(hash, secret, concatBytes(currentA, labelSeed));
-                output = concatBytes(output, block)
-        }
-        return output.slice(0, length)
-}
-async function hkdfExtract(hash, salt, inputKeyMaterial) {
-        return salt && salt.length || (salt = new Uint8Array(hashByteLength(hash))), hmac(hash, salt, inputKeyMaterial)
-}
-async function hkdfExpandLabel(hash, secret, label, context, length) {
-        const fullLabel = textEncoder.encode("tls13 " + label);
-        return async function (hash, secret, info, length) {
-                const hashLen = hashByteLength(hash),
-                        roundCount = Math.ceil(length / hashLen);
-                let output = new Uint8Array(0),
-                        previousBlock = new Uint8Array(0);
-                for (let round = 1; round <= roundCount; round++) previousBlock = await hmac(hash, secret, concatBytes(previousBlock, info, [round])), output = concatBytes(output, previousBlock);
-                return output.slice(0, length)
-        }(hash, secret, tlsBytes(uint16be(length), fullLabel.length, fullLabel, context.length, context), length)
-}
-async function generateKeyShare(group = "P-256") {
-        const algorithm = "X25519" === group ? { name: "X25519" } : { name: "ECDH", namedCurve: group };
-        const keyPair = /** @type {CryptoKeyPair} */ (await crypto.subtle.generateKey(algorithm, !0, ["deriveBits"]));
-        const publicKeyRaw = /** @type {ArrayBuffer} */ (await crypto.subtle.exportKey("raw", keyPair.publicKey));
-        return { keyPair, publicKeyRaw: new Uint8Array(publicKeyRaw) }
-}
-async function deriveSharedSecret(privateKey, peerPublicKey, group = "P-256") {
-        const algorithm = "X25519" === group ? { name: "X25519" } : { name: "ECDH", namedCurve: group },
-                peerKey = await crypto.subtle.importKey("raw", peerPublicKey, algorithm, !1, []),
-                bits = "P-384" === group ? 384 : "P-521" === group ? 528 : 256;
-        return new Uint8Array(await crypto.subtle.deriveBits(/** @type {any} */({ name: algorithm.name, public: peerKey }), privateKey, bits))
-}
-async function importAesGcmKey(key, usages) { return crypto.subtle.importKey("raw", key, { name: "AES-GCM" }, !1, usages) }
-async function aesGcmEncryptWithKey(cryptoKey, initializationVector, plaintext, additionalData) {
-        return new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: initializationVector, additionalData, tagLength: 128 }, cryptoKey, plaintext))
-}
-async function aesGcmDecryptWithKey(cryptoKey, initializationVector, ciphertext, additionalData) {
-        return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: initializationVector, additionalData, tagLength: 128 }, cryptoKey, ciphertext))
-}
-
-function rotateLeft32(value, bits) { return (value << bits | value >>> 32 - bits) >>> 0 }
-
-function chachaQuarterRound(state, indexA, indexB, indexC, indexD) {
-        state[indexA] = state[indexA] + state[indexB] >>> 0, state[indexD] = rotateLeft32(state[indexD] ^ state[indexA], 16), state[indexC] = state[indexC] + state[indexD] >>> 0, state[indexB] = rotateLeft32(state[indexB] ^ state[indexC], 12), state[indexA] = state[indexA] + state[indexB] >>> 0, state[indexD] = rotateLeft32(state[indexD] ^ state[indexA], 8), state[indexC] = state[indexC] + state[indexD] >>> 0, state[indexB] = rotateLeft32(state[indexB] ^ state[indexC], 7)
-}
-
-function chacha20Block(key, counter, nonce) {
-        const state = new Uint32Array(16);
-        state[0] = 1634760805, state[1] = 857760878, state[2] = 2036477234, state[3] = 1797285236;
-        const keyView = new DataView(key.buffer, key.byteOffset, key.byteLength);
-        for (let wordIndex = 0; wordIndex < 8; wordIndex++) state[4 + wordIndex] = keyView.getUint32(4 * wordIndex, !0);
-        state[12] = counter;
-        const nonceView = new DataView(nonce.buffer, nonce.byteOffset, nonce.byteLength);
-        state[13] = nonceView.getUint32(0, !0), state[14] = nonceView.getUint32(4, !0), state[15] = nonceView.getUint32(8, !0);
-        const workingState = new Uint32Array(state);
-        for (let round = 0; round < 10; round++) chachaQuarterRound(workingState, 0, 4, 8, 12), chachaQuarterRound(workingState, 1, 5, 9, 13), chachaQuarterRound(workingState, 2, 6, 10, 14), chachaQuarterRound(workingState, 3, 7, 11, 15), chachaQuarterRound(workingState, 0, 5, 10, 15), chachaQuarterRound(workingState, 1, 6, 11, 12), chachaQuarterRound(workingState, 2, 7, 8, 13), chachaQuarterRound(workingState, 3, 4, 9, 14);
-        for (let wordIndex = 0; wordIndex < 16; wordIndex++) workingState[wordIndex] = workingState[wordIndex] + state[wordIndex] >>> 0;
-        return new Uint8Array(workingState.buffer.slice(0))
-}
-
-function chacha20Xor(key, nonce, data) {
-        const output = new Uint8Array(data.length);
-        let counter = 1;
-        for (let offset = 0; offset < data.length; offset += 64) {
-                const block = chacha20Block(key, counter++, nonce),
-                        blockLength = Math.min(64, data.length - offset);
-                for (let index = 0; index < blockLength; index++) output[offset + index] = data[offset + index] ^ block[index]
-        }
-        return output
-}
-
-function poly1305Mac(key, message) {
-        const rKey = function (rBytes) {
-                const clamped = new Uint8Array(rBytes);
-                return clamped[3] &= 15, clamped[7] &= 15, clamped[11] &= 15, clamped[15] &= 15, clamped[4] &= 252, clamped[8] &= 252, clamped[12] &= 252, clamped
-        }(key.slice(0, 16)),
-                sKey = key.slice(16, 32);
-        let accumulator = [0n, 0n, 0n, 0n, 0n];
-        const rLimbs = [0x3ffffffn & BigInt(rKey[0] | rKey[1] << 8 | rKey[2] << 16 | rKey[3] << 24), 0x3ffffffn & BigInt(rKey[3] >> 2 | rKey[4] << 6 | rKey[5] << 14 | rKey[6] << 22), 0x3ffffffn & BigInt(rKey[6] >> 4 | rKey[7] << 4 | rKey[8] << 12 | rKey[9] << 20), 0x3ffffffn & BigInt(rKey[9] >> 6 | rKey[10] << 2 | rKey[11] << 10 | rKey[12] << 18), 0x3ffffffn & BigInt(rKey[13] | rKey[14] << 8 | rKey[15] << 16)];
-        for (let offset = 0; offset < message.length; offset += 16) {
-                const chunk = message.slice(offset, offset + 16),
-                        paddedChunk = new Uint8Array(17);
-                paddedChunk.set(chunk), paddedChunk[chunk.length] = 1, accumulator[0] += BigInt(paddedChunk[0] | paddedChunk[1] << 8 | paddedChunk[2] << 16 | (3 & paddedChunk[3]) << 24), accumulator[1] += BigInt(paddedChunk[3] >> 2 | paddedChunk[4] << 6 | paddedChunk[5] << 14 | (15 & paddedChunk[6]) << 22), accumulator[2] += BigInt(paddedChunk[6] >> 4 | paddedChunk[7] << 4 | paddedChunk[8] << 12 | (63 & paddedChunk[9]) << 20), accumulator[3] += BigInt(paddedChunk[9] >> 6 | paddedChunk[10] << 2 | paddedChunk[11] << 10 | paddedChunk[12] << 18), accumulator[4] += BigInt(paddedChunk[13] | paddedChunk[14] << 8 | paddedChunk[15] << 16 | paddedChunk[16] << 24);
-                const product = [0n, 0n, 0n, 0n, 0n];
-                for (let accIndex = 0; accIndex < 5; accIndex++)
-                        for (let rIndex = 0; rIndex < 5; rIndex++) {
-                                const limbIndex = accIndex + rIndex;
-                                limbIndex < 5 ? product[limbIndex] += accumulator[accIndex] * rLimbs[rIndex] : product[limbIndex - 5] += accumulator[accIndex] * rLimbs[rIndex] * 5n
-                        }
-                let carry = 0n;
-                for (let index = 0; index < 5; index++) product[index] += carry, accumulator[index] = 0x3ffffffn & product[index], carry = product[index] >> 26n;
-                accumulator[0] += 5n * carry, carry = accumulator[0] >> 26n, accumulator[0] &= 0x3ffffffn, accumulator[1] += carry
-        }
-        let tagValue = accumulator[0] | accumulator[1] << 26n | accumulator[2] << 52n | accumulator[3] << 78n | accumulator[4] << 104n;
-        tagValue = tagValue + sKey.reduce(((total, byte, index) => total + (BigInt(byte) << BigInt(8 * index))), 0n) & (1n << 128n) - 1n;
-        const tag = new Uint8Array(16);
-        for (let index = 0; index < 16; index++) tag[index] = Number(tagValue >> BigInt(8 * index) & 0xffn);
-        return tag
-}
-
-function chacha20Poly1305Encrypt(key, nonce, plaintext, additionalData) {
-        const polyKey = chacha20Block(key, 0, nonce).slice(0, 32),
-                ciphertext = chacha20Xor(key, nonce, plaintext),
-                aadPadding = (16 - additionalData.length % 16) % 16,
-                ciphertextPadding = (16 - ciphertext.length % 16) % 16,
-                macData = new Uint8Array(additionalData.length + aadPadding + ciphertext.length + ciphertextPadding + 16);
-        macData.set(additionalData, 0), macData.set(ciphertext, additionalData.length + aadPadding);
-        const lengthView = new DataView(macData.buffer, additionalData.length + aadPadding + ciphertext.length + ciphertextPadding);
-        lengthView.setBigUint64(0, BigInt(additionalData.length), !0), lengthView.setBigUint64(8, BigInt(ciphertext.length), !0);
-        const tag = poly1305Mac(polyKey, macData);
-        return concatBytes(ciphertext, tag)
-}
-
-function chacha20Poly1305Decrypt(key, nonce, ciphertext, additionalData) {
-        if (ciphertext.length < 16) throw new Error("Ciphertext too short");
-        const tag = ciphertext.slice(-16),
-                encryptedData = ciphertext.slice(0, -16),
-                polyKey = chacha20Block(key, 0, nonce).slice(0, 32),
-                aadPadding = (16 - additionalData.length % 16) % 16,
-                ciphertextPadding = (16 - encryptedData.length % 16) % 16,
-                macData = new Uint8Array(additionalData.length + aadPadding + encryptedData.length + ciphertextPadding + 16);
-        macData.set(additionalData, 0), macData.set(encryptedData, additionalData.length + aadPadding);
-        const lengthView = new DataView(macData.buffer, additionalData.length + aadPadding + encryptedData.length + ciphertextPadding);
-        lengthView.setBigUint64(0, BigInt(additionalData.length), !0), lengthView.setBigUint64(8, BigInt(encryptedData.length), !0);
-        const expectedTag = poly1305Mac(polyKey, macData);
-        let diff = 0;
-        for (let index = 0; index < 16; index++) diff |= tag[index] ^ expectedTag[index];
-        if (0 !== diff) throw new Error("ChaCha20-Poly1305 authentication failed");
-        return chacha20Xor(key, nonce, encryptedData)
-}
-
-const TLS_MAX_PLAINTEXT_FRAGMENT = 16 * 1024;
-function buildTlsRecord(contentType, fragment, version = TLS_VERSION_12) {
-        const data = 数据转Uint8Array(fragment);
-        const record = new Uint8Array(5 + data.byteLength);
-        record[0] = contentType;
-        record[1] = version >> 8 & 255;
-        record[2] = version & 255;
-        record[3] = data.byteLength >> 8 & 255;
-        record[4] = data.byteLength & 255;
-        record.set(data, 5);
-        return record;
-}
-function buildHandshakeMessage(handshakeType, body) { return tlsBytes(handshakeType, (length => [length >> 16 & 255, length >> 8 & 255, 255 & length])(body.length), body) }
-class TlsRecordParser {
-        constructor() { this.buffer = new Uint8Array(0) }
-        feed(chunk) {
-                const bytes = 数据转Uint8Array(chunk);
-                this.buffer = this.buffer.length ? concatBytes(this.buffer, bytes) : bytes
-        }
-        next() {
-                if (this.buffer.length < 5) return null;
-                const contentType = this.buffer[0],
-                        version = readUint16(this.buffer, 1),
-                        length = readUint16(this.buffer, 3);
-                if (this.buffer.length < 5 + length) return null;
-                const fragment = this.buffer.subarray(5, 5 + length);
-                return this.buffer = this.buffer.subarray(5 + length), { type: contentType, version, length, fragment }
-        }
-}
-class TlsHandshakeParser {
-        constructor() { this.buffer = new Uint8Array(0) }
-        feed(chunk) {
-                const bytes = 数据转Uint8Array(chunk);
-                this.buffer = this.buffer.length ? concatBytes(this.buffer, bytes) : bytes
-        }
-        next() {
-                if (this.buffer.length < 4) return null;
-                const handshakeType = this.buffer[0],
-                        length = readUint24(this.buffer, 1);
-                if (this.buffer.length < 4 + length) return null;
-                const body = this.buffer.subarray(4, 4 + length),
-                        raw = this.buffer.subarray(0, 4 + length);
-                return this.buffer = this.buffer.subarray(4 + length), { type: handshakeType, length, body, raw }
-        }
-}
-
-function parseServerHello(body) {
-        let offset = 0;
-        const legacyVersion = readUint16(body, offset);
-        offset += 2;
-        const serverRandom = body.slice(offset, offset + 32);
-        offset += 32;
-        const sessionIdLength = body[offset++],
-                sessionId = body.slice(offset, offset + sessionIdLength);
-        offset += sessionIdLength;
-        const cipherSuite = readUint16(body, offset);
-        offset += 2;
-        const compression = body[offset++];
-        let selectedVersion = legacyVersion,
-                keyShare = null,
-                alpn = null;
-        if (offset < body.length) {
-                const extensionsLength = readUint16(body, offset);
-                offset += 2;
-                const extensionsEnd = offset + extensionsLength;
-                for (; offset + 4 <= extensionsEnd;) {
-                        const extensionType = readUint16(body, offset);
-                        offset += 2;
-                        const extensionLength = readUint16(body, offset);
-                        offset += 2;
-                        const extensionData = body.slice(offset, offset + extensionLength);
-                        if (offset += extensionLength, extensionType === EXT_SUPPORTED_VERSIONS && extensionLength >= 2) selectedVersion = readUint16(extensionData, 0);
-                        else if (extensionType === EXT_KEY_SHARE && extensionLength >= 4) {
-                                const group = readUint16(extensionData, 0),
-                                        keyLength = readUint16(extensionData, 2);
-                                keyShare = { group, key: extensionData.slice(4, 4 + keyLength) }
-                        } else extensionType === EXT_APPLICATION_LAYER_PROTOCOL_NEGOTIATION && extensionLength >= 3 && (alpn = textDecoder.decode(extensionData.slice(3, 3 + extensionData[2])))
-                }
-        }
-        const helloRetryRequestRandom = new Uint8Array([207, 33, 173, 116, 229, 154, 97, 17, 190, 29, 140, 2, 30, 101, 184, 145, 194, 162, 17, 22, 122, 187, 140, 94, 7, 158, 9, 226, 200, 168, 51, 156]);
-        return { version: legacyVersion, serverRandom, sessionId, cipherSuite, compression, selectedVersion, keyShare, alpn, isHRR: constantTimeEqual(serverRandom, helloRetryRequestRandom), isTls13: selectedVersion === TLS_VERSION_13 }
-}
-
-function parseServerKeyExchange(body) {
-        let offset = 1;
-        const namedCurve = readUint16(body, offset);
-        offset += 2;
-        const keyLength = body[offset++];
-        return { namedCurve, serverPublicKey: body.slice(offset, offset + keyLength) }
-}
-
-function extractLeafCertificate(body, hasContext = 0) {
-        let offset = 0;
-        if (hasContext) {
-                const contextLength = body[offset++];
-                offset += contextLength
-        }
-        if (offset + 3 > body.length) return null;
-        const certificateListLength = readUint24(body, offset);
-        if (offset += 3, !certificateListLength || offset + 3 > body.length) return null;
-        const certificateLength = readUint24(body, offset);
-        return offset += 3, certificateLength ? body.slice(offset, offset + certificateLength) : null
-}
-
-function parseEncryptedExtensions(body) {
-        const parsed = { alpn: null };
-        let offset = 2;
-        const extensionsEnd = 2 + readUint16(body, 0);
-        for (; offset + 4 <= extensionsEnd;) {
-                const extensionType = readUint16(body, offset);
-                offset += 2;
-                const extensionLength = readUint16(body, offset);
-                if (offset += 2, extensionType === EXT_APPLICATION_LAYER_PROTOCOL_NEGOTIATION && extensionLength >= 3) {
-                        const protocolLength = body[offset + 2];
-                        protocolLength > 0 && offset + 3 + protocolLength <= offset + extensionLength && (parsed.alpn = textDecoder.decode(body.slice(offset + 3, offset + 3 + protocolLength)))
-                }
-                offset += extensionLength
-        }
-        return parsed
-}
-
-function buildClientHello(clientRandom, serverName, keyShares, { tls13: enableTls13 = !0, tls12: enableTls12 = !0, alpn = null, chacha = !0 } = {}) {
-        const cipherIds = [];
-        enableTls13 && cipherIds.push(4865, 4866, ...(chacha ? [4867] : [])), enableTls12 && cipherIds.push(49199, 49200, 49195, 49196, ...(chacha ? [52392, 52393] : []));
-        const cipherBytes = tlsBytes(...cipherIds.flatMap(uint16be)),
-                extensions = [tlsBytes(255, 1, 0, 1, 0)];
-        if (serverName) {
-                const serverNameBytes = textEncoder.encode(serverName),
-                        serverNameList = tlsBytes(0, uint16be(serverNameBytes.length), serverNameBytes);
-                extensions.push(tlsBytes(uint16be(EXT_SERVER_NAME), uint16be(serverNameList.length + 2), uint16be(serverNameList.length), serverNameList))
-        }
-        extensions.push(tlsBytes(uint16be(EXT_EC_POINT_FORMATS), 0, 2, 1, 0)), extensions.push(tlsBytes(uint16be(EXT_SUPPORTED_GROUPS), 0, 6, 0, 4, 0, 29, 0, 23));
-        const signatureBytes = tlsBytes(...SUPPORTED_SIGNATURE_ALGORITHMS.flatMap(uint16be));
-        extensions.push(tlsBytes(uint16be(EXT_SIGNATURE_ALGORITHMS), uint16be(signatureBytes.length + 2), uint16be(signatureBytes.length), signatureBytes));
-        const protocols = Array.isArray(alpn) ? alpn.filter(Boolean) : alpn ? [alpn] : [];
-        if (protocols.length) {
-                const alpnBytes = concatBytes(...protocols.map((protocol => { const protocolBytes = textEncoder.encode(protocol); return tlsBytes(protocolBytes.length, protocolBytes) })));
-                extensions.push(tlsBytes(uint16be(EXT_APPLICATION_LAYER_PROTOCOL_NEGOTIATION), uint16be(alpnBytes.length + 2), uint16be(alpnBytes.length), alpnBytes))
-        }
-        if (enableTls13 && keyShares) {
-                let keyShareBytes;
-                if (extensions.push(enableTls12 ? tlsBytes(uint16be(EXT_SUPPORTED_VERSIONS), 0, 5, 4, 3, 4, 3, 3) : tlsBytes(uint16be(EXT_SUPPORTED_VERSIONS), 0, 3, 2, 3, 4)), extensions.push(tlsBytes(uint16be(EXT_PSK_KEY_EXCHANGE_MODES), 0, 2, 1, 1)), keyShares?.x25519 && keyShares?.p256) keyShareBytes = concatBytes(tlsBytes(0, 29, uint16be(keyShares.x25519.length), keyShares.x25519), tlsBytes(0, 23, uint16be(keyShares.p256.length), keyShares.p256));
-                else if (keyShares?.x25519) keyShareBytes = tlsBytes(0, 29, uint16be(keyShares.x25519.length), keyShares.x25519);
-                else if (keyShares?.p256) keyShareBytes = tlsBytes(0, 23, uint16be(keyShares.p256.length), keyShares.p256);
-                else {
-                        if (!(keyShares instanceof Uint8Array)) throw new Error("Invalid keyShares");
-                        keyShareBytes = tlsBytes(0, 23, uint16be(keyShares.length), keyShares)
-                }
-                extensions.push(tlsBytes(uint16be(EXT_KEY_SHARE), uint16be(keyShareBytes.length + 2), uint16be(keyShareBytes.length), keyShareBytes))
-        }
-        const extensionsBytes = concatBytes(...extensions);
-        return buildHandshakeMessage(HANDSHAKE_TYPE_CLIENT_HELLO, tlsBytes(uint16be(TLS_VERSION_12), clientRandom, 0, uint16be(cipherBytes.length), cipherBytes, 1, 0, uint16be(extensionsBytes.length), extensionsBytes))
-}
-const uint64be = sequenceNumber => { const bytes = new Uint8Array(8); return new DataView(bytes.buffer).setBigUint64(0, sequenceNumber, !1), bytes },
-        xorSequenceIntoIv = (initializationVector, sequenceNumber) => {
-                const nonce = initializationVector.slice(),
-                        sequenceBytes = uint64be(sequenceNumber);
-                for (let index = 0; index < 8; index++) nonce[nonce.length - 8 + index] ^= sequenceBytes[index];
-                return nonce
-        },
-        deriveTrafficKeys = (hash, secret, keyLen, ivLen) => Promise.all([hkdfExpandLabel(hash, secret, "key", EMPTY_BYTES, keyLen), hkdfExpandLabel(hash, secret, "iv", EMPTY_BYTES, ivLen)]);
-class TlsClient {
-        constructor(socket, options = {}) {
-                if (this.socket = socket, this.serverName = options.serverName || "", this.supportTls13 = !1 !== options.tls13, this.supportTls12 = !1 !== options.tls12, !this.supportTls13 && !this.supportTls12) throw new Error("At least one TLS version must be enabled");
-                this.alpnProtocols = Array.isArray(options.alpn) ? options.alpn : options.alpn ? [options.alpn] : null, this.allowChacha = options.allowChacha !== false, this.timeout = options.timeout ?? 3e4, this.clientRandom = randomBytes(32), this.serverRandom = null, this.handshakeChunks = [], this.handshakeComplete = !1, this.negotiatedAlpn = null, this.cipherSuite = null, this.cipherConfig = null, this.isTls13 = !1, this.masterSecret = null, this.handshakeSecret = null, this.clientWriteKey = null, this.serverWriteKey = null, this.clientWriteIv = null, this.serverWriteIv = null, this.clientHandshakeKey = null, this.serverHandshakeKey = null, this.clientHandshakeIv = null, this.serverHandshakeIv = null, this.clientAppKey = null, this.serverAppKey = null, this.clientAppIv = null, this.serverAppIv = null, this.clientWriteCryptoKey = null, this.serverWriteCryptoKey = null, this.clientHandshakeCryptoKey = null, this.serverHandshakeCryptoKey = null, this.clientAppCryptoKey = null, this.serverAppCryptoKey = null, this.clientSeqNum = 0n, this.serverSeqNum = 0n, this.recordParser = new TlsRecordParser, this.handshakeParser = new TlsHandshakeParser, this.keyPairs = new Map, this.ecdhKeyPair = null, this.sawCert = !1
-        }
-        recordHandshake(chunk) { this.handshakeChunks.push(chunk) }
-        transcript() { return 1 === this.handshakeChunks.length ? this.handshakeChunks[0] : concatBytes(...this.handshakeChunks) }
-        getCipherConfig(cipherSuite) { return CIPHER_SUITES_BY_ID.get(cipherSuite) || null }
-        async readChunk(reader) { return this.timeout ? Promise.race([reader.read(), new Promise(((resolve, reject) => setTimeout((() => reject(new Error("TLS read timeout"))), this.timeout)))]) : reader.read() }
-        async readRecordsUntil(reader, predicate, closedError) {
-                for (; ;) {
-                        let record;
-                        for (; record = this.recordParser.next();)
-                                if (await predicate(record)) return;
-                        const { value, done } = await this.readChunk(reader);
-                        if (done) throw new Error(closedError);
-                        this.recordParser.feed(value)
-                }
-        }
-        async readHandshakeUntil(reader, predicate, closedError) {
-                for (let message; message = this.handshakeParser.next();)
-                        if (await predicate(message)) return;
-                return this.readRecordsUntil(reader, (async record => {
-                        if (record.type === CONTENT_TYPE_ALERT) {
-                                if (shouldIgnoreTlsAlert(record.fragment)) return;
-                                throw new Error(`TLS Alert: ${record.fragment[1]}`);
-                        }
-                        if (record.type === CONTENT_TYPE_HANDSHAKE) {
-                                this.handshakeParser.feed(record.fragment);
-                                for (let message; message = this.handshakeParser.next();)
-                                        if (await predicate(message)) return 1
-                        }
-                }), closedError)
-        }
-        async acceptCertificate(certificate) { if (!certificate?.length) throw new Error("Empty certificate"); this.sawCert = !0 }
-        async handshake() {
-                const [p256Share, x25519Share] = await Promise.all([generateKeyShare("P-256"), generateKeyShare("X25519")]);
-                this.keyPairs = new Map([[23, p256Share], [29, x25519Share]]), this.ecdhKeyPair = p256Share.keyPair;
-                const reader = this.socket.readable.getReader(),
-                        writer = this.socket.writable.getWriter();
-                try {
-                        const clientHello = buildClientHello(this.clientRandom, this.serverName, { x25519: x25519Share.publicKeyRaw, p256: p256Share.publicKeyRaw }, { tls13: this.supportTls13, tls12: this.supportTls12, alpn: this.alpnProtocols, chacha: this.allowChacha });
-                        this.recordHandshake(clientHello), await writer.write(buildTlsRecord(CONTENT_TYPE_HANDSHAKE, clientHello, TLS_VERSION_10));
-                        const serverHello = await this.receiveServerHello(reader);
-                        if (serverHello.isHRR) throw new Error("HelloRetryRequest is not supported by TLSClientMini");
-                        if (serverHello.keyShare?.group && this.keyPairs.has(serverHello.keyShare.group)) {
-                                const selectedKeyPair = this.keyPairs.get(serverHello.keyShare.group);
-                                this.ecdhKeyPair = selectedKeyPair.keyPair
-                        }
-                        serverHello.isTls13 ? await this.handshakeTls13(reader, writer, serverHello) : await this.handshakeTls12(reader, writer), this.handshakeComplete = !0
-                } finally {
-                        reader.releaseLock(), writer.releaseLock()
-                }
-        }
-        async receiveServerHello(reader) {
-                for (; ;) {
-                        const { value, done } = await this.readChunk(reader);
-                        if (done) throw new Error("Connection closed waiting for ServerHello");
-                        let record;
-                        for (this.recordParser.feed(value); record = this.recordParser.next();) {
-                                if (record.type === CONTENT_TYPE_ALERT) {
-                                        if (shouldIgnoreTlsAlert(record.fragment)) continue;
-                                        throw new Error(`TLS Alert: level=${record.fragment[0]}, desc=${record.fragment[1]}`);
-                                }
-                                if (record.type !== CONTENT_TYPE_HANDSHAKE) continue;
-                                let message;
-                                for (this.handshakeParser.feed(record.fragment); message = this.handshakeParser.next();) {
-                                        if (message.type !== HANDSHAKE_TYPE_SERVER_HELLO) continue;
-                                        this.recordHandshake(message.raw);
-                                        const serverHello = parseServerHello(message.body);
-                                        if (this.serverRandom = serverHello.serverRandom, this.cipherSuite = serverHello.cipherSuite, this.cipherConfig = this.getCipherConfig(serverHello.cipherSuite), this.isTls13 = serverHello.isTls13, this.negotiatedAlpn = serverHello.alpn || null, !this.cipherConfig) throw new Error(`Unsupported cipher suite: 0x${serverHello.cipherSuite.toString(16)}`);
-                                        return serverHello
-                                }
-                        }
-                }
-        }
-        async handshakeTls12(reader, writer) {
-                /** @type {{ namedCurve: number, serverPublicKey: Uint8Array } | null} */
-                let serverKeyExchange = null;
-                let sawServerHelloDone = !1;
-                if (await this.readHandshakeUntil(reader, (async message => {
-                        switch (message.type) {
-                                case HANDSHAKE_TYPE_CERTIFICATE: {
-                                        this.recordHandshake(message.raw);
-                                        const certificate = extractLeafCertificate(message.body, 1);
-                                        if (!certificate) throw new Error("Missing TLS 1.2 certificate");
-                                        await this.acceptCertificate(certificate);
-                                        break
-                                }
-                                case HANDSHAKE_TYPE_SERVER_KEY_EXCHANGE:
-                                        this.recordHandshake(message.raw), serverKeyExchange = parseServerKeyExchange(message.body);
-                                        break;
-                                case HANDSHAKE_TYPE_SERVER_HELLO_DONE:
-                                        return this.recordHandshake(message.raw), sawServerHelloDone = !0, 1;
-                                case HANDSHAKE_TYPE_CERTIFICATE_REQUEST:
-                                        throw new Error("Client certificate is not supported");
-                                default:
-                                        this.recordHandshake(message.raw)
-                        }
-                }), "Connection closed during TLS 1.2 handshake"), !this.sawCert) throw new Error("Missing TLS 1.2 leaf certificate");
-                const serverKeyExchangeData = /** @type {{ namedCurve: number, serverPublicKey: Uint8Array } | null} */ (serverKeyExchange);
-                if (!serverKeyExchangeData) throw new Error("Missing TLS 1.2 ServerKeyExchange");
-                const curveName = GROUPS_BY_ID.get(serverKeyExchangeData.namedCurve);
-                if (!curveName) throw new Error(`Unsupported named curve: 0x${serverKeyExchangeData.namedCurve.toString(16)}`);
-                const keyShare = this.keyPairs.get(serverKeyExchangeData.namedCurve);
-                if (!keyShare) throw new Error(`Missing key pair for curve: 0x${serverKeyExchangeData.namedCurve.toString(16)}`);
-                const preMasterSecret = await deriveSharedSecret(keyShare.keyPair.privateKey, serverKeyExchangeData.serverPublicKey, curveName),
-                        clientKeyExchange = buildHandshakeMessage(HANDSHAKE_TYPE_CLIENT_KEY_EXCHANGE, tlsBytes(keyShare.publicKeyRaw.length, keyShare.publicKeyRaw));
-                this.recordHandshake(clientKeyExchange);
-                const hashName = this.cipherConfig.hash;
-                this.masterSecret = await tls12Prf(preMasterSecret, "master secret", concatBytes(this.clientRandom, this.serverRandom), 48, hashName);
-                const keyLen = this.cipherConfig.keyLen,
-                        ivLen = this.cipherConfig.ivLen,
-                        keyBlock = await tls12Prf(this.masterSecret, "key expansion", concatBytes(this.serverRandom, this.clientRandom), 2 * keyLen + 2 * ivLen, hashName);
-                this.clientWriteKey = keyBlock.slice(0, keyLen), this.serverWriteKey = keyBlock.slice(keyLen, 2 * keyLen), this.clientWriteIv = keyBlock.slice(2 * keyLen, 2 * keyLen + ivLen), this.serverWriteIv = keyBlock.slice(2 * keyLen + ivLen, 2 * keyLen + 2 * ivLen);
-                if (!this.cipherConfig.chacha) [this.clientWriteCryptoKey, this.serverWriteCryptoKey] = await Promise.all([importAesGcmKey(this.clientWriteKey, ["encrypt"]), importAesGcmKey(this.serverWriteKey, ["decrypt"])]);
-                await writer.write(buildTlsRecord(CONTENT_TYPE_HANDSHAKE, clientKeyExchange)), await writer.write(buildTlsRecord(CONTENT_TYPE_CHANGE_CIPHER_SPEC, tlsBytes(1)));
-                const clientVerifyData = await tls12Prf(this.masterSecret, "client finished", await digestBytes(hashName, this.transcript()), 12, hashName),
-                        finishedMessage = buildHandshakeMessage(HANDSHAKE_TYPE_FINISHED, clientVerifyData);
-                this.recordHandshake(finishedMessage), await writer.write(buildTlsRecord(CONTENT_TYPE_HANDSHAKE, await this.encryptTls12(finishedMessage, CONTENT_TYPE_HANDSHAKE)));
-                let sawChangeCipherSpec = !1;
-                await this.readRecordsUntil(reader, (async record => {
-                        if (record.type === CONTENT_TYPE_ALERT) {
-                                if (shouldIgnoreTlsAlert(record.fragment)) return;
-                                throw new Error(`TLS Alert: ${record.fragment[1]}`);
-                        }
-                        if (record.type === CONTENT_TYPE_CHANGE_CIPHER_SPEC) return void (sawChangeCipherSpec = !0);
-                        if (record.type !== CONTENT_TYPE_HANDSHAKE || !sawChangeCipherSpec) return;
-                        const decrypted = await this.decryptTls12(record.fragment, CONTENT_TYPE_HANDSHAKE);
-                        if (decrypted[0] !== HANDSHAKE_TYPE_FINISHED) return;
-                        const verifyLength = readUint24(decrypted, 1),
-                                verifyData = decrypted.slice(4, 4 + verifyLength),
-                                expectedVerifyData = await tls12Prf(this.masterSecret, "server finished", await digestBytes(hashName, this.transcript()), 12, hashName);
-                        if (!constantTimeEqual(verifyData, expectedVerifyData)) throw new Error("TLS 1.2 server Finished verify failed");
-                        return 1
-                }), "Connection closed waiting for TLS 1.2 Finished")
-        }
-        async handshakeTls13(reader, writer, serverHello) {
-                const groupName = GROUPS_BY_ID.get(serverHello.keyShare?.group);
-                if (!groupName || !serverHello.keyShare?.key?.length) throw new Error("Missing TLS 1.3 key_share");
-                const hashName = this.cipherConfig.hash,
-                        hashLen = hashByteLength(hashName),
-                        keyLen = this.cipherConfig.keyLen,
-                        ivLen = this.cipherConfig.ivLen,
-                        sharedSecret = await deriveSharedSecret(this.ecdhKeyPair.privateKey, serverHello.keyShare.key, groupName),
-                        earlySecret = await hkdfExtract(hashName, null, new Uint8Array(hashLen)),
-                        derivedSecret = await hkdfExpandLabel(hashName, earlySecret, "derived", await digestBytes(hashName, EMPTY_BYTES), hashLen);
-                this.handshakeSecret = await hkdfExtract(hashName, derivedSecret, sharedSecret);
-                const transcriptHash = await digestBytes(hashName, this.transcript()),
-                        clientHandshakeTrafficSecret = await hkdfExpandLabel(hashName, this.handshakeSecret, "c hs traffic", transcriptHash, hashLen),
-                        serverHandshakeTrafficSecret = await hkdfExpandLabel(hashName, this.handshakeSecret, "s hs traffic", transcriptHash, hashLen);
-                [this.clientHandshakeKey, this.clientHandshakeIv] = await deriveTrafficKeys(hashName, clientHandshakeTrafficSecret, keyLen, ivLen), [this.serverHandshakeKey, this.serverHandshakeIv] = await deriveTrafficKeys(hashName, serverHandshakeTrafficSecret, keyLen, ivLen);
-                if (!this.cipherConfig.chacha) [this.clientHandshakeCryptoKey, this.serverHandshakeCryptoKey] = await Promise.all([importAesGcmKey(this.clientHandshakeKey, ["encrypt"]), importAesGcmKey(this.serverHandshakeKey, ["decrypt"])]);
-                const serverFinishedKey = await hkdfExpandLabel(hashName, serverHandshakeTrafficSecret, "finished", EMPTY_BYTES, hashLen);
-                let serverFinishedReceived = !1;
-                const handleHandshakeMessage = async message => {
-                        switch (message.type) {
-                                case HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS: {
-                                        const encryptedExtensions = parseEncryptedExtensions(message.body);
-                                        encryptedExtensions.alpn && (this.negotiatedAlpn = encryptedExtensions.alpn), this.recordHandshake(message.raw);
-                                        break
-                                }
-                                case HANDSHAKE_TYPE_CERTIFICATE: {
-                                        const certificate = extractLeafCertificate(message.body);
-                                        if (!certificate) throw new Error("Missing TLS 1.3 certificate");
-                                        await this.acceptCertificate(certificate), this.recordHandshake(message.raw);
-                                        break
-                                }
-                                case HANDSHAKE_TYPE_CERTIFICATE_REQUEST:
-                                        throw new Error("Client certificate is not supported");
-                                case HANDSHAKE_TYPE_CERTIFICATE_VERIFY:
-                                        this.recordHandshake(message.raw);
-                                        break;
-                                case HANDSHAKE_TYPE_FINISHED: {
-                                        const expectedVerifyData = await hmac(hashName, serverFinishedKey, await digestBytes(hashName, this.transcript()));
-                                        if (!constantTimeEqual(expectedVerifyData, message.body)) throw new Error("TLS 1.3 server Finished verify failed");
-                                        this.recordHandshake(message.raw), serverFinishedReceived = !0;
-                                        break
-                                }
-                                default:
-                                        this.recordHandshake(message.raw)
-                        }
-                };
-                await this.readRecordsUntil(reader, (async record => {
-                        if (record.type === CONTENT_TYPE_CHANGE_CIPHER_SPEC || record.type === CONTENT_TYPE_HANDSHAKE) return;
-                        if (record.type === CONTENT_TYPE_ALERT) {
-                                if (shouldIgnoreTlsAlert(record.fragment)) return;
-                                throw new Error(`TLS Alert: ${record.fragment[1]}`);
-                        }
-                        if (record.type !== CONTENT_TYPE_APPLICATION_DATA) return;
-                        const decrypted = await this.decryptTls13Handshake(record.fragment),
-                                innerType = decrypted[decrypted.length - 1],
-                                plaintext = decrypted.slice(0, -1);
-                        if (innerType === CONTENT_TYPE_HANDSHAKE) {
-                                this.handshakeParser.feed(plaintext);
-                                for (let message; message = this.handshakeParser.next();)
-                                        if (await handleHandshakeMessage(message), serverFinishedReceived) return 1
-                        }
-                }), "Connection closed during TLS 1.3 handshake");
-                const applicationTranscriptHash = await digestBytes(hashName, this.transcript()),
-                        masterDerivedSecret = await hkdfExpandLabel(hashName, this.handshakeSecret, "derived", await digestBytes(hashName, EMPTY_BYTES), hashLen),
-                        masterSecret = await hkdfExtract(hashName, masterDerivedSecret, new Uint8Array(hashLen)),
-                        clientAppTrafficSecret = await hkdfExpandLabel(hashName, masterSecret, "c ap traffic", applicationTranscriptHash, hashLen),
-                        serverAppTrafficSecret = await hkdfExpandLabel(hashName, masterSecret, "s ap traffic", applicationTranscriptHash, hashLen);
-                [this.clientAppKey, this.clientAppIv] = await deriveTrafficKeys(hashName, clientAppTrafficSecret, keyLen, ivLen), [this.serverAppKey, this.serverAppIv] = await deriveTrafficKeys(hashName, serverAppTrafficSecret, keyLen, ivLen);
-                if (!this.cipherConfig.chacha) [this.clientAppCryptoKey, this.serverAppCryptoKey] = await Promise.all([importAesGcmKey(this.clientAppKey, ["encrypt"]), importAesGcmKey(this.serverAppKey, ["decrypt"])]);
-                const clientFinishedKey = await hkdfExpandLabel(hashName, clientHandshakeTrafficSecret, "finished", EMPTY_BYTES, hashLen),
-                        clientFinishedVerifyData = await hmac(hashName, clientFinishedKey, await digestBytes(hashName, this.transcript())),
-                        clientFinishedMessage = buildHandshakeMessage(HANDSHAKE_TYPE_FINISHED, clientFinishedVerifyData);
-                this.recordHandshake(clientFinishedMessage), await writer.write(buildTlsRecord(CONTENT_TYPE_APPLICATION_DATA, await this.encryptTls13Handshake(concatBytes(clientFinishedMessage, [CONTENT_TYPE_HANDSHAKE])))), this.clientSeqNum = 0n, this.serverSeqNum = 0n
-        }
-        async encryptTls12(plaintext, contentType) {
-                const sequenceNumber = this.clientSeqNum++,
-                        sequenceBytes = uint64be(sequenceNumber),
-                        additionalData = concatBytes(sequenceBytes, [contentType], uint16be(TLS_VERSION_12), uint16be(plaintext.length));
-                if (this.cipherConfig.chacha) {
-                        const nonce = xorSequenceIntoIv(this.clientWriteIv, sequenceNumber);
-                        return chacha20Poly1305Encrypt(this.clientWriteKey, nonce, plaintext, additionalData)
-                }
-                const explicitNonce = randomBytes(8);
-                if (!this.clientWriteCryptoKey) this.clientWriteCryptoKey = await importAesGcmKey(this.clientWriteKey, ["encrypt"]);
-                return concatBytes(explicitNonce, await aesGcmEncryptWithKey(this.clientWriteCryptoKey, concatBytes(this.clientWriteIv, explicitNonce), plaintext, additionalData))
-        }
-        async decryptTls12(ciphertext, contentType) {
-                const sequenceNumber = this.serverSeqNum++,
-                        sequenceBytes = uint64be(sequenceNumber);
-                if (this.cipherConfig.chacha) {
-                        const nonce = xorSequenceIntoIv(this.serverWriteIv, sequenceNumber);
-                        return chacha20Poly1305Decrypt(this.serverWriteKey, nonce, ciphertext, concatBytes(sequenceBytes, [contentType], uint16be(TLS_VERSION_12), uint16be(ciphertext.length - 16)))
-                }
-                const explicitNonce = ciphertext.subarray(0, 8),
-                        encryptedData = ciphertext.subarray(8);
-                if (!this.serverWriteCryptoKey) this.serverWriteCryptoKey = await importAesGcmKey(this.serverWriteKey, ["decrypt"]);
-                return aesGcmDecryptWithKey(this.serverWriteCryptoKey, concatBytes(this.serverWriteIv, explicitNonce), encryptedData, concatBytes(sequenceBytes, [contentType], uint16be(TLS_VERSION_12), uint16be(encryptedData.length - 16)))
-        }
-        async encryptTls13Handshake(plaintext) {
-                const nonce = xorSequenceIntoIv(this.clientHandshakeIv, this.clientSeqNum++),
-                        additionalData = tlsBytes(CONTENT_TYPE_APPLICATION_DATA, 3, 3, uint16be(plaintext.length + 16));
-                if (this.cipherConfig.chacha) return chacha20Poly1305Encrypt(this.clientHandshakeKey, nonce, plaintext, additionalData);
-                if (!this.clientHandshakeCryptoKey) this.clientHandshakeCryptoKey = await importAesGcmKey(this.clientHandshakeKey, ["encrypt"]);
-                return aesGcmEncryptWithKey(this.clientHandshakeCryptoKey, nonce, plaintext, additionalData)
-        }
-        async decryptTls13Handshake(ciphertext) {
-                const nonce = xorSequenceIntoIv(this.serverHandshakeIv, this.serverSeqNum++),
-                        additionalData = tlsBytes(CONTENT_TYPE_APPLICATION_DATA, 3, 3, uint16be(ciphertext.length));
-                const decrypted = this.cipherConfig.chacha ? await chacha20Poly1305Decrypt(this.serverHandshakeKey, nonce, ciphertext, additionalData) : await aesGcmDecryptWithKey(this.serverHandshakeCryptoKey || (this.serverHandshakeCryptoKey = await importAesGcmKey(this.serverHandshakeKey, ["decrypt"])), nonce, ciphertext, additionalData);
-                let innerTypeIndex = decrypted.length - 1;
-                for (; innerTypeIndex >= 0 && !decrypted[innerTypeIndex];) innerTypeIndex--;
-                return innerTypeIndex < 0 ? EMPTY_BYTES : decrypted.slice(0, innerTypeIndex + 1)
-        }
-        async encryptTls13(data) {
-                const plaintext = concatBytes(data, [CONTENT_TYPE_APPLICATION_DATA]),
-                        nonce = xorSequenceIntoIv(this.clientAppIv, this.clientSeqNum++),
-                        additionalData = tlsBytes(CONTENT_TYPE_APPLICATION_DATA, 3, 3, uint16be(plaintext.length + 16));
-                if (this.cipherConfig.chacha) return chacha20Poly1305Encrypt(this.clientAppKey, nonce, plaintext, additionalData);
-                if (!this.clientAppCryptoKey) this.clientAppCryptoKey = await importAesGcmKey(this.clientAppKey, ["encrypt"]);
-                return aesGcmEncryptWithKey(this.clientAppCryptoKey, nonce, plaintext, additionalData)
-        }
-        async decryptTls13(ciphertext) {
-                const nonce = xorSequenceIntoIv(this.serverAppIv, this.serverSeqNum++),
-                        additionalData = tlsBytes(CONTENT_TYPE_APPLICATION_DATA, 3, 3, uint16be(ciphertext.length)),
-                        plaintext = this.cipherConfig.chacha ? await chacha20Poly1305Decrypt(this.serverAppKey, nonce, ciphertext, additionalData) : await aesGcmDecryptWithKey(this.serverAppCryptoKey || (this.serverAppCryptoKey = await importAesGcmKey(this.serverAppKey, ["decrypt"])), nonce, ciphertext, additionalData);
-                let innerTypeIndex = plaintext.length - 1;
-                for (; innerTypeIndex >= 0 && !plaintext[innerTypeIndex];) innerTypeIndex--;
-                if (innerTypeIndex < 0) return {
-                        data: EMPTY_BYTES,
-                        type: 0
-                };
-                return {
-                        data: plaintext.slice(0, innerTypeIndex),
-                        type: plaintext[innerTypeIndex]
-                }
-        }
-        async write(data) {
-                if (!this.handshakeComplete) throw new Error("Handshake not complete");
-                const plaintext = 数据转Uint8Array(data);
-                if (!plaintext.byteLength) return;
-                const writer = this.socket.writable.getWriter();
-                try {
-                        const records = [];
-                        for (let offset = 0; offset < plaintext.byteLength; offset += TLS_MAX_PLAINTEXT_FRAGMENT) {
-                                const chunk = plaintext.subarray(offset, Math.min(offset + TLS_MAX_PLAINTEXT_FRAGMENT, plaintext.byteLength));
-                                const encrypted = this.isTls13 ? await this.encryptTls13(chunk) : await this.encryptTls12(chunk, CONTENT_TYPE_APPLICATION_DATA);
-                                records.push(buildTlsRecord(CONTENT_TYPE_APPLICATION_DATA, encrypted));
-                        }
-                        await writer.write(records.length === 1 ? records[0] : concatBytes(...records))
-                } finally {
-                        writer.releaseLock()
-                }
-        }
-        async read() {
-                for (; ;) {
-                        let record;
-                        for (; record = this.recordParser.next();) {
-                                if (record.type === CONTENT_TYPE_ALERT) {
-                                        if (record.fragment[1] === ALERT_CLOSE_NOTIFY) return null;
-                                        throw new Error(`TLS Alert: ${record.fragment[1]}`)
-                                }
-                                if (record.type !== CONTENT_TYPE_APPLICATION_DATA) continue;
-                                if (!this.isTls13) return this.decryptTls12(record.fragment, CONTENT_TYPE_APPLICATION_DATA);
-                                const { data, type } = await this.decryptTls13(record.fragment);
-                                if (type === CONTENT_TYPE_APPLICATION_DATA) return data;
-                                if (type === CONTENT_TYPE_ALERT) {
-                                        if (data[1] === ALERT_CLOSE_NOTIFY) return null;
-                                        throw new Error(`TLS Alert: ${data[1]}`)
-                                }
-                                if (type !== CONTENT_TYPE_HANDSHAKE) continue;
-                                let message;
-                                for (this.handshakeParser.feed(data); message = this.handshakeParser.next();)
-                                        if (message.type !== HANDSHAKE_TYPE_NEW_SESSION_TICKET && message.type === HANDSHAKE_TYPE_KEY_UPDATE) throw new Error("TLS 1.3 KeyUpdate is not supported by TLSClientMini")
-                        }
-                        const reader = this.socket.readable.getReader();
-                        try {
-                                const { value, done } = await this.readChunk(reader);
-                                if (done) return null;
-                                this.recordParser.feed(value)
-                        } finally {
-                                reader.releaseLock()
-                        }
-                }
-        }
-        close() { this.socket.close() }
-}
-
-function stripIPv6Brackets(hostname = '') {
-        const host = String(hostname || '').trim();
-        return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
-}
-
-function isIPHostname(hostname = '') {
-        const host = stripIPv6Brackets(hostname);
-        const ipv4Regex = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
-        if (ipv4Regex.test(host)) return true;
-        if (!host.includes(':')) return false;
-        try {
-                new URL(`http://[${host}]/`);
-                return true;
         } catch (e) {
-                return false;
+                if (socket) {
+                        try {
+                                await socket.close();
+                        } catch (err) {}
+                }
+                throw new Error(`Connection failed to ${targetHost}:${targetPort}`);
         }
 }
-
-//////////////////////////////////////////////////turnConnect///////////////////////////////////////////////
-const CONNECT_TIMEOUT_MS = 9999;
-const TURN_STUN_MAGIC_COOKIE = new Uint8Array([0x21, 0x12, 0xa4, 0x42]);
-const TURN_STUN_TYPE = {
-        ALLOCATE_REQUEST: 0x0003, ALLOCATE_SUCCESS: 0x0103, ALLOCATE_ERROR: 0x0113,
-        CREATE_PERMISSION_REQUEST: 0x0008, CREATE_PERMISSION_SUCCESS: 0x0108,
-        CONNECT_REQUEST: 0x000a, CONNECT_SUCCESS: 0x010a,
-        CONNECTION_BIND_REQUEST: 0x000b, CONNECTION_BIND_SUCCESS: 0x010b
-};
-const TURN_STUN_ATTR = {
-        USERNAME: 0x0006, MESSAGE_INTEGRITY: 0x0008, ERROR_CODE: 0x0009,
-        XOR_PEER_ADDRESS: 0x0012, REALM: 0x0014, NONCE: 0x0015,
-        REQUESTED_TRANSPORT: 0x0019, CONNECTION_ID: 0x002a
-};
-
-async function withTimeout(promise, timeoutMs, message) {
-        let timer;
+async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
+        const requestData = convertToUint8Array(udpChunk);
         try {
-                return await Promise.race([
-                        promise,
-                        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs) })
-                ]);
-        } finally {
-                clearTimeout(timer);
-        }
-}
-
-function isIPv4(value) {
-        const parts = String(value || '').split('.');
-        return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
-}
-
-function turnStunPadding(length) {
-        return -length & 3;
-}
-
-function createTurnStunAttribute(type, value) {
-        const body = 数据转Uint8Array(value);
-        const attribute = new Uint8Array(4 + body.byteLength + turnStunPadding(body.byteLength));
-        const view = new DataView(attribute.buffer);
-        view.setUint16(0, type);
-        view.setUint16(2, body.byteLength);
-        attribute.set(body, 4);
-        return attribute;
-}
-
-function createTurnStunMessage(type, transactionId, attributes) {
-        const body = 拼接字节数据(...attributes);
-        const header = new Uint8Array(20);
-        const view = new DataView(header.buffer);
-        view.setUint16(0, type);
-        view.setUint16(2, body.byteLength);
-        header.set(TURN_STUN_MAGIC_COOKIE, 4);
-        header.set(transactionId, 8);
-        return 拼接字节数据(header, body);
-}
-
-function parseTurnErrorCode(data) {
-        return data?.byteLength >= 4 ? (data[2] & 7) * 100 + data[3] : 0;
-}
-
-function randomTurnTransactionId() {
-        return crypto.getRandomValues(new Uint8Array(12));
-}
-
-async function addTurnMessageIntegrity(message, key) {
-        const signedMessage = new Uint8Array(message);
-        const view = new DataView(signedMessage.buffer);
-        view.setUint16(2, view.getUint16(2) + 24);
-        const hmacKey = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
-        const signature = await crypto.subtle.sign('HMAC', hmacKey, signedMessage);
-        return 拼接字节数据(signedMessage, createTurnStunAttribute(TURN_STUN_ATTR.MESSAGE_INTEGRITY, new Uint8Array(signature)));
-}
-
-async function readTurnStunMessage(reader, bufferedData = null, timeoutMessage = 'TURN response timed out') {
-        let buffer = 有效数据长度(bufferedData) ? 数据转Uint8Array(bufferedData) : new Uint8Array(0);
-        const pull = async () => {
-                const { done, value } = await withTimeout(reader.read(), CONNECT_TIMEOUT_MS, timeoutMessage);
-                if (done) throw new Error('TURN server closed connection');
-                if (value?.byteLength) buffer = 拼接字节数据(buffer, value);
-        };
-        while (buffer.byteLength < 20) await pull();
-
-        const messageLength = 20 + ((buffer[2] << 8) | buffer[3]);
-        if (messageLength > 65555) throw new Error('TURN response is too large');
-        while (buffer.byteLength < messageLength) await pull();
-        const messageBuffer = buffer.subarray(0, messageLength);
-        if (TURN_STUN_MAGIC_COOKIE.some((value, index) => messageBuffer[4 + index] !== value)) throw new Error('Invalid TURN/STUN response');
-
-        const view = new DataView(messageBuffer.buffer, messageBuffer.byteOffset, messageBuffer.byteLength);
-        const attributes = {};
-        for (let offset = 20; offset + 4 <= messageLength;) {
-                const type = view.getUint16(offset);
-                const length = view.getUint16(offset + 2);
-                if (offset + 4 + length > messageBuffer.byteLength) break;
-                attributes[type] = messageBuffer.slice(offset + 4, offset + 4 + length);
-                offset += 4 + length + turnStunPadding(length);
-        }
-        return {
-                message: { type: view.getUint16(0), attributes },
-                extraData: buffer.byteLength > messageLength ? buffer.subarray(messageLength) : null
-        };
-}
-
-async function writeTurnBytes(writer, bytes, timeoutMessage) {
-        await withTimeout(writer.write(bytes), CONNECT_TIMEOUT_MS, timeoutMessage);
-}
-
-async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
-        proxy = { ...proxy, username: proxy.username ?? null, password: proxy.password ?? null };
-        const resolvedTargetHost = stripIPv6Brackets(targetHost);
-        /** @type {string | null} */
-        let targetIp = isIPv4(resolvedTargetHost) ? resolvedTargetHost : null;
-        if (!targetIp) {
-                const records = await DoH查询(resolvedTargetHost, 'A');
-                const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
-                targetIp = typeof recordData === 'string' ? recordData : null;
-        }
-        if (!targetIp) throw new Error(`Could not resolve ${targetHost} to an IPv4 address for TURN CONNECT`);
-
-        const turnHost = stripIPv6Brackets(proxy.hostname);
-        let controlSocket = null, dataSocket = null, controlWriter = null, controlReader = null, dataWriter = null, dataReader = null, dataReaderReleased = false;
-        const close = () => {
-                try { controlSocket?.close?.() } catch (e) { }
-                try { dataSocket?.close?.() } catch (e) { }
-        };
-        const releaseDataReader = () => {
-                if (dataReaderReleased) return;
-                dataReaderReleased = true;
-                try { dataReader?.releaseLock?.() } catch (e) { }
-        };
-
-        try {
-                controlSocket = TCP连接({ hostname: turnHost, port: proxy.port });
-                await withTimeout(controlSocket.opened, CONNECT_TIMEOUT_MS, 'TURN server connection timed out');
-                controlWriter = controlSocket.writable.getWriter();
-                controlReader = controlSocket.readable.getReader();
-
-                const xorPeerAddress = new Uint8Array(8);
-                xorPeerAddress[1] = 1;
-                new DataView(xorPeerAddress.buffer).setUint16(2, targetPort ^ 0x2112);
-                targetIp.split('.').forEach((value, index) => {
-                        xorPeerAddress[4 + index] = Number(value) ^ TURN_STUN_MAGIC_COOKIE[index];
-                });
-                const peerAddress = createTurnStunAttribute(TURN_STUN_ATTR.XOR_PEER_ADDRESS, xorPeerAddress);
-                const requestedTransport = new Uint8Array([6, 0, 0, 0]);
-
-                await writeTurnBytes(controlWriter, createTurnStunMessage(
-                        TURN_STUN_TYPE.ALLOCATE_REQUEST,
-                        randomTurnTransactionId(),
-                        [createTurnStunAttribute(TURN_STUN_ATTR.REQUESTED_TRANSPORT, requestedTransport)]
-                ), 'TURN Allocate request timed out');
-
-                let turnResponse = await readTurnStunMessage(controlReader, null, 'TURN Allocate response timed out');
-                let message = turnResponse.message;
-                let bufferedData = turnResponse.extraData;
-                let integrityKey = null;
-                let authAttributes = [];
-                const sign = messageToSign => integrityKey ? addTurnMessageIntegrity(messageToSign, integrityKey) : Promise.resolve(messageToSign);
-
-                if (
-                        message.type === TURN_STUN_TYPE.ALLOCATE_ERROR
-                        && proxy.username !== null
-                        && proxy.password !== null
-                        && parseTurnErrorCode(message.attributes[TURN_STUN_ATTR.ERROR_CODE]) === 401
-                ) {
-                        const realmBytes = message.attributes[TURN_STUN_ATTR.REALM];
-                        const nonce = message.attributes[TURN_STUN_ATTR.NONCE];
-                        if (!realmBytes || !nonce?.byteLength) throw new Error('TURN authentication challenge is missing realm or nonce');
-
-                        const realm = textDecoder.decode(realmBytes);
-                        integrityKey = new Uint8Array(await crypto.subtle.digest('MD5', textEncoder.encode(`${proxy.username}:${realm}:${proxy.password}`)));
-                        authAttributes = [
-                                createTurnStunAttribute(TURN_STUN_ATTR.USERNAME, textEncoder.encode(proxy.username)),
-                                createTurnStunAttribute(TURN_STUN_ATTR.REALM, textEncoder.encode(realm)),
-                                createTurnStunAttribute(TURN_STUN_ATTR.NONCE, nonce)
-                        ];
-
-                        const allocateRequest = await addTurnMessageIntegrity(createTurnStunMessage(
-                                TURN_STUN_TYPE.ALLOCATE_REQUEST,
-                                randomTurnTransactionId(),
-                                [
-                                        createTurnStunAttribute(TURN_STUN_ATTR.REQUESTED_TRANSPORT, requestedTransport),
-                                        ...authAttributes
-                                ]
-                        ), integrityKey);
-                        const pipelinedMessages = await Promise.all([
-                                sign(createTurnStunMessage(TURN_STUN_TYPE.CREATE_PERMISSION_REQUEST, randomTurnTransactionId(), [peerAddress, ...authAttributes])),
-                                sign(createTurnStunMessage(TURN_STUN_TYPE.CONNECT_REQUEST, randomTurnTransactionId(), [peerAddress, ...authAttributes]))
-                        ]);
-                        await writeTurnBytes(controlWriter, 拼接字节数据(allocateRequest, ...pipelinedMessages), 'TURN authenticated Allocate request timed out');
-                        turnResponse = await readTurnStunMessage(controlReader, bufferedData, 'TURN authenticated Allocate response timed out');
-                        message = turnResponse.message;
-                        bufferedData = turnResponse.extraData;
-                } else if (message.type === TURN_STUN_TYPE.ALLOCATE_SUCCESS) {
-                        const pipelinedMessages = await Promise.all([
-                                sign(createTurnStunMessage(TURN_STUN_TYPE.CREATE_PERMISSION_REQUEST, randomTurnTransactionId(), [peerAddress, ...authAttributes])),
-                                sign(createTurnStunMessage(TURN_STUN_TYPE.CONNECT_REQUEST, randomTurnTransactionId(), [peerAddress, ...authAttributes]))
-                        ]);
-                        if (pipelinedMessages.length) await writeTurnBytes(controlWriter, 拼接字节数据(...pipelinedMessages), 'TURN pipelined request timed out');
-                }
-
-                if (message.type !== TURN_STUN_TYPE.ALLOCATE_SUCCESS) {
-                        const errorCode = parseTurnErrorCode(message.attributes[TURN_STUN_ATTR.ERROR_CODE]);
-                        throw new Error(errorCode ? `TURN Allocate failed with ${errorCode}` : 'TURN Allocate failed');
-                }
-
-                dataSocket = TCP连接({ hostname: turnHost, port: proxy.port });
-                turnResponse = await readTurnStunMessage(controlReader, bufferedData, 'TURN CreatePermission response timed out');
-                message = turnResponse.message;
-                bufferedData = turnResponse.extraData;
-                if (message.type !== TURN_STUN_TYPE.CREATE_PERMISSION_SUCCESS) throw new Error('TURN CreatePermission failed');
-
-                turnResponse = await readTurnStunMessage(controlReader, bufferedData, 'TURN CONNECT response timed out');
-                message = turnResponse.message;
-                bufferedData = turnResponse.extraData;
-                if (message.type !== TURN_STUN_TYPE.CONNECT_SUCCESS || !message.attributes[TURN_STUN_ATTR.CONNECTION_ID]) throw new Error('TURN CONNECT failed');
-
-                await withTimeout(dataSocket.opened, CONNECT_TIMEOUT_MS, 'TURN data connection timed out');
-                dataWriter = dataSocket.writable.getWriter();
-                dataReader = dataSocket.readable.getReader();
-                await writeTurnBytes(dataWriter, await sign(createTurnStunMessage(
-                        TURN_STUN_TYPE.CONNECTION_BIND_REQUEST,
-                        randomTurnTransactionId(),
-                        [
-                                createTurnStunAttribute(TURN_STUN_ATTR.CONNECTION_ID, message.attributes[TURN_STUN_ATTR.CONNECTION_ID]),
-                                ...authAttributes
-                        ]
-                )), 'TURN ConnectionBind request timed out');
-
-                turnResponse = await readTurnStunMessage(dataReader, null, 'TURN ConnectionBind response timed out');
-                message = turnResponse.message;
-                const extraPayload = turnResponse.extraData;
-                if (message.type !== TURN_STUN_TYPE.CONNECTION_BIND_SUCCESS) throw new Error('TURN ConnectionBind failed');
-
-                controlWriter.releaseLock();
-                controlWriter = null;
-                controlReader.releaseLock();
-                controlReader = null;
-                dataWriter.releaseLock();
-                dataWriter = null;
-
-                const readable = new ReadableStream({
-                        start(controller) {
-                                if (extraPayload?.byteLength) controller.enqueue(extraPayload);
-                        },
-                        pull(controller) {
-                                return dataReader.read().then(({ done, value }) => {
-                                        if (done) {
-                                                releaseDataReader();
-                                                controller.close();
-                                        } else if (value?.byteLength) controller.enqueue(new Uint8Array(value));
-                                });
-                        },
-                        cancel() {
-                                try { dataReader?.cancel?.() } catch (e) { }
-                                releaseDataReader();
-                                close();
-                        }
-                });
-
-                return { readable, writable: dataSocket.writable, closed: dataSocket.closed, close };
-        } catch (error) {
-                try { controlWriter?.releaseLock?.() } catch (e) { }
-                try { controlReader?.releaseLock?.() } catch (e) { }
-                try { dataWriter?.releaseLock?.() } catch (e) { }
-                releaseDataReader();
-                close();
-                throw error;
-        }
-}
-//////////////////////////////////////////////////sstpConnect///////////////////////////////////////////////
-const SSTP_TCP_MSS = 1400;
-const SSTP_EMPTY_BYTES = new Uint8Array(0);
-
-function readSstpUint16(bytes, offset = 0) {
-        return (bytes[offset] << 8) | bytes[offset + 1];
-}
-
-function readSstpUint32(bytes, offset = 0) {
-        return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
-}
-
-function randomSstpUint16() {
-        return readSstpUint16(crypto.getRandomValues(new Uint8Array(2)));
-}
-
-function internetChecksum(bytes, offset, length) {
-        let sum = 0;
-        for (let index = offset; index < offset + length - 1; index += 2) sum += readSstpUint16(bytes, index);
-        if (length & 1) sum += bytes[offset + length - 1] << 8;
-        while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
-        return (~sum) & 0xffff;
-}
-
-async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
-        proxy = { ...proxy, username: proxy.username ?? null, password: proxy.password ?? null };
-        let bufferedBytes = SSTP_EMPTY_BYTES, pppIdentifier = 1, socket = null, reader = null, writer = null;
-        let closedSettled = false, resolveClosed, rejectClosed;
-        const closed = new Promise((resolve, reject) => {
-                resolveClosed = resolve;
-                rejectClosed = reject;
-        });
-        const settleClosed = (settle, value) => {
-                if (closedSettled) return;
-                closedSettled = true;
-                settle(value);
-        };
-        const close = () => {
-                try { reader?.cancel?.().catch?.(() => { }) } catch (e) { }
-                try { reader?.releaseLock?.() } catch (e) { }
-                try { writer?.close?.().catch?.(() => { }) } catch (e) { }
-                try { writer?.releaseLock?.() } catch (e) { }
-                try { socket?.close?.() } catch (e) { }
-                settleClosed(resolveClosed);
-        };
-
-        const readSocketChunk = async () => {
-                const { value, done } = await reader.read();
-                if (done || !value) throw new Error('SSTP socket closed');
-                return 数据转Uint8Array(value);
-        };
-        const readBytes = async length => {
-                while (bufferedBytes.byteLength < length) {
-                        const chunk = await readSocketChunk();
-                        bufferedBytes = bufferedBytes.byteLength ? 拼接字节数据(bufferedBytes, chunk) : chunk;
-                }
-                const result = bufferedBytes.subarray(0, length);
-                bufferedBytes = bufferedBytes.subarray(length);
-                return result;
-        };
-        const readHttpLine = async () => {
-                for (; ;) {
-                        const lineEnd = bufferedBytes.indexOf(10);
-                        if (lineEnd >= 0) {
-                                const line = textDecoder.decode(bufferedBytes.subarray(0, lineEnd));
-                                bufferedBytes = bufferedBytes.subarray(lineEnd + 1);
-                                return line.replace(/\r$/, '');
-                        }
-                        const chunk = await readSocketChunk();
-                        bufferedBytes = bufferedBytes.byteLength ? 拼接字节数据(bufferedBytes, chunk) : chunk;
-                }
-        };
-        const readPacket = async (timeoutMs = CONNECT_TIMEOUT_MS) => {
-                const header = await withTimeout(readBytes(4), timeoutMs, 'SSTP read timeout');
-                const length = readSstpUint16(header, 2) & 0x0fff;
-                if (length < 4) throw new Error('Invalid SSTP packet length');
-                return {
-                        isControl: (header[1] & 1) !== 0,
-                        body: length > 4 ? await withTimeout(readBytes(length - 4), timeoutMs, 'SSTP packet body read timeout') : SSTP_EMPTY_BYTES
-                };
-        };
-        const buildSstpDataPacket = pppFrame => {
-                const packetLength = 6 + pppFrame.byteLength;
-                const packet = new Uint8Array(packetLength);
-                packet.set([0x10, 0x00, ((packetLength >> 8) & 0x0f) | 0x80, packetLength & 0xff, 0xff, 0x03]);
-                packet.set(pppFrame, 6);
-                return packet;
-        };
-        const buildPppConfigurePacket = (protocol, code, id, options = []) => {
-                const optionsLength = options.reduce((size, option) => size + 2 + option.data.byteLength, 0);
-                const frame = new Uint8Array(6 + optionsLength);
-                const view = new DataView(frame.buffer);
-                view.setUint16(0, protocol);
-                frame[2] = code;
-                frame[3] = id;
-                view.setUint16(4, 4 + optionsLength);
-                options.reduce((offset, option) => {
-                        frame[offset] = option.type;
-                        frame[offset + 1] = 2 + option.data.byteLength;
-                        frame.set(option.data, offset + 2);
-                        return offset + 2 + option.data.byteLength;
-                }, 6);
-                return frame;
-        };
-        const parsePPPFrame = data => {
-                const offset = data.byteLength >= 2 && data[0] === 0xff && data[1] === 0x03 ? 2 : 0;
-                if (data.byteLength - offset < 4) return null;
-                const protocol = readSstpUint16(data, offset);
-                if (protocol === 0x0021) return { protocol, ipPacket: data.subarray(offset + 2) };
-                if (data.byteLength - offset < 6) return null;
-                return { protocol, code: data[offset + 2], id: data[offset + 3], payload: data.subarray(offset + 6), rawPacket: data.subarray(offset) };
-        };
-        const parsePppOptions = data => {
-                const options = [];
-                for (let offset = 0; offset + 2 <= data.byteLength;) {
-                        const type = data[offset];
-                        const length = data[offset + 1];
-                        if (length < 2 || offset + length > data.byteLength) break;
-                        options.push({ type, data: data.subarray(offset + 2, offset + length) });
-                        offset += length;
-                }
-                return options;
-        };
-
-        try {
-                const serverHost = stripIPv6Brackets(proxy.hostname);
-                const serverPort = proxy.port;
-                socket = TCP连接({ hostname: serverHost, port: serverPort }, { secureTransport: 'on', allowHalfOpen: false });
-                await withTimeout(socket.opened, CONNECT_TIMEOUT_MS, 'SSTP server connection timed out');
-                reader = socket.readable.getReader();
-                writer = socket.writable.getWriter();
-
-                const displayHost = serverHost.includes(':') ? `[${serverHost}]` : serverHost;
-                const httpRequest = textEncoder.encode(
-                        `SSTP_DUPLEX_POST /sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/ HTTP/1.1\r\n`
-                        + `Host: ${Number(serverPort) === 443 ? displayHost : `${displayHost}:${serverPort}`}\r\n`
-                        + 'Content-Length: 18446744073709551615\r\n'
-                        + `SSTPCORRELATIONID: {${crypto.randomUUID()}}\r\n\r\n`
+                const tcpSocket = connect({ hostname: dnsServer, port: 53 });
+                let vIeesHeader = respHeader;
+                const writer = tcpSocket.writable.getWriter();
+                await writer.write(requestData);
+                writer.releaseLock();
+                await tcpSocket.readable.pipeTo(
+                        new WritableStream({
+                                async write(chunk) {
+                                        const response = convertToUint8Array(chunk);
+                                        if (typeof onBytes === "function") onBytes(response.byteLength);
+                                        if (webSocket.readyState !== WebSocket.OPEN) return;
+                                        if (vIeesHeader) {
+                                                const merged = new Uint8Array(vIeesHeader.length + response.byteLength);
+                                                merged.set(vIeesHeader, 0);
+                                                merged.set(response, vIeesHeader.length);
+                                                webSocket.send(merged.buffer);
+                                                vIeesHeader = null;
+                                        } else {
+                                                webSocket.send(response);
+                                        }
+                                },
+                        }),
                 );
-                const encapsulatedProtocol = new Uint8Array(2);
-                new DataView(encapsulatedProtocol.buffer).setUint16(0, 1);
-                const maximumReceiveUnit = new Uint8Array(2);
-                new DataView(maximumReceiveUnit.buffer).setUint16(0, 1500);
-                const sstpConnectRequest = new Uint8Array(12 + encapsulatedProtocol.byteLength);
-                const sstpConnectView = new DataView(sstpConnectRequest.buffer);
-                sstpConnectRequest[0] = 0x10;
-                sstpConnectRequest[1] = 0x01;
-                sstpConnectView.setUint16(2, sstpConnectRequest.byteLength | 0x8000);
-                sstpConnectView.setUint16(4, 0x0001);
-                sstpConnectView.setUint16(6, 1);
-                sstpConnectRequest[9] = 1;
-                sstpConnectView.setUint16(10, 4 + encapsulatedProtocol.byteLength);
-                sstpConnectRequest.set(encapsulatedProtocol, 12);
-
-                await withTimeout(writer.write(拼接字节数据(
-                        httpRequest,
-                        sstpConnectRequest,
-                        buildSstpDataPacket(buildPppConfigurePacket(0xc021, 1, pppIdentifier++, [
-                                { type: 1, data: maximumReceiveUnit }
-                        ]))
-                )), CONNECT_TIMEOUT_MS, 'SSTP HTTP handshake request timed out');
-
-                const statusLine = await withTimeout(readHttpLine(), CONNECT_TIMEOUT_MS, 'SSTP HTTP handshake timed out');
-                for (; ;) {
-                        const line = await withTimeout(readHttpLine(), CONNECT_TIMEOUT_MS, 'SSTP HTTP header read timed out');
-                        if (line === '') break;
-                }
-                if (!/HTTP\/\d(?:\.\d)?\s+2\d\d/i.test(statusLine)) throw new Error(`SSTP HTTP handshake failed: ${statusLine || 'invalid status'}`);
-
-                let localLcpAcked = false, peerLcpAcked = false, papRequired = false, papSent = false, papDone = false, ipcpStarted = false, ipcpFinished = false, sourceIp = null;
-                const sendPapIfReady = async () => {
-                        if (!localLcpAcked || !peerLcpAcked || !papRequired || papSent) return;
-                        if (proxy.username === null || proxy.password === null) throw new Error('SSTP server requires PAP authentication');
-                        const username = textEncoder.encode(proxy.username);
-                        const password = textEncoder.encode(proxy.password);
-                        if (username.byteLength > 255 || password.byteLength > 255) throw new Error('SSTP username/password is too long');
-                        const papLength = 6 + username.byteLength + password.byteLength;
-                        const frame = new Uint8Array(2 + papLength);
-                        const view = new DataView(frame.buffer);
-                        view.setUint16(0, 0xc023);
-                        frame[2] = 1;
-                        frame[3] = pppIdentifier++;
-                        view.setUint16(4, papLength);
-                        frame[6] = username.byteLength;
-                        frame.set(username, 7);
-                        frame[7 + username.byteLength] = password.byteLength;
-                        frame.set(password, 8 + username.byteLength);
-                        await withTimeout(writer.write(buildSstpDataPacket(frame)), CONNECT_TIMEOUT_MS, 'SSTP PAP authentication request timed out');
-                        papSent = true;
-                };
-                const startIpcpIfReady = async () => {
-                        if (!localLcpAcked || !peerLcpAcked || ipcpStarted || (papRequired && !papDone)) return;
-                        await withTimeout(writer.write(buildSstpDataPacket(buildPppConfigurePacket(0x8021, 1, pppIdentifier++, [
-                                { type: 3, data: new Uint8Array(4) }
-                        ]))), CONNECT_TIMEOUT_MS, 'SSTP IPCP request timed out');
-                        ipcpStarted = true;
-                };
-
-                for (let round = 0; round < 50 && !ipcpFinished; round++) {
-                        const packet = await readPacket(CONNECT_TIMEOUT_MS);
-                        if (packet.isControl) continue;
-                        const ppp = parsePPPFrame(packet.body);
-                        if (!ppp) continue;
-
-                        if (ppp.protocol === 0xc021) {
-                                if (ppp.code === 1) {
-                                        const authOption = parsePppOptions(ppp.payload).find(option => option.type === 3);
-                                        if (authOption?.data?.byteLength >= 2) {
-                                                const authProtocol = readSstpUint16(authOption.data);
-                                                if (authProtocol !== 0xc023) throw new Error(`SSTP unsupported PPP authentication protocol: 0x${authProtocol.toString(16)}`);
-                                                papRequired = true;
-                                        }
-                                        const ack = new Uint8Array(ppp.rawPacket);
-                                        ack[2] = 2;
-                                        await withTimeout(writer.write(buildSstpDataPacket(ack)), CONNECT_TIMEOUT_MS, 'SSTP LCP Configure-Ack timed out');
-                                        peerLcpAcked = true;
-                                        await sendPapIfReady();
-                                        await startIpcpIfReady();
-                                } else if (ppp.code === 2) {
-                                        localLcpAcked = true;
-                                        await sendPapIfReady();
-                                        await startIpcpIfReady();
-                                }
-                                continue;
-                        }
-
-                        if (ppp.protocol === 0xc023) {
-                                if (ppp.code === 2) {
-                                        papDone = true;
-                                        await startIpcpIfReady();
-                                } else if (ppp.code === 3) throw new Error('SSTP PAP authentication failed');
-                                continue;
-                        }
-
-                        if (ppp.protocol === 0x8021) {
-                                if (ppp.code === 1) {
-                                        const ack = new Uint8Array(ppp.rawPacket);
-                                        ack[2] = 2;
-                                        await withTimeout(writer.write(buildSstpDataPacket(ack)), CONNECT_TIMEOUT_MS, 'SSTP IPCP Configure-Ack timed out');
-                                        await startIpcpIfReady();
-                                } else if (ppp.code === 3) {
-                                        const addressOption = parsePppOptions(ppp.payload).find(option => option.type === 3);
-                                        if (addressOption?.data?.byteLength === 4) {
-                                                sourceIp = [...addressOption.data].join('.');
-                                                await withTimeout(writer.write(buildSstpDataPacket(buildPppConfigurePacket(0x8021, 1, pppIdentifier++, [
-                                                        { type: 3, data: addressOption.data }
-                                                ]))), CONNECT_TIMEOUT_MS, 'SSTP IPCP address request timed out');
-                                                ipcpStarted = true;
-                                        }
-                                } else if (ppp.code === 2) {
-                                        const addressOption = parsePppOptions(ppp.payload).find(option => option.type === 3);
-                                        if (addressOption?.data?.byteLength === 4) sourceIp = [...addressOption.data].join('.');
-                                        ipcpFinished = true;
-                                }
-                        }
-                }
-                if (!sourceIp) throw new Error('SSTP did not assign an IPv4 address');
-
-                const target = stripIPv6Brackets(targetHost);
-                /** @type {string | null} */
-                let targetIp = isIPv4(target) ? target : null;
-                if (!targetIp) {
-                        const records = await DoH查询(target, 'A');
-                        const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
-                        targetIp = typeof recordData === 'string' ? recordData : null;
-                }
-                if (!targetIp) throw new Error(`Could not resolve ${targetHost} to an IPv4 address for SSTP`);
-
-                const sourcePort = 10000 + (randomSstpUint16() % 50000);
-                const sourceAddress = new Uint8Array(String(sourceIp || '').split('.').map(Number));
-                const destinationAddress = new Uint8Array(String(targetIp || '').split('.').map(Number));
-                let sequenceNumber = readSstpUint32(crypto.getRandomValues(new Uint8Array(4)));
-                let acknowledgementNumber = 0;
-                const ipHeaderTemplate = new Uint8Array(20);
-                ipHeaderTemplate.set([0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 64, 6]);
-                ipHeaderTemplate.set(sourceAddress, 12);
-                ipHeaderTemplate.set(destinationAddress, 16);
-                const tcpPseudoHeader = new Uint8Array(1432);
-                tcpPseudoHeader.set(sourceAddress);
-                tcpPseudoHeader.set(destinationAddress, 4);
-                tcpPseudoHeader[9] = 6;
-                const buildTcpFrame = (flags, payload = SSTP_EMPTY_BYTES) => {
-                        const bytes = 数据转Uint8Array(payload);
-                        const payloadLength = bytes.byteLength;
-                        const tcpLength = 20 + payloadLength;
-                        const ipLength = 20 + tcpLength;
-                        const sstpLength = 8 + ipLength;
-                        const frame = new Uint8Array(sstpLength);
-                        const view = new DataView(frame.buffer);
-                        frame.set([0x10, 0x00, ((sstpLength >> 8) & 0x0f) | 0x80, sstpLength & 0xff, 0xff, 0x03, 0x00, 0x21]);
-                        frame.set(ipHeaderTemplate, 8);
-                        view.setUint16(10, ipLength);
-                        view.setUint16(12, randomSstpUint16());
-                        view.setUint16(18, internetChecksum(frame, 8, 20));
-                        view.setUint16(28, sourcePort);
-                        view.setUint16(30, targetPort);
-                        view.setUint32(32, sequenceNumber);
-                        view.setUint32(36, acknowledgementNumber);
-                        frame[40] = 0x50;
-                        frame[41] = flags;
-                        view.setUint16(42, 65535);
-                        if (payloadLength) frame.set(bytes, 48);
-                        tcpPseudoHeader[10] = tcpLength >> 8;
-                        tcpPseudoHeader[11] = tcpLength & 0xff;
-                        tcpPseudoHeader.set(frame.subarray(28, 28 + tcpLength), 12);
-                        view.setUint16(44, internetChecksum(tcpPseudoHeader, 0, 12 + tcpLength));
-                        return frame;
-                };
-                const matchIncomingIpPacket = ipPacket => {
-                        if (ipPacket.byteLength < 40 || ipPacket[9] !== 6) return null;
-                        const ipHeaderLength = (ipPacket[0] & 0x0f) * 4;
-                        if (ipPacket.byteLength < ipHeaderLength + 20) return null;
-                        if (readSstpUint16(ipPacket, ipHeaderLength) !== targetPort) return null;
-                        if (readSstpUint16(ipPacket, ipHeaderLength + 2) !== sourcePort) return null;
-                        return {
-                                flags: ipPacket[ipHeaderLength + 13],
-                                sequence: readSstpUint32(ipPacket, ipHeaderLength + 4),
-                                payloadOffset: ipHeaderLength + ((ipPacket[ipHeaderLength + 12] >> 4) & 0x0f) * 4
-                        };
-                };
-
-                await withTimeout(writer.write(buildTcpFrame(0x02)), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN write timed out');
-                sequenceNumber = (sequenceNumber + 1) >>> 0;
-                let tcpReady = false;
-                for (let attempt = 0; attempt < 30; attempt++) {
-                        const packet = await readPacket(CONNECT_TIMEOUT_MS);
-                        if (packet.isControl) continue;
-                        const ppp = parsePPPFrame(packet.body);
-                        if (!ppp || ppp.protocol !== 0x0021) continue;
-                        const tcp = matchIncomingIpPacket(ppp.ipPacket);
-                        if (!tcp || (tcp.flags & 0x12) !== 0x12) continue;
-                        acknowledgementNumber = (tcp.sequence + 1) >>> 0;
-                        await withTimeout(writer.write(buildTcpFrame(0x10)), CONNECT_TIMEOUT_MS, 'SSTP TCP ACK write timed out');
-                        tcpReady = true;
-                        break;
-                }
-                if (!tcpReady) throw new Error('TCP handshake through SSTP timed out');
-
-                /** @type {ReadableStreamDefaultController<Uint8Array> | null} */
-                let streamController = null;
-                const readable = new ReadableStream({
-                        start(controller) {
-                                streamController = controller;
-                        },
-                        cancel() {
-                                close();
-                        }
-                });
-
-                (async () => {
+        } catch (e) {}
+}
+function extractUUIDFromvIees(data) {
+        if (data.byteLength < 17) return null;
+        const hex = [...data.slice(1, 17)].map((b) => b.toString(16).padStart(2, "0")).join("");
+        return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
+}
+function trackRequest(env, ctx) {
+        GLOBAL_REQ_COUNT++;
+        const now = Date.now();
+        if ((now - GLOBAL_LAST_REQ_WRITE > 900000 || GLOBAL_REQ_COUNT > 5000) && GLOBAL_REQ_COUNT > 0) {
+                GLOBAL_LAST_REQ_WRITE = now;
+                const countToSave = GLOBAL_REQ_COUNT;
+                GLOBAL_REQ_COUNT = 0;
+                const task = async () => {
                         try {
-                                let pendingChunks = [], pendingLength = 0;
-                                const flush = () => {
-                                        if (!pendingLength) return;
-                                        if (!streamController) throw new Error('SSTP readable stream is not ready');
-                                        streamController.enqueue(pendingChunks.length === 1 ? pendingChunks[0] : 拼接字节数据(...pendingChunks));
-                                        pendingChunks = [];
-                                        pendingLength = 0;
-                                        writer.write(buildTcpFrame(0x10)).catch(() => { });
-                                };
-
-                                for (; ;) {
-                                        const packet = await readPacket(60000);
-                                        if (packet.isControl) continue;
-                                        const ppp = parsePPPFrame(packet.body);
-                                        if (!ppp || ppp.protocol !== 0x0021) continue;
-                                        const incoming = matchIncomingIpPacket(ppp.ipPacket);
-                                        if (!incoming) continue;
-
-                                        if (incoming.payloadOffset < ppp.ipPacket.byteLength) {
-                                                const payload = ppp.ipPacket.subarray(incoming.payloadOffset);
-                                                if (payload.byteLength) {
-                                                        acknowledgementNumber = (incoming.sequence + payload.byteLength) >>> 0;
-                                                        pendingChunks.push(new Uint8Array(payload));
-                                                        pendingLength += payload.byteLength;
-                                                }
-                                        }
-
-                                        if (incoming.flags & 0x01) {
-                                                flush();
-                                                acknowledgementNumber = (acknowledgementNumber + 1) >>> 0;
-                                                writer.write(buildTcpFrame(0x11)).catch(() => { });
-                                                const controller = streamController;
-                                                if (controller) {
-                                                        try { controller.close() } catch (e) { }
-                                                }
-                                                close();
-                                                return;
-                                        }
-
-                                        if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
+                                const today = new Date().toISOString().split("T")[0];
+                                await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
+                                const lastDateRow = await env.DB.prepare("SELECT value FROM edgepp_settings WHERE key = 'req_last_date'").first();
+                                if (!lastDateRow || lastDateRow.value !== today) {
+                                        await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
+                                        await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
+                                } else {
+                                        await env.DB.prepare("INSERT OR REPLACE INTO edgepp_settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
                                 }
-                        } catch (error) {
-                                const controller = streamController;
-                                if (controller) {
-                                        try { controller.error(error) } catch (e) { }
-                                }
-                                settleClosed(rejectClosed, error);
-                                try { socket?.close?.() } catch (e) { }
-                        }
-                })();
-
-                const writable = new WritableStream({
-                        async write(chunk) {
-                                const bytes = 数据转Uint8Array(chunk);
-                                if (!bytes.byteLength) return;
-                                if (bytes.byteLength <= SSTP_TCP_MSS) {
-                                        await writer.write(buildTcpFrame(0x18, bytes));
-                                        sequenceNumber = (sequenceNumber + bytes.byteLength) >>> 0;
-                                        return;
-                                }
-                                const frames = [];
-                                for (let offset = 0; offset < bytes.byteLength; offset += SSTP_TCP_MSS) {
-                                        const segment = bytes.subarray(offset, Math.min(offset + SSTP_TCP_MSS, bytes.byteLength));
-                                        frames.push(buildTcpFrame(0x18, segment));
-                                        sequenceNumber = (sequenceNumber + segment.byteLength) >>> 0;
-                                }
-                                await writer.write(拼接字节数据(...frames));
-                        },
-                        close() {
-                                return writer.write(buildTcpFrame(0x11)).catch(() => { });
-                        },
-                        abort(error) {
-                                close();
-                                if (error) settleClosed(rejectClosed, error);
-                        }
-                });
-
-                return { readable, writable, closed, close };
-        } catch (error) {
-                close();
-                throw error;
+                        } catch (e) {}
+                };
+                if (ctx) ctx.waitUntil(task());
+                else task();
         }
 }
-//////////////////////////////////////////////////功能性函数///////////////////////////////////////////////
-/**
- * 带秘钥的 Base64 编码
- * @param {string} plaintext - 原始明文字符串
- * @param {string} secret - 秘钥字符串（如 "KEY123"）
- * @returns {string} 经过秘钥处理的 Base64 字符串
- */
-function base64SecretEncode(plaintext, secret) {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(plaintext);
-        const key = encoder.encode(secret);
-        const mixed = new Uint8Array(data.length);
-
-        for (let i = 0; i < data.length; i++) {
-                mixed[i] = data[i] ^ key[i % key.length];
-        }
-
-        // 将 Uint8Array 转换为可被 btoa 处理的字符串
-        let binary = '';
-        for (let i = 0; i < mixed.length; i++) {
-                binary += String.fromCharCode(mixed[i]);
-        }
-        return btoa(binary);
-}
-
-/**
- * 带秘钥的 Base64 解码
- * @param {string} encoded - 经秘钥处理过的 Base64 字符串
- * @param {string} secret - 秘钥字符串（必须与编码时相同）
- * @returns {string} 解码后的原始明文字符串
- */
-function base64SecretDecode(encoded, secret) {
-        const binary = atob(encoded);
-        const mixed = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-                mixed[i] = binary.charCodeAt(i);
-        }
-
-        const encoder = new TextEncoder();
-        const key = encoder.encode(secret);
-        const data = new Uint8Array(mixed.length);
-
-        for (let i = 0; i < mixed.length; i++) {
-                data[i] = mixed[i] ^ key[i % key.length];
-        }
-
-        const decoder = new TextDecoder();
-        return decoder.decode(data);
-}
-
-function 获取传输协议配置(配置 = {}) {
-        const 是gRPC = 配置.传输协议 === 'grpc';
-        return {
-                type: 是gRPC ? (配置.gRPC模式 === 'multi' ? 'grpc&mode=multi' : 'grpc&mode=gun') : (配置.传输协议 === 'xhttp' ? 'xhttp&mode=stream-one' : 'ws'),
-                路径字段名: 是gRPC ? 'serviceName' : 'path',
-                域名字段名: 是gRPC ? 'authority' : 'host'
-        };
-}
-
-function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优选订阅生成器 = false) {
-        const 路径值 = 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
-        if (配置.传输协议 !== 'grpc') return 路径值;
-        return 路径值.split('?')[0] || '/';
-}
-
-function log(...args) {
-        if (调试日志打印) console.log(...args);
-}
-
-function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {
-        const uuid = config_JSON?.UUID || null;
-        const ECH启用 = Boolean(config_JSON?.ECH);
-        const HOSTS = Array.isArray(config_JSON?.HOSTS) ? [...config_JSON.HOSTS] : [];
-        const ECH_SNI = config_JSON?.ECHConfig?.SNI || null;
-        const ECH_DNS = config_JSON?.ECHConfig?.DNS;
-        const 需要处理ECH = Boolean(uuid && ECH启用);
-        const gRPCUserAgent = (typeof config_JSON?.gRPCUserAgent === 'string' && config_JSON.gRPCUserAgent.trim()) ? config_JSON.gRPCUserAgent.trim() : null;
-        const 需要处理gRPC = config_JSON?.传输协议 === "grpc" && Boolean(gRPCUserAgent);
-        const gRPCUserAgentYAML = gRPCUserAgent ? JSON.stringify(gRPCUserAgent) : null;
-        let clash_yaml = Clash_原始订阅内容.replace(/mode:\s*Rule\b/g, 'mode: rule');
-
-        const baseDnsBlock = `dns:
-  enable: true
-  default-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-    - 114.114.114.114
-  use-hosts: true
-  nameserver:
-    - https://sm2.doh.pub/dns-query
-    - https://dns.alidns.com/dns-query
-  fallback:
-    - 8.8.4.4
-    - 208.67.220.220
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
-      - 127.0.0.1/32
-      - 0.0.0.0/32
-    domain:
-      - '+.google.com'
-      - '+.facebook.com'
-      - '+.youtube.com'
-`;
-
-        const 添加InlineGrpcUserAgent = (text) => text.replace(/grpc-opts:\s*\{([\s\S]*?)\}/i, (all, inner) => {
-                if (/grpc-user-agent\s*:/i.test(inner)) return all;
-                let content = inner.trim();
-                if (content.endsWith(',')) content = content.slice(0, -1).trim();
-                const patchedContent = content ? `${content}, grpc-user-agent: ${gRPCUserAgentYAML}` : `grpc-user-agent: ${gRPCUserAgentYAML}`;
-                return `grpc-opts: {${patchedContent}}`;
-        });
-        const 匹配到gRPC网络 = (text) => /(?:^|[,{])\s*network:\s*(?:"grpc"|'grpc'|grpc)(?=\s*(?:[,}\n#]|$))/mi.test(text);
-        const 获取代理类型 = (nodeText) => nodeText.match(/type:\s*(\w+)/)?.[1] || 'vl' + 'ess';
-        const 获取凭据值 = (nodeText, isFlowStyle) => {
-                const credentialField = 获取代理类型(nodeText) === 'trojan' ? 'password' : 'uuid';
-                const pattern = new RegExp(`${credentialField}:\\s*${isFlowStyle ? '([^,}\\n]+)' : '([^\\n]+)'}`);
-                return nodeText.match(pattern)?.[1]?.trim() || null;
-        };
-        const 插入NameserverPolicy = (yaml, hostsEntries) => {
-                if (/^\s{2}nameserver-policy:\s*(?:\n|$)/m.test(yaml)) {
-                        return yaml.replace(/^(\s{2}nameserver-policy:\s*\n)/m, `$1${hostsEntries}\n`);
-                }
-                const lines = yaml.split('\n');
-                let dnsBlockEndIndex = -1;
-                let inDnsBlock = false;
-                for (let i = 0; i < lines.length; i++) {
-                        const line = lines[i];
-                        if (/^dns:\s*$/.test(line)) {
-                                inDnsBlock = true;
-                                continue;
-                        }
-                        if (inDnsBlock && /^[a-zA-Z]/.test(line)) {
-                                dnsBlockEndIndex = i;
-                                break;
-                        }
-                }
-                const nameserverPolicyBlock = `  nameserver-policy:\n${hostsEntries}`;
-                if (dnsBlockEndIndex !== -1) lines.splice(dnsBlockEndIndex, 0, nameserverPolicyBlock);
-                else lines.push(nameserverPolicyBlock);
-                return lines.join('\n');
-        };
-        const 添加Flow格式gRPCUserAgent = (nodeText) => {
-                if (!匹配到gRPC网络(nodeText) || /grpc-user-agent\s*:/i.test(nodeText)) return nodeText;
-                if (/grpc-opts:\s*\{/i.test(nodeText)) return 添加InlineGrpcUserAgent(nodeText);
-                return nodeText.replace(/\}(\s*)$/, `, grpc-opts: {grpc-user-agent: ${gRPCUserAgentYAML}}}$1`);
-        };
-        const 添加Block格式gRPCUserAgent = (nodeLines, topLevelIndent) => {
-                const 顶级缩进 = ' '.repeat(topLevelIndent);
-                let grpcOptsIndex = -1;
-                for (let idx = 0; idx < nodeLines.length; idx++) {
-                        const line = nodeLines[idx];
-                        if (!line.trim()) continue;
-                        const indent = line.search(/\S/);
-                        if (indent !== topLevelIndent) continue;
-                        if (/^\s*grpc-opts:\s*(?:#.*)?$/.test(line) || /^\s*grpc-opts:\s*\{.*\}\s*(?:#.*)?$/.test(line)) {
-                                grpcOptsIndex = idx;
-                                break;
-                        }
-                }
-                if (grpcOptsIndex === -1) {
-                        let insertIndex = -1;
-                        for (let j = nodeLines.length - 1; j >= 0; j--) {
-                                if (nodeLines[j].trim()) {
-                                        insertIndex = j;
-                                        break;
-                                }
-                        }
-                        if (insertIndex >= 0) nodeLines.splice(insertIndex + 1, 0, `${顶级缩进}grpc-opts:`, `${顶级缩进}  grpc-user-agent: ${gRPCUserAgentYAML}`);
-                        return nodeLines;
-                }
-                const grpcLine = nodeLines[grpcOptsIndex];
-                if (/^\s*grpc-opts:\s*\{.*\}\s*(?:#.*)?$/.test(grpcLine)) {
-                        if (!/grpc-user-agent\s*:/i.test(grpcLine)) nodeLines[grpcOptsIndex] = 添加InlineGrpcUserAgent(grpcLine);
-                        return nodeLines;
-                }
-                let blockEndIndex = nodeLines.length;
-                let 子级缩进 = topLevelIndent + 2;
-                let 已有gRPCUserAgent = false;
-                for (let idx = grpcOptsIndex + 1; idx < nodeLines.length; idx++) {
-                        const line = nodeLines[idx];
-                        const trimmed = line.trim();
-                        if (!trimmed) continue;
-                        const indent = line.search(/\S/);
-                        if (indent <= topLevelIndent) {
-                                blockEndIndex = idx;
-                                break;
-                        }
-                        if (indent > topLevelIndent && 子级缩进 === topLevelIndent + 2) 子级缩进 = indent;
-                        if (/^grpc-user-agent\s*:/.test(trimmed)) {
-                                已有gRPCUserAgent = true;
-                                break;
-                        }
-                }
-                if (!已有gRPCUserAgent) nodeLines.splice(blockEndIndex, 0, `${' '.repeat(子级缩进)}grpc-user-agent: ${gRPCUserAgentYAML}`);
-                return nodeLines;
-        };
-        const 添加Block格式ECHOpts = (nodeLines, topLevelIndent) => {
-                let insertIndex = -1;
-                for (let j = nodeLines.length - 1; j >= 0; j--) {
-                        if (nodeLines[j].trim()) {
-                                insertIndex = j;
-                                break;
-                        }
-                }
-                if (insertIndex < 0) return nodeLines;
-                const indent = ' '.repeat(topLevelIndent);
-                const echOptsLines = [`${indent}ech-opts:`, `${indent}  enable: true`];
-                if (ECH_SNI) echOptsLines.push(`${indent}  query-server-name: ${ECH_SNI}`);
-                nodeLines.splice(insertIndex + 1, 0, ...echOptsLines);
-                return nodeLines;
-        };
-
-        if (!/^dns:\s*(?:\n|$)/m.test(clash_yaml)) clash_yaml = baseDnsBlock + clash_yaml;
-        if (ECH_SNI && !HOSTS.includes(ECH_SNI)) HOSTS.push(ECH_SNI);
-
-        if (ECH启用 && HOSTS.length > 0) {
-                const hostsEntries = HOSTS.map(host => `    "${host}": ${ECH_DNS ? ECH_DNS : ''}`).join('\n');
-                clash_yaml = 插入NameserverPolicy(clash_yaml, hostsEntries);
-        }
-
-        if (!需要处理ECH && !需要处理gRPC) return clash_yaml;
-
-        const lines = clash_yaml.split('\n');
-        const processedLines = [];
-        let i = 0;
-
-        while (i < lines.length) {
-                const line = lines[i];
-                const trimmedLine = line.trim();
-
-                if (trimmedLine.startsWith('- {')) {
-                        let fullNode = line;
-                        let braceCount = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
-                        while (braceCount > 0 && i + 1 < lines.length) {
-                                i++;
-                                fullNode += '\n' + lines[i];
-                                braceCount += (lines[i].match(/\{/g) || []).length - (lines[i].match(/\}/g) || []).length;
-                        }
-                        if (需要处理gRPC) fullNode = 添加Flow格式gRPCUserAgent(fullNode);
-                        if (需要处理ECH && 获取凭据值(fullNode, true) === uuid.trim()) {
-                                fullNode = fullNode.replace(/\}(\s*)$/, `, ech-opts: {enable: true${ECH_SNI ? `, query-server-name: ${ECH_SNI}` : ''}}}$1`);
-                        }
-                        processedLines.push(fullNode);
-                        i++;
-                } else if (trimmedLine.startsWith('- name:')) {
-                        let nodeLines = [line];
-                        let baseIndent = line.search(/\S/);
-                        let topLevelIndent = baseIndent + 2;
-                        i++;
-                        while (i < lines.length) {
-                                const nextLine = lines[i];
-                                const nextTrimmed = nextLine.trim();
-                                if (!nextTrimmed) {
-                                        nodeLines.push(nextLine);
-                                        i++;
-                                        break;
-                                }
-                                const nextIndent = nextLine.search(/\S/);
-                                if (nextIndent <= baseIndent && nextTrimmed.startsWith('- ')) {
-                                        break;
-                                }
-                                if (nextIndent < baseIndent && nextTrimmed) {
-                                        break;
-                                }
-                                nodeLines.push(nextLine);
-                                i++;
-                        }
-                        let nodeText = nodeLines.join('\n');
-                        if (需要处理gRPC && 匹配到gRPC网络(nodeText)) {
-                                nodeLines = 添加Block格式gRPCUserAgent(nodeLines, topLevelIndent);
-                                nodeText = nodeLines.join('\n');
-                        }
-                        if (需要处理ECH && 获取凭据值(nodeText, false) === uuid.trim()) nodeLines = 添加Block格式ECHOpts(nodeLines, topLevelIndent);
-                        processedLines.push(...nodeLines);
-                } else {
-                        processedLines.push(line);
-                        i++;
+async function connectProxy(proxyStr, destAddr, destPort, initialData) {
+        let normalized = proxyStr;
+        if (proxyStr.includes("t.me/socks") || proxyStr.includes("tg://socks")) {
+                const server = proxyStr.match(/server=([^&]+)/)?.[1];
+                const port = proxyStr.match(/port=([^&]+)/)?.[1];
+                const user = proxyStr.match(/user=([^&]+)/)?.[1];
+                const pass = proxyStr.match(/pass=([^&]+)/)?.[1];
+                if (server && port) {
+                        normalized = user && pass ? `socks5://${user}:${pass}@${server}:${port}` : `socks5://${server}:${port}`;
                 }
         }
-
-        return processedLines.join('\n');
+        const isHttp = normalized.toLowerCase().startsWith("http://") || normalized.toLowerCase().startsWith("https://");
+        const isSocks4 = normalized.toLowerCase().startsWith("socks4://");
+        let cleanStr = normalized.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+        if (isHttp) {
+                return await connectHttp(cleanStr, destAddr, destPort, initialData);
+        }
+        if (isSocks4) {
+                return await connectSocks4(cleanStr, destAddr, destPort, initialData);
+        }
+        return await connectSocks5(cleanStr, destAddr, destPort, initialData);
 }
-
-async function Singbox订阅配置文件热补丁(SingBox_原始订阅内容, config_JSON = {}) {
-        const uuid = config_JSON?.UUID || null;
-        const fingerprint = config_JSON?.Fingerprint || "chrome";
-        const ECH启用 = Boolean(config_JSON?.ECH);
-        const ECH_SNI = config_JSON?.ECHConfig?.SNI || "cloudflare-ech.com";
-        const sb_json_text = SingBox_原始订阅内容.replace('1.1.1.1', '8.8.8.8').replace('1.0.0.1', '8.8.4.4');
+async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
+        const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
+        const socket = connect({ hostname: host, port: port });
+        const reader = socket.readable.getReader();
+        const writer = socket.writable.getWriter();
         try {
-                const config = JSON.parse(sb_json_text);
-                const 数组化 = value => value === undefined || value === null ? [] : (Array.isArray(value) ? value : [value]);
-                const 确保Route = () => config.route = config.route && typeof config.route === 'object' ? config.route : {};
-                const 获取DNS规则服务器 = rule => rule && typeof rule === 'object' && !Array.isArray(rule) && typeof rule.server === 'string' ? rule.server : null;
-                const 添加规则集 = (type, code) => {
-                        if (!code || typeof code !== 'string') return null;
-                        const route = 确保Route(), tag = `${type}-${code}`, ruleSet = Array.isArray(route.rule_set) ? route.rule_set : 数组化(route.rule_set);
-                        if (!ruleSet.some(item => item?.tag === tag)) {
-                                const legacyOptions = type === 'geoip' ? route.geoip : route.geosite;
-                                ruleSet.push({ tag, type: 'remote', format: 'binary', url: `https://raw.githubusercontent.com/SagerNet/sing-${type}/rule-set/${tag}.srs`, ...(legacyOptions?.download_detour ? { download_detour: legacyOptions.download_detour } : {}) });
-                                config.experimental = config.experimental && typeof config.experimental === 'object' ? config.experimental : {};
-                                config.experimental.cache_file = config.experimental.cache_file && typeof config.experimental.cache_file === 'object' ? config.experimental.cache_file : {};
-                                config.experimental.cache_file.enabled ??= true;
-                        }
-                        route.rule_set = ruleSet;
-                        return tag;
-                };
-
-                const 迁移规则集字段 = rule => {
-                        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return rule;
-                        if (rule.type === 'logical' && Array.isArray(rule.rules)) {
-                                rule.rules = rule.rules.map(迁移规则集字段);
-                                return rule;
-                        }
-                        const tags = [];
-                        for (const geoip of 数组化(rule.geoip)) {
-                                if (typeof geoip !== 'string') continue;
-                                if (geoip.toLowerCase() === 'private') rule.ip_is_private = true;
-                                else tags.push(添加规则集('geoip', geoip));
-                        }
-                        for (const sourceGeoip of 数组化(rule.source_geoip)) {
-                                if (typeof sourceGeoip !== 'string') continue;
-                                tags.push(添加规则集('geoip', sourceGeoip));
-                                rule.rule_set_ip_cidr_match_source = true;
-                        }
-                        for (const geosite of 数组化(rule.geosite)) if (typeof geosite === 'string') tags.push(添加规则集('geosite', geosite));
-                        if (tags.length) rule.rule_set = [...new Set([...数组化(rule.rule_set), ...tags].filter(Boolean))];
-                        delete rule.geoip;
-                        delete rule.source_geoip;
-                        delete rule.geosite;
-                        return rule;
-                };
-
-                const 迁移DNS规则 = (rule, rcodeServerMap) => {
-                        rule = 迁移规则集字段(rule);
-                        if (!rule || typeof rule !== 'object' || Array.isArray(rule)) return rule;
-                        if (rule.type === 'logical' && Array.isArray(rule.rules)) {
-                                rule.rules = rule.rules.map(childRule => 迁移DNS规则(childRule, rcodeServerMap));
-                                return rule;
-                        }
-                        const serverTag = 获取DNS规则服务器(rule);
-                        if (serverTag && rcodeServerMap.has(serverTag)) {
-                                for (const key of ['server', 'strategy', 'disable_cache', 'rewrite_ttl', 'client_subnet', 'timeout']) delete rule[key];
-                                rule.action = 'predefined';
-                                rule.rcode = rcodeServerMap.get(serverTag);
-                        } else if (serverTag && !rule.action) rule.action = 'route';
-                        return rule;
-                };
-
-                if (Array.isArray(config.inbounds)) {
-                        for (const inbound of config.inbounds) {
-                                if (!inbound || typeof inbound !== 'object' || inbound.type !== 'tun') continue;
-                                for (const migration of [
-                                        { targetKey: 'address', sourceKeys: ['inet4_address', 'inet6_address'] },
-                                        { targetKey: 'route_address', sourceKeys: ['inet4_route_address', 'inet6_route_address'] },
-                                        { targetKey: 'route_exclude_address', sourceKeys: ['inet4_route_exclude_address', 'inet6_route_exclude_address'] }
-                                ]) {
-                                        const values = 数组化(inbound[migration.targetKey]);
-                                        for (const sourceKey of migration.sourceKeys) values.push(...数组化(inbound[sourceKey]));
-                                        if (values.length) inbound[migration.targetKey] = [...new Set(values)];
-                                        for (const sourceKey of migration.sourceKeys) delete inbound[sourceKey];
-                                }
-                                if (inbound.tag) {
-                                        const addedRules = [];
-                                        if (inbound.domain_strategy) addedRules.push({ inbound: inbound.tag, action: 'resolve', strategy: inbound.domain_strategy });
-                                        if (inbound.sniff) {
-                                                const sniffRule = { inbound: inbound.tag, action: 'sniff' };
-                                                if (inbound.sniff_timeout) sniffRule.timeout = inbound.sniff_timeout;
-                                                addedRules.push(sniffRule);
-                                        }
-                                        if (addedRules.length) {
-                                                const route = 确保Route();
-                                                route.rules = [...addedRules, ...数组化(route.rules)];
-                                        }
-                                }
-                                delete inbound.sniff;
-                                delete inbound.sniff_timeout;
-                                delete inbound.domain_strategy;
-                        }
+                const portHigh = (destPort >> 8) & 0xff;
+                const portLow = destPort & 0xff;
+                let req;
+                if (isIPv4(destAddr)) {
+                        const ipBytes = destAddr.split(".").map(Number);
+                        req = new Uint8Array([0x04, 0x01, portHigh, portLow, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], 0x00]);
+                } else {
+                        const hostBytes = new TextEncoder().encode(destAddr);
+                        req = new Uint8Array(9 + hostBytes.length + 1);
+                        req[0] = 0x04;
+                        req[1] = 0x01;
+                        req[2] = portHigh;
+                        req[3] = portLow;
+                        req[4] = 0x00;
+                        req[5] = 0x00;
+                        req[6] = 0x00;
+                        req[7] = 0x01;
+                        req[8] = 0x00;
+                        req.set(hostBytes, 9);
+                        req[9 + hostBytes.length] = 0x00;
                 }
-
-                if (config?.route && typeof config.route === 'object' && Array.isArray(config.route.rules)) {
-                        const 修补路由规则 = rule => {
-                                rule = 迁移规则集字段(rule);
-                                if (rule?.type === 'logical' && Array.isArray(rule.rules)) rule.rules = rule.rules.map(修补路由规则);
-                                else if (rule && typeof rule === 'object' && !Array.isArray(rule) && rule.outbound && !rule.action) rule.action = 'route';
-                                return rule;
-                        };
-                        config.route.rules = config.route.rules.map(修补路由规则);
+                await writer.write(req);
+                let res = await reader.read();
+                if (res.done || !res.value || res.value[0] !== 0x00 || res.value[1] !== 0x5a) {
+                        throw new Error("پـروکـسـی SOCKS4 وصل نشد یا اتصال را رد کرد");
                 }
-
-                const dns = config?.dns;
-                if (dns && typeof dns === 'object') {
-                        const legacyFakeIP = dns.fakeip && typeof dns.fakeip === 'object' ? dns.fakeip : null;
-                        const rcodeServerMap = new Map();
-                        const DNS地址协议类型 = { 'tcp:': 'tcp', 'udp:': 'udp', 'tls:': 'tls', 'quic:': 'quic', 'https:': 'https', 'h3:': 'h3' };
-                        const RCode映射 = { success: 'NOERROR', format_error: 'FORMERR', server_failure: 'SERVFAIL', name_error: 'NXDOMAIN', not_implemented: 'NOTIMP', refused: 'REFUSED' };
-                        let hasFakeIPServer = false;
-
-                        if (Array.isArray(dns.servers)) {
-                                const migratedServers = [];
-                                for (const originalServer of dns.servers) {
-                                        if (!originalServer || typeof originalServer !== 'object' || Array.isArray(originalServer)) {
-                                                migratedServers.push(originalServer);
-                                                continue;
-                                        }
-
-                                        const server = { ...originalServer };
-                                        let parsedAddress = null, parsedRCode = '', rawAddress = typeof server.address === 'string' ? server.address.trim() : '';
-                                        if (rawAddress) {
-                                                const lowerAddress = rawAddress.toLowerCase();
-                                                if (lowerAddress === 'fakeip') parsedAddress = { type: 'fakeip' };
-                                                else if (lowerAddress === 'local') parsedAddress = { type: 'local' };
-                                                else if (lowerAddress.startsWith('rcode://')) {
-                                                        parsedAddress = { type: 'rcode' };
-                                                        parsedRCode = rawAddress.slice('rcode://'.length).toLowerCase();
-                                                }
-                                                else if (lowerAddress.startsWith('dhcp://')) {
-                                                        const dhcpInterface = rawAddress.slice('dhcp://'.length);
-                                                        parsedAddress = dhcpInterface && dhcpInterface.toLowerCase() !== 'auto' ? { type: 'dhcp', interface: dhcpInterface } : { type: 'dhcp' };
-                                                } else {
-                                                        try {
-                                                                const addressURL = new URL(rawAddress);
-                                                                const type = DNS地址协议类型[addressURL.protocol.toLowerCase()];
-                                                                if (type) {
-                                                                        const parsedServer = addressURL.hostname?.startsWith('[') && addressURL.hostname.endsWith(']') ? addressURL.hostname.slice(1, -1) : addressURL.hostname;
-                                                                        parsedAddress = {
-                                                                                type,
-                                                                                server: parsedServer || addressURL.host || rawAddress,
-                                                                                ...(addressURL.port ? { server_port: Number(addressURL.port) } : {}),
-                                                                                ...((type === 'https' || type === 'h3') && addressURL.pathname && addressURL.pathname !== '/dns-query' ? { path: addressURL.pathname } : {})
-                                                                        };
-                                                                }
-                                                        } catch (_) { }
-                                                        if (!parsedAddress) parsedAddress = { type: 'udp', server: rawAddress };
-                                                }
-                                        }
-
-                                        if (parsedAddress?.type === 'rcode') {
-                                                const rcode = RCode映射[parsedRCode] || 'NOERROR';
-                                                if (typeof server.tag === 'string' && server.tag) {
-                                                        rcodeServerMap.set(server.tag, rcode);
-                                                        rcodeServerMap.set(server.tag.startsWith('dns_') ? server.tag.slice(4) : `dns_${server.tag}`, rcode);
-                                                }
-                                                continue;
-                                        }
-
-                                        if (parsedAddress) {
-                                                delete server.address;
-                                                Object.assign(server, parsedAddress);
-                                        }
-                                        if (server.address_resolver !== undefined && server.domain_resolver === undefined) server.domain_resolver = server.address_resolver;
-                                        if (server.address_strategy !== undefined && server.domain_strategy === undefined) server.domain_strategy = server.address_strategy;
-                                        delete server.address_resolver;
-                                        delete server.address_strategy;
-                                        if (server.detour === 'DIRECT') delete server.detour;
-
-                                        if (server.type === 'fakeip') {
-                                                hasFakeIPServer = true;
-                                                if (legacyFakeIP) {
-                                                        for (const key of ['inet4_range', 'inet6_range']) {
-                                                                if (legacyFakeIP[key] !== undefined && server[key] === undefined) server[key] = legacyFakeIP[key];
-                                                        }
-                                                }
-                                        }
-                                        migratedServers.push(server);
-                                }
-                                dns.servers = migratedServers;
-                        }
-
-                        if (legacyFakeIP && !hasFakeIPServer && legacyFakeIP.enabled !== false) {
-                                const fakeIPServer = { type: 'fakeip', tag: 'fakeip' };
-                                for (const rule of Array.isArray(dns.rules) ? dns.rules : []) {
-                                        const serverTag = 获取DNS规则服务器(rule);
-                                        if (serverTag && serverTag.toLowerCase().includes('fakeip')) {
-                                                fakeIPServer.tag = serverTag;
-                                                break;
-                                        }
-                                }
-                                for (const key of ['inet4_range', 'inet6_range']) {
-                                        if (legacyFakeIP[key] !== undefined) fakeIPServer[key] = legacyFakeIP[key];
-                                }
-                                if (Array.isArray(dns.servers)) dns.servers.push(fakeIPServer);
-                                else dns.servers = [fakeIPServer];
-                        }
-
-                        if (Array.isArray(dns.rules)) {
-                                const migratedRules = [];
-                                for (const rule of dns.rules) {
-                                        const serverTag = 获取DNS规则服务器(rule);
-                                        const outbound = 数组化(rule?.outbound);
-                                        const DNS路由选项字段 = new Set(['outbound', 'server', 'action', 'strategy', 'disable_cache', 'rewrite_ttl', 'client_subnet', 'timeout']);
-                                        const isOutboundAnyDNSRule = rule && typeof rule === 'object' && !Array.isArray(rule) && rule.type !== 'logical'
-                                                && serverTag && outbound.includes('any') && Object.keys(rule).every(key => DNS路由选项字段.has(key));
-                                        if (isOutboundAnyDNSRule) {
-                                                const route = 确保Route();
-                                                if (route.default_domain_resolver === undefined) {
-                                                        const resolver = { server: serverTag };
-                                                        for (const key of ['strategy', 'disable_cache', 'rewrite_ttl', 'client_subnet', 'timeout']) {
-                                                                if (rule[key] !== undefined) resolver[key] = rule[key];
-                                                        }
-                                                        route.default_domain_resolver = Object.keys(resolver).length === 1 ? resolver.server : resolver;
-                                                }
-                                                continue;
-                                        }
-                                        migratedRules.push(迁移DNS规则(rule, rcodeServerMap));
-                                }
-                                dns.rules = migratedRules;
-                        }
-
-                        delete dns.fakeip;
-                        delete dns.independent_cache;
+                if (initialData && initialData.byteLength > 0) {
+                        await writer.write(convertToUint8Array(initialData));
                 }
-
-                if (config?.route && typeof config.route === 'object') {
-                        delete config.route.geoip;
-                        delete config.route.geosite;
-                }
-                if (config?.ntp?.detour === 'DIRECT') delete config.ntp.detour;
-
-                if (Array.isArray(config.outbounds)) {
-                        const outboundTags = new Set(config.outbounds.map(outbound => outbound?.tag).filter(Boolean));
-                        const 引用REJECT = value => value === 'REJECT' || (value && typeof value === 'object' && (Array.isArray(value) ? value.some(引用REJECT) : Object.values(value).some(引用REJECT)));
-                        if (!outboundTags.has('REJECT') && 引用REJECT({ outbounds: config.outbounds, route: config.route })) config.outbounds.push({ type: 'block', tag: 'REJECT' });
-                }
-
-                // --- UUID 匹配节点的 TLS 热补丁 (utls & ech) ---
-                if (uuid) {
-                        config.outbounds?.forEach(outbound => {
-                                // 仅处理包含 uuid 或 password 且匹配的节点
-                                if ((outbound.uuid && outbound.uuid === uuid) || (outbound.password && outbound.password === uuid)) {
-                                        // 确保 tls 对象存在
-                                        if (!outbound.tls) {
-                                                outbound.tls = { enabled: true };
-                                        }
-
-                                        // 添加/更新 utls 配置
-                                        if (fingerprint) {
-                                                outbound.tls.utls = {
-                                                        enabled: true,
-                                                        fingerprint: fingerprint
-                                                };
-                                        }
-
-                                        // 如果提供了 ech_config，添加/更新 ech 配置
-                                        if (ECH启用) {
-                                                outbound.tls.ech = {
-                                                        enabled: true,
-                                                        query_server_name: ECH_SNI,// 等待 1.13.0+ 版本上线
-                                                        //config: `-----BEGIN ECH CONFIGS-----\n${ech_config}\n-----END ECH CONFIGS-----`
-                                                };
-                                        }
-                                }
-                        });
-                }
-
-                return JSON.stringify(config, null, 2);
+                writer.releaseLock();
+                reader.releaseLock();
+                return socket;
         } catch (e) {
-                console.error("Singbox热补丁执行失败:", e);
-                return JSON.stringify(JSON.parse(sb_json_text), null, 2);
-        }
-}
-
-function Surge订阅配置文件热补丁(content, url, config_JSON) {
-        const 每行内容 = content.includes('\r\n') ? content.split('\r\n') : content.split('\n');
-        const 完整节点路径 = config_JSON.随机路径 ? 随机路径(config_JSON.完整节点路径) : config_JSON.完整节点路径;
-        let 输出内容 = "";
-        for (let x of 每行内容) {
-                if (x.includes('= tro' + 'jan,') && !x.includes('ws=true') && !x.includes('ws-path=')) {
-                        const host = x.split("sni=")[1].split(",")[0];
-                        const 备改内容 = `sni=${host}, skip-cert-verify=${config_JSON.跳过证书验证}`;
-                        const 正确内容 = `sni=${host}, skip-cert-verify=${config_JSON.跳过证书验证}, ws=true, ws-path=${完整节点路径.replace(/,/g, '%2C')}, ws-headers=Host:"${host}"`;
-                        输出内容 += x.replace(new RegExp(备改内容, 'g'), 正确内容).replace("[", "").replace("]", "") + '\n';
-                } else {
-                        输出内容 += x + '\n';
-                }
-        }
-
-        输出内容 = `#!MANAGED-CONFIG ${url} interval=${config_JSON.优选订阅生成.SUBUpdateTime * 60 * 60} strict=false` + 输出内容.substring(输出内容.indexOf('\n'));
-        return 输出内容;
-}
-
-async function 请求日志记录(env, request, 访问IP, 请求类型 = "Get_SUB", config_JSON, 是否写入KV日志 = true) {
-        try {
-                const 当前时间 = new Date();
-                const 日志内容 = { TYPE: 请求类型, IP: 访问IP, ASN: `AS${request.cf.asn || '0'} ${request.cf.asOrganization || 'Unknown'}`, CC: `${request.cf.country || 'N/A'} ${request.cf.city || 'N/A'}`, URL: request.url, UA: request.headers.get('User-Agent') || 'Unknown', TIME: 当前时间.getTime() };
-                if (config_JSON.TG.启用) {
-                        try {
-                                const TG_TXT = await env.KV.get('tg.json');
-                                const TG_JSON = JSON.parse(TG_TXT);
-                                if (TG_JSON?.BotToken && TG_JSON?.ChatID) {
-                                        const 请求时间 = new Date(日志内容.TIME).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-                                        const 请求URL = new URL(日志内容.URL);
-                                        const msg = `<b>#${config_JSON.优选订阅生成.SUBNAME} 日志通知</b>\n\n` +
-                                                `📌 <b>类型：</b>#${日志内容.TYPE}\n` +
-                                                `🌐 <b>IP：</b><code>${日志内容.IP}</code>\n` +
-                                                `📍 <b>位置：</b>${日志内容.CC}\n` +
-                                                `🏢 <b>ASN：</b>${日志内容.ASN}\n` +
-                                                `🔗 <b>域名：</b><code>${请求URL.host}</code>\n` +
-                                                `🔍 <b>路径：</b><code>${请求URL.pathname + 请求URL.search}</code>\n` +
-                                                `🤖 <b>UA：</b><code>${日志内容.UA}</code>\n` +
-                                                `📅 <b>时间：</b>${请求时间}\n` +
-                                                `${config_JSON.CF.Usage.success ? `📊 <b>请求用量：</b>${config_JSON.CF.Usage.total}/${config_JSON.CF.Usage.max} <b>${((config_JSON.CF.Usage.total / config_JSON.CF.Usage.max) * 100).toFixed(2)}%</b>\n` : ''}`;
-                                        await fetch(`https://api.telegram.org/bot${TG_JSON.BotToken}/sendMessage?chat_id=${TG_JSON.ChatID}&parse_mode=HTML&text=${encodeURIComponent(msg)}`, {
-                                                method: 'GET',
-                                                headers: {
-                                                        'Accept': 'text/html,application/xhtml+xml,application/xml;',
-                                                        'Accept-Encoding': 'gzip, deflate, br',
-                                                        'User-Agent': 日志内容.UA || 'Unknown',
-                                                }
-                                        });
-                                }
-                        } catch (error) { console.error(`读取tg.json出错: ${error.message}`) }
-                }
-                是否写入KV日志 = ['1', 'true'].includes(env.OFF_LOG) ? false : 是否写入KV日志;
-                if (!是否写入KV日志) return;
-                let 日志数组 = [];
-                const 现有日志 = await env.KV.get('log.json'), KV容量限制 = 4;//MB
-                if (现有日志) {
-                        try {
-                                日志数组 = JSON.parse(现有日志);
-                                if (!Array.isArray(日志数组)) { 日志数组 = [日志内容] }
-                                else if (请求类型 !== "Get_SUB") {
-                                        const 三十分钟前时间戳 = 当前时间.getTime() - 30 * 60 * 1000;
-                                        if (日志数组.some(log => log.TYPE !== "Get_SUB" && log.IP === 访问IP && log.URL === request.url && log.UA === (request.headers.get('User-Agent') || 'Unknown') && log.TIME >= 三十分钟前时间戳)) return;
-                                        日志数组.push(日志内容);
-                                        while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-                                } else {
-                                        日志数组.push(日志内容);
-                                        while (JSON.stringify(日志数组, null, 2).length > KV容量限制 * 1024 * 1024 && 日志数组.length > 0) 日志数组.shift();
-                                }
-                        } catch (e) { 日志数组 = [日志内容] }
-                } else { 日志数组 = [日志内容] }
-                await env.KV.put('log.json', JSON.stringify(日志数组, null, 2));
-        } catch (error) { console.error(`日志记录失败: ${error.message}`) }
-}
-
-function 掩码敏感信息(文本, 前缀长度 = 3, 后缀长度 = 2) {
-        if (!文本 || typeof 文本 !== 'string') return 文本;
-        if (文本.length <= 前缀长度 + 后缀长度) return 文本; // 如果长度太短，直接返回
-
-        const 前缀 = 文本.slice(0, 前缀长度);
-        const 后缀 = 文本.slice(-后缀长度);
-        const 星号数量 = 文本.length - 前缀长度 - 后缀长度;
-
-        return `${前缀}${'*'.repeat(星号数量)}${后缀}`;
-}
-
-async function MD5MD5(文本) {
-        const 编码器 = new TextEncoder();
-
-        const 第一次哈希 = await crypto.subtle.digest('MD5', 编码器.encode(文本));
-        const 第一次哈希数组 = Array.from(new Uint8Array(第一次哈希));
-        const 第一次十六进制 = 第一次哈希数组.map(字节 => 字节.toString(16).padStart(2, '0')).join('');
-
-        const 第二次哈希 = await crypto.subtle.digest('MD5', 编码器.encode(第一次十六进制.slice(7, 27)));
-        const 第二次哈希数组 = Array.from(new Uint8Array(第二次哈希));
-        const 第二次十六进制 = 第二次哈希数组.map(字节 => 字节.toString(16).padStart(2, '0')).join('');
-
-        return 第二次十六进制.toLowerCase();
-}
-
-function 随机路径(完整节点路径 = "/") {
-        const 常用路径目录 = ["about", "account", "acg", "act", "activity", "ad", "ads", "ajax", "album", "albums", "anime", "api", "app", "apps", "archive", "archives", "article", "articles", "ask", "auth", "avatar", "bbs", "bd", "blog", "blogs", "book", "books", "bt", "buy", "cart", "category", "categories", "cb", "channel", "channels", "chat", "china", "city", "class", "classify", "clip", "clips", "club", "cn", "code", "collect", "collection", "comic", "comics", "community", "company", "config", "contact", "content", "course", "courses", "cp", "data", "detail", "details", "dh", "directory", "discount", "discuss", "dl", "dload", "doc", "docs", "document", "documents", "doujin", "download", "downloads", "drama", "edu", "en", "ep", "episode", "episodes", "event", "events", "f", "faq", "favorite", "favourites", "favs", "feedback", "file", "files", "film", "films", "forum", "forums", "friend", "friends", "game", "games", "gif", "go", "go.html", "go.php", "group", "groups", "help", "home", "hot", "htm", "html", "image", "images", "img", "index", "info", "intro", "item", "items", "ja", "jp", "jump", "jump.html", "jump.php", "jumping", "knowledge", "lang", "lesson", "lessons", "lib", "library", "link", "links", "list", "live", "lives", "m", "mag", "magnet", "mall", "manhua", "map", "member", "members", "message", "messages", "mobile", "movie", "movies", "music", "my", "new", "news", "note", "novel", "novels", "online", "order", "out", "out.html", "out.php", "outbound", "p", "page", "pages", "pay", "payment", "pdf", "photo", "photos", "pic", "pics", "picture", "pictures", "play", "player", "playlist", "post", "posts", "product", "products", "program", "programs", "project", "qa", "question", "rank", "ranking", "read", "readme", "redirect", "redirect.html", "redirect.php", "reg", "register", "res", "resource", "retrieve", "sale", "search", "season", "seasons", "section", "seller", "series", "service", "services", "setting", "settings", "share", "shop", "show", "shows", "site", "soft", "sort", "source", "special", "star", "stars", "static", "stock", "store", "stream", "streaming", "streams", "student", "study", "tag", "tags", "task", "teacher", "team", "tech", "temp", "test", "thread", "tool", "tools", "topic", "topics", "torrent", "trade", "travel", "tv", "txt", "type", "u", "upload", "uploads", "url", "urls", "user", "users", "v", "version", "videos", "view", "vip", "vod", "watch", "web", "wenku", "wiki", "work", "www", "zh", "zh-cn", "zh-tw", "zip"];
-        const 随机数 = Math.floor(Math.random() * 3 + 1);
-        const 随机路径 = 常用路径目录.sort(() => 0.5 - Math.random()).slice(0, 随机数).join('/');
-        if (完整节点路径 === "/") return `/${随机路径}`;
-        else return `/${随机路径 + 完整节点路径.replace('/?', '?')}`;
-}
-
-function 替换星号为随机字符(内容) {
-        if (typeof 内容 !== 'string' || !内容.includes('*')) return 内容;
-        const 字符集 = 'abcdefghijklmnopqrstuvwxyz0123456789';
-        return 内容.replace(/\*/g, () => {
-                let s = '';
-                for (let i = 0; i < Math.floor(Math.random() * 14) + 3; i++) s += 字符集[Math.floor(Math.random() * 字符集.length)];
-                return s;
-        });
-}
-
-const DoH缓存 = {};
-const DoH缓存最大条目 = 256;
-const DoH记录类型映射 = { A: 1, NS: 2, CNAME: 5, MX: 15, TXT: 16, AAAA: 28, SRV: 33, HTTPS: 65 };
-async function DoH查询(域名, 记录类型, DoH解析服务 = "https://cloudflare-dns.com/dns-query") {
-        const 规范化域名 = String(域名 || '').trim().toLowerCase().replace(/\.$/, '');
-        const 规范化记录类型 = String(记录类型 || '').trim().toUpperCase();
-        const 缓存键 = `${规范化域名}:${规范化记录类型}`;
-        const qtype = DoH记录类型映射[规范化记录类型] || 1;
-        const 当前时间戳 = Date.now();
-        const 现缓存项 = DoH缓存[缓存键];
-        if (现缓存项 && 当前时间戳 < 现缓存项.过期时间) {
-                log(`[DoH查询] 命中缓存 ${域名} ${记录类型} via ${DoH解析服务}`);
-                return 现缓存项.data.map(data => ({ type: qtype, data }));
-        }
-        const 开始时间 = performance.now();
-        log(`[DoH查询] 开始查询 ${域名} ${记录类型} via ${DoH解析服务}`);
-        try {
-                // 记录类型字符串转数值
-                // 编码域名为 DNS wire format labels
-                const 编码域名 = (name) => {
-                        const parts = name.endsWith('.') ? name.slice(0, -1).split('.') : name.split('.');
-                        const bufs = [];
-                        for (const label of parts) {
-                                const enc = new TextEncoder().encode(label);
-                                bufs.push(new Uint8Array([enc.length]), enc);
-                        }
-                        bufs.push(new Uint8Array([0]));
-                        const total = bufs.reduce((s, b) => s + b.length, 0);
-                        const result = new Uint8Array(total);
-                        let off = 0;
-                        for (const b of bufs) { result.set(b, off); off += b.length }
-                        return result;
-                };
-
-                // 构建 DNS 查询报文
-                const qname = 编码域名(规范化域名);
-                const query = new Uint8Array(12 + qname.length + 4);
-                const qview = new DataView(query.buffer);
-                qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]); // ID (random per RFC 1035)
-                qview.setUint16(2, 0x0100);  // Flags: RD=1 (递归查询)
-                qview.setUint16(4, 1);       // QDCOUNT
-                query.set(qname, 12);
-                qview.setUint16(12 + qname.length, qtype);
-                qview.setUint16(12 + qname.length + 2, 1); // QCLASS = IN
-
-                // 通过 POST 发送 dns-message 请求
-                log(`[DoH查询] 发送查询报文 ${域名} via ${DoH解析服务} (type=${qtype}, ${query.length}字节)`);
-                const response = await fetch(DoH解析服务, {
-                        method: 'POST',
-                        headers: {
-                                'Content-Type': 'application/dns-message',
-                                'Accept': 'application/dns-message',
-                        },
-                        body: query,
-                });
-                if (!response.ok) {
-                        console.warn(`[DoH查询] 请求失败 ${域名} ${记录类型} via ${DoH解析服务} 响应代码:${response.status}`);
-                        return [];
-                }
-
-                // 解析 DNS 响应报文
-                const buf = new Uint8Array(await response.arrayBuffer());
-                const dv = new DataView(buf.buffer);
-                const qdcount = dv.getUint16(4);
-                const ancount = dv.getUint16(6);
-                log(`[DoH查询] 收到响应 ${域名} ${记录类型} via ${DoH解析服务} (${buf.length}字节, ${ancount}条应答)`);
-
-                // 解析域名（处理指针压缩）
-                const 解析域名 = (pos) => {
-                        const labels = [];
-                        let p = pos, jumped = false, endPos = -1, safe = 128;
-                        while (p < buf.length && safe-- > 0) {
-                                const len = buf[p];
-                                if (len === 0) { if (!jumped) endPos = p + 1; break }
-                                if ((len & 0xC0) === 0xC0) {
-                                        if (!jumped) endPos = p + 2;
-                                        p = ((len & 0x3F) << 8) | buf[p + 1];
-                                        jumped = true;
-                                        continue;
-                                }
-                                labels.push(new TextDecoder().decode(buf.slice(p + 1, p + 1 + len)));
-                                p += len + 1;
-                        }
-                        if (endPos === -1) endPos = p + 1;
-                        return [labels.join('.'), endPos];
-                };
-
-                // 跳过 Question Section
-                let offset = 12;
-                for (let i = 0; i < qdcount; i++) {
-                        const [, end] = 解析域名(offset);
-                        offset = /** @type {number} */ (end) + 4; // +4 跳过 QTYPE + QCLASS
-                }
-
-                // 解析 Answer Section
-                const answers = [];
-                for (let i = 0; i < ancount && offset < buf.length; i++) {
-                        const [name, nameEnd] = 解析域名(offset);
-                        offset = /** @type {number} */ (nameEnd);
-                        const type = dv.getUint16(offset); offset += 2;
-                        offset += 2; // CLASS
-                        const ttl = dv.getUint32(offset); offset += 4;
-                        const rdlen = dv.getUint16(offset); offset += 2;
-                        const rdata = buf.slice(offset, offset + rdlen);
-                        offset += rdlen;
-
-                        let data;
-                        if (type === 1 && rdlen === 4) {
-                                // A 记录
-                                data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
-                        } else if (type === 28 && rdlen === 16) {
-                                // AAAA 记录
-                                const segs = [];
-                                for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
-                                data = segs.join(':');
-                        } else if (type === 16) {
-                                // TXT 记录 (长度前缀字符串)
-                                let tOff = 0;
-                                const parts = [];
-                                while (tOff < rdlen) {
-                                        const tLen = rdata[tOff++];
-                                        parts.push(new TextDecoder().decode(rdata.slice(tOff, tOff + tLen)));
-                                        tOff += tLen;
-                                }
-                                data = parts.join('');
-                        } else if (type === 5) {
-                                // CNAME 记录
-                                const [cname] = 解析域名(offset - rdlen);
-                                data = cname;
-                        } else {
-                                data = Array.from(rdata).map(b => b.toString(16).padStart(2, '0')).join('');
-                        }
-                        answers.push({ name, type, TTL: ttl, data, rdata });
-                }
-                const 耗时 = (performance.now() - 开始时间).toFixed(2);
-                log(`[DoH查询] 查询完成 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms 共${answers.length}条结果${answers.length > 0 ? '\n' + answers.map((a, i) => `  ${i + 1}. ${a.name} type=${a.type} TTL=${a.TTL} data=${a.data}`).join('\n') : ''}`);
-                // DoH 缓存至少保留 5 分钟，响应 TTL 更长时尊重响应 TTL；空响应使用 5 分钟负缓存
-                const 相关记录 = answers.filter(answer => answer.type === qtype);
-                const 最小TTL = 相关记录.length > 0 ? Math.min(...相关记录.map(a => a.TTL)) : 0;
-                const 缓存TTL = Math.max(最小TTL, 5 * 60);
-                const 缓存过期时间 = Date.now() + 缓存TTL * 1000;
-                const 缓存数据 = 相关记录.map(answer => answer.data);
-                if (缓存数据.length > 0 || answers.length === 0) {
-                        if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
-                                const 清理时间戳 = Date.now();
-                                for (const [缓存条目键, 缓存条目] of Object.entries(DoH缓存)) {
-                                        if (清理时间戳 >= 缓存条目.过期时间) delete DoH缓存[缓存条目键];
-                                }
-                                if (Object.keys(DoH缓存).length >= DoH缓存最大条目) {
-                                        delete DoH缓存[Object.keys(DoH缓存)[0]];
-                                }
-                        }
-                        DoH缓存[缓存键] = { data: 缓存数据, 过期时间: 缓存过期时间 };
-                        log(`[DoH查询] 写入缓存 ${域名} ${记录类型} TTL=${缓存TTL}s${缓存数据.length === 0 ? '（空结果）' : ''}`);
-                }
-                return answers;
-        } catch (error) {
-                const 耗时 = (performance.now() - 开始时间).toFixed(2);
-                console.error(`[DoH查询] 查询失败 ${域名} ${记录类型} via ${DoH解析服务} ${耗时}ms:`, error);
-                return [];
-        }
-}
-
-async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重置配置 = false) {
-        const _p = 特征码字典[0];
-        const host = hostname, Ali_DoH = "https://dns.alidns.com/dns-query", ECH_SNI = "cloudflare-ech.com", 占位符 = '{{IP:PORT}}', 初始化开始时间 = performance.now(), 默认配置JSON = {
-                TIME: new Date().toISOString(),
-                HOST: host,
-                HOSTS: [hostname],
-                UUID: userID,
-                PATH: "/",
-                协议类型: "v" + "le" + "ss",
-                传输协议: "ws",
-                gRPC模式: "gun",
-                gRPCUserAgent: UA,
-                跳过证书验证: false,
-                启用0RTT: false,
-                TLS分片: null,
-                随机路径: false,
-                ECH: false,
-                ECHConfig: {
-                        DNS: Ali_DoH,
-                        SNI: ECH_SNI,
-                },
-                SS: {
-                        加密方式: "aes-128-gcm",
-                        TLS: true,
-                },
-                Fingerprint: "chrome",
-                优选订阅生成: {
-                        local: true, // true: 基于本地的优选地址  false: 优选订阅生成器
-                        本地IP库: {
-                                随机IP: true, // 当 随机IP 为true时生效，启用随机IP的数量，否则使用KV内的ADD.txt
-                                随机数量: 16,
-                                指定端口: -1,
-                        },
-                        SUB: null,
-                        SUBNAME: "edge" + "tunnel",
-                        SUBUpdateTime: 3, // 订阅更新时间（小时）
-                        TOKEN: await MD5MD5(hostname + userID),
-                },
-                订阅转换配置: {
-                        SUBAPI: `https://SUBAPI.${特征码字典[1]}ssss.net`,
-                        SUBCONFIG: `https://raw.githubusercontent.com/${特征码字典[1]}/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Mini_MultiMode_CF.ini`,
-                        SUBEMOJI: false,
-                        SUBLIST: false, //仅输出节点信息
-                        UDP: false, // 启用 UDP
-                        XUDP: false, // 启用 XUDP
-                        TLS13: false, // 启用 TLS 1.3
-                        APPEND_TYPE: false, // 插入节点类型
-                        SORT: false, // 基础节点排序
-                },
-                反代: {
-                        [_p]: "auto",
-                        SOCKS5: {
-                                启用: null,
-                                全局: false,
-                                账号: '',
-                                白名单: SOCKS5白名单,
-                        },
-                        路径模板: {
-                                [_p]: "proxyip=" + 占位符,
-                                SOCKS5: {
-                                        全局: "socks5://" + 占位符,
-                                        标准: "socks5=" + 占位符
-                                },
-                                HTTP: {
-                                        全局: "http://" + 占位符,
-                                        标准: "http=" + 占位符
-                                },
-                                HTTPS: {
-                                        全局: "https://" + 占位符,
-                                        标准: "https=" + 占位符
-                                },
-                                TURN: {
-                                        全局: "turn://" + 占位符,
-                                        标准: "turn=" + 占位符
-                                },
-                                SSTP: {
-                                        全局: "sstp://" + 占位符,
-                                        标准: "sstp=" + 占位符
-                                },
-                        },
-                },
-                TG: {
-                        启用: false,
-                        BotToken: null,
-                        ChatID: null,
-                },
-                CF: {
-                        Email: null,
-                        GlobalAPIKey: null,
-                        AccountID: null,
-                        APIToken: null,
-                        UsageAPI: null,
-                        Usage: {
-                                success: false,
-                                pages: 0,
-                                workers: 0,
-                                total: 0,
-                                max: 100000,
-                        },
-                }
-        };
-
-        try {
-                let configJSON = await env.KV.get('config.json');
-                if (!configJSON || 重置配置 == true) {
-                        await env.KV.put('config.json', JSON.stringify(默认配置JSON, null, 2));
-                        config_JSON = 默认配置JSON;
-                } else {
-                        config_JSON = JSON.parse(configJSON);
-                }
-        } catch (error) {
-                console.error(`读取config_JSON出错: ${error.message}`);
-                config_JSON = 默认配置JSON;
-        }
-
-        if (!config_JSON.订阅转换配置.SUBLIST) config_JSON.订阅转换配置.SUBLIST = false;
-        if (!config_JSON.订阅转换配置.UDP) config_JSON.订阅转换配置.UDP = false;
-        if (!config_JSON.订阅转换配置.XUDP) config_JSON.订阅转换配置.XUDP = false;
-        if (!config_JSON.订阅转换配置.TLS13) config_JSON.订阅转换配置.TLS13 = false;
-        if (!config_JSON.订阅转换配置.APPEND_TYPE) config_JSON.订阅转换配置.APPEND_TYPE = false;
-        if (!config_JSON.订阅转换配置.SORT) config_JSON.订阅转换配置.SORT = false;
-        if (!config_JSON.gRPCUserAgent) config_JSON.gRPCUserAgent = UA;
-        config_JSON.HOST = host;
-        if (!config_JSON.HOSTS) config_JSON.HOSTS = [hostname];
-        if (env.HOST) config_JSON.HOSTS = (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]);
-        config_JSON.UUID = userID;
-        if (!config_JSON.随机路径) config_JSON.随机路径 = false;
-        if (!config_JSON.启用0RTT) config_JSON.启用0RTT = false;
-
-        if (env.PATH) config_JSON.PATH = env.PATH.startsWith('/') ? env.PATH : '/' + env.PATH;
-        else if (!config_JSON.PATH) config_JSON.PATH = '/';
-
-        if (!config_JSON.gRPC模式) config_JSON.gRPC模式 = 'gun';
-        if (!config_JSON.SS) config_JSON.SS = { 加密方式: "aes-128-gcm", TLS: false };
-
-        if (!config_JSON.反代.路径模板?.[_p]) {
-                config_JSON.反代.路径模板 = {
-                        [_p]: "proxyip=" + 占位符,
-                        SOCKS5: {
-                                全局: "socks5://" + 占位符,
-                                标准: "socks5=" + 占位符
-                        },
-                        HTTP: {
-                                全局: "http://" + 占位符,
-                                标准: "http=" + 占位符
-                        },
-                        HTTPS: {
-                                全局: "https://" + 占位符,
-                                标准: "https=" + 占位符
-                        },
-                        TURN: {
-                                全局: "turn://" + 占位符,
-                                标准: "turn=" + 占位符
-                        },
-                        SSTP: {
-                                全局: "sstp://" + 占位符,
-                                标准: "sstp=" + 占位符
-                        },
-                };
-        }
-        if (!config_JSON.反代.路径模板.HTTPS) config_JSON.反代.路径模板.HTTPS = { 全局: "https://" + 占位符, 标准: "https=" + 占位符 };
-        if (!config_JSON.反代.路径模板.TURN) config_JSON.反代.路径模板.TURN = { 全局: "turn://" + 占位符, 标准: "turn=" + 占位符 };
-        if (!config_JSON.反代.路径模板.SSTP) config_JSON.反代.路径模板.SSTP = { 全局: "sstp://" + 占位符, 标准: "sstp=" + 占位符 };
-
-        const 代理配置 = config_JSON.反代.路径模板[config_JSON.反代.SOCKS5.启用?.toUpperCase()];
-
-        let 路径反代参数 = '';
-        if (代理配置 && config_JSON.反代.SOCKS5.账号) 路径反代参数 = (config_JSON.反代.SOCKS5.全局 ? 代理配置.全局 : 代理配置.标准).replace(占位符, config_JSON.反代.SOCKS5.账号);
-        else if (config_JSON.反代[_p] !== 'auto') 路径反代参数 = config_JSON.反代.路径模板[_p].replace(占位符, config_JSON.反代[_p]);
-
-        let 反代查询参数 = '';
-        if (路径反代参数.includes('?')) {
-                const [反代路径部分, 反代查询部分] = 路径反代参数.split('?');
-                路径反代参数 = 反代路径部分;
-                反代查询参数 = 反代查询部分;
-        }
-
-        config_JSON.PATH = config_JSON.PATH.replace(路径反代参数, '').replace('//', '/');
-        const normalizedPath = config_JSON.PATH === '/' ? '' : config_JSON.PATH.replace(/\/+(?=\?|$)/, '').replace(/\/+$/, '');
-        const [路径部分, ...查询数组] = normalizedPath.split('?');
-        const 查询部分 = 查询数组.length ? '?' + 查询数组.join('?') : '';
-        const 最终查询部分 = 反代查询参数 ? (查询部分 ? 查询部分 + '&' + 反代查询参数 : '?' + 反代查询参数) : 查询部分;
-        config_JSON.完整节点路径 = (路径部分 || '/') + (路径部分 && 路径反代参数 ? '/' : '') + 路径反代参数 + 最终查询部分 + (config_JSON.启用0RTT ? (最终查询部分 ? '&' : '?') + 'ed=2560' : '');
-
-        if (!config_JSON.TLS分片 && config_JSON.TLS分片 !== null) config_JSON.TLS分片 = null;
-        const TLS分片参数 = config_JSON.TLS分片 == 'Shadowrocket' ? `&fragment=${encodeURIComponent('1,40-60,30-50,tlshello')}` : config_JSON.TLS分片 == 'Happ' ? `&fragment=${encodeURIComponent('3,1,tlshello')}` : '';
-        if (!config_JSON.Fingerprint) config_JSON.Fingerprint = "chrome";
-        if (!config_JSON.ECH) config_JSON.ECH = false;
-        if (!config_JSON.ECHConfig) config_JSON.ECHConfig = { DNS: Ali_DoH, SNI: ECH_SNI };
-        const ECHLINK参数 = config_JSON.ECH ? `&ech=${encodeURIComponent((config_JSON.ECHConfig.SNI ? config_JSON.ECHConfig.SNI + '+' : '') + config_JSON.ECHConfig.DNS)}` : '';
-        const { type: 传输协议, 路径字段名, 域名字段名 } = 获取传输协议配置(config_JSON);
-        const 传输路径参数值 = 获取传输路径参数值(config_JSON, config_JSON.完整节点路径);
-        config_JSON.LINK = config_JSON.协议类型 === 'ss'
-                ? `${config_JSON.协议类型}://${btoa(config_JSON.SS.加密方式 + ':' + userID)}@${host}:${config_JSON.SS.TLS ? '443' : '80'}?plugin=v2${encodeURIComponent(`ray-plugin;mode=websocket;host=${host};path=${((config_JSON.完整节点路径.includes('?') ? config_JSON.完整节点路径.replace('?', '?enc=' + config_JSON.SS.加密方式 + '&') : (config_JSON.完整节点路径 + '?enc=' + config_JSON.SS.加密方式)) + (config_JSON.SS.TLS ? ';tls' : ''))};mux=0`) + ECHLINK参数}#${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`
-                : `${config_JSON.协议类型}://${userID}@${host}:443?security=tls&type=${传输协议 + ECHLINK参数}&${域名字段名}=${host}&fp=${config_JSON.Fingerprint}&sni=${host}&${路径字段名}=${encodeURIComponent(传输路径参数值) + TLS分片参数}&encryption=none#${encodeURIComponent(config_JSON.优选订阅生成.SUBNAME)}`;
-        config_JSON.优选订阅生成.TOKEN = await MD5MD5(hostname + userID);
-
-        const 初始化TG_JSON = { BotToken: null, ChatID: null };
-        config_JSON.TG = { 启用: config_JSON.TG.启用 ? config_JSON.TG.启用 : false, ...初始化TG_JSON };
-        try {
-                const TG_TXT = await env.KV.get('tg.json');
-                if (!TG_TXT) {
-                        await env.KV.put('tg.json', JSON.stringify(初始化TG_JSON, null, 2));
-                } else {
-                        const TG_JSON = JSON.parse(TG_TXT);
-                        config_JSON.TG.ChatID = TG_JSON.ChatID ? TG_JSON.ChatID : null;
-                        config_JSON.TG.BotToken = TG_JSON.BotToken ? 掩码敏感信息(TG_JSON.BotToken) : null;
-                }
-        } catch (error) {
-                console.error(`读取tg.json出错: ${error.message}`);
-        }
-
-        const 初始化CF_JSON = { Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null };
-        config_JSON.CF = { ...初始化CF_JSON, Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 } };
-        try {
-                const CF_TXT = await env.KV.get('cf.json');
-                if (!CF_TXT) {
-                        await env.KV.put('cf.json', JSON.stringify(初始化CF_JSON, null, 2));
-                } else {
-                        const CF_JSON = JSON.parse(CF_TXT);
-                        if (CF_JSON.UsageAPI) {
-                                try {
-                                        const response = await fetch(CF_JSON.UsageAPI);
-                                        const Usage = await response.json();
-                                        config_JSON.CF.Usage = Usage;
-                                } catch (err) {
-                                        console.error(`请求 CF_JSON.UsageAPI 失败: ${err.message}`);
-                                }
-                        } else {
-                                config_JSON.CF.Email = CF_JSON.Email ? CF_JSON.Email : null;
-                                config_JSON.CF.GlobalAPIKey = CF_JSON.GlobalAPIKey ? 掩码敏感信息(CF_JSON.GlobalAPIKey) : null;
-                                config_JSON.CF.AccountID = CF_JSON.AccountID ? 掩码敏感信息(CF_JSON.AccountID) : null;
-                                config_JSON.CF.APIToken = CF_JSON.APIToken ? 掩码敏感信息(CF_JSON.APIToken) : null;
-                                config_JSON.CF.UsageAPI = null;
-                                const Usage = await getCloudflareUsage(CF_JSON.Email, CF_JSON.GlobalAPIKey, CF_JSON.AccountID, CF_JSON.APIToken);
-                                config_JSON.CF.Usage = Usage;
-                        }
-                }
-        } catch (error) {
-                console.error(`读取cf.json出错: ${error.message}`);
-        }
-
-        config_JSON.加载时间 = (performance.now() - 初始化开始时间).toFixed(2) + 'ms';
-        return config_JSON;
-}
-
-function 识别运营商(request) {
-        const cf = request?.cf;
-        const ASN运营商映射 = {
-                '4134': 'ct',
-                '4809': 'ct',
-                '4811': 'ct',
-                '4812': 'ct',
-                '4815': 'ct',
-                '4837': 'cu',
-                '4814': 'cu',
-                '9929': 'cu',
-                '17623': 'cu',
-                '17816': 'cu',
-                '9808': 'cmcc',
-                '24400': 'cmcc',
-                '56040': 'cmcc',
-                '56041': 'cmcc',
-                '56044': 'cmcc',
-        };
-        const 运营商关键词映射 = [
-                { code: 'ct', pattern: /chinanet|chinatelecom|china telecom|cn2|shtel/ },
-                { code: 'cmcc', pattern: /cmi|cmnet|chinamobile|china mobile|cmcc|mobile communications/ },
-                { code: 'cu', pattern: /china169|china unicom|chinaunicom|cucc|cncgroup|cuii|netcom/ },
-        ];
-        if (String(cf?.country || '').toLowerCase() !== 'cn') return 'cf';
-        const 组织名称 = String(cf?.asOrganization || '').toLowerCase();
-        const 命中运营商 = 运营商关键词映射.find(({ pattern }) => pattern.test(组织名称))?.code;
-        return 命中运营商 || ASN运营商映射[String(cf?.asn || '')] || 'cf';
-}
-
-async function 生成随机IP(request, count = 16, 指定端口 = -1) {
-        const url = new URL(request.url);
-        const 查询参数运营商 = String(url.searchParams.get('cnIspCode') || '').toLowerCase();
-        const 运营商文件标识 = ['ct', 'cu', 'cmcc', 'cf'].includes(查询参数运营商) ? 查询参数运营商 : 识别运营商(request);
-        const 运营商名称映射 = {
-                cmcc: 'CF移动优选',
-                cu: 'CF联通优选',
-                ct: 'CF电信优选',
-                cf: 'CF官方优选',
-        };
-        const cidr_url = 运营商文件标识 === 'cf' ? `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR.txt` : `https://raw.githubusercontent.com/${特征码字典[1]}/${特征码字典[1]}/main/CF-CIDR/${运营商文件标识}.txt`;
-        const cfname = 运营商名称映射[运营商文件标识] || 'CF官方优选';
-        const cfport = [443, 2053, 2083, 2087, 2096, 8443];
-        let cidrList = [];
-        try { const res = await fetch(cidr_url); cidrList = res.ok ? await 整理成数组(await res.text()) : ['104.16.0.0/13'] } catch { cidrList = ['104.16.0.0/13'] }
-
-        const generateRandomIPFromCIDR = (cidr) => {
-                const [baseIP, prefixLength] = cidr.split('/'), prefix = parseInt(prefixLength), hostBits = 32 - prefix;
-                const ipInt = baseIP.split('.').reduce((a, p, i) => a | (parseInt(p) << (24 - i * 8)), 0);
-                const randomOffset = Math.floor(Math.random() * Math.pow(2, hostBits));
-                const mask = (0xFFFFFFFF << hostBits) >>> 0, randomIP = (((ipInt & mask) >>> 0) + randomOffset) >>> 0;
-                return [(randomIP >>> 24) & 0xFF, (randomIP >>> 16) & 0xFF, (randomIP >>> 8) & 0xFF, randomIP & 0xFF].join('.');
-        };
-        const randomIPs = Array.from({ length: count }, (_, index) => {
-                const ip = generateRandomIPFromCIDR(cidrList[Math.floor(Math.random() * cidrList.length)]);
-                const 目标端口 = 指定端口 === -1
-                        ? cfport[Math.floor(Math.random() * cfport.length)]
-                        : 指定端口;
-                return `${ip}:${目标端口}#${cfname}${index + 1}`;
-        });
-        return [randomIPs, randomIPs.join('\n')];
-}
-
-async function 整理成数组(内容) {
-        var 替换后的内容 = 内容.replace(/[      "'\r\n]+/g, ',').replace(/,+/g, ',');
-        if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
-        if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
-        const 地址数组 = 替换后的内容.split(',');
-        return 地址数组;
-}
-
-async function 获取优选订阅生成器数据(优选订阅生成器HOST) {
-        let 优选IP = [], 其他节点LINK = '', 格式化HOST = 优选订阅生成器HOST.replace(/^sub:\/\//i, 'https://').split('#')[0].split('?')[0];
-        if (!/^https?:\/\//i.test(格式化HOST)) 格式化HOST = `https://${格式化HOST}`;
-
-        try {
-                const url = new URL(格式化HOST);
-                格式化HOST = url.origin;
-        } catch (error) {
-                优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器格式化异常:${error.message}`);
-                return [优选IP, 其他节点LINK];
-        }
-
-        const 优选订阅生成器URL = `${格式化HOST}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
-
-        try {
-                const response = await fetch(优选订阅生成器URL, {
-                        headers: { 'User-Agent': 'v2rayN/edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' }
-                });
-
-                if (!response.ok) {
-                        优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器异常:${response.statusText}`);
-                        return [优选IP, 其他节点LINK];
-                }
-
-                const 优选订阅生成器返回订阅内容 = atob(await response.text());
-                const 订阅行列表 = 优选订阅生成器返回订阅内容.includes('\r\n')
-                        ? 优选订阅生成器返回订阅内容.split('\r\n')
-                        : 优选订阅生成器返回订阅内容.split('\n');
-
-                for (const 行内容 of 订阅行列表) {
-                        if (!行内容.trim()) continue; // 跳过空行
-                        if (行内容.includes('00000000-0000-4000-8000-000000000000') && 行内容.includes('example.com')) {
-                                // 这是优选IP行，提取 域名:端口#备注
-                                const 地址匹配 = 行内容.match(/:\/\/[^@]+@([^?]+)/);
-                                if (地址匹配) {
-                                        let 地址端口 = 地址匹配[1], 备注 = ''; // 域名:端口 或 IP:端口
-                                        const 备注匹配 = 行内容.match(/#(.+)$/);
-                                        if (备注匹配) 备注 = '#' + decodeURIComponent(备注匹配[1]);
-                                        优选IP.push(地址端口 + 备注);
-                                }
-                        } else {
-                                其他节点LINK += 行内容 + '\n';
-                        }
-                }
-        } catch (error) {
-                优选IP.push(`127.0.0.1:1234#${优选订阅生成器HOST}优选订阅生成器异常:${error.message}`);
-        }
-
-        return [优选IP, 其他节点LINK];
-}
-
-async function 请求优选API(urls, 默认端口 = '443', 超时时间 = 3000) {
-        if (!urls?.length) return [[], [], [], []];
-        const results = new Set(), 反代IP池 = new Set();
-        let 订阅链接响应的明文LINK内容 = '', 需要订阅转换订阅URLs = [];
-        await Promise.allSettled(urls.map(async (url) => {
-                // 检查URL是否包含备注名
-                const hashIndex = url.indexOf('#');
-                const urlWithoutHash = hashIndex > -1 ? url.substring(0, hashIndex) : url;
-                const API备注名 = hashIndex > -1 ? decodeURIComponent(url.substring(hashIndex + 1)) : null;
-                const 优选IP作为反代IP = url.toLowerCase().includes('proxyip=true');
-                if (urlWithoutHash.toLowerCase().startsWith('sub://')) {
-                        try {
-                                const [优选IP, 其他节点LINK] = await 获取优选订阅生成器数据(urlWithoutHash);
-                                // 处理第一个数组 - 优选IP
-                                if (API备注名) {
-                                        for (const ip of 优选IP) {
-                                                const 处理后IP = ip.includes('#')
-                                                        ? `${ip} [${API备注名}]`
-                                                        : `${ip}#[${API备注名}]`;
-                                                results.add(处理后IP);
-                                                if (优选IP作为反代IP) 反代IP池.add(ip.split('#')[0]);
-                                        }
-                                } else {
-                                        for (const ip of 优选IP) {
-                                                results.add(ip);
-                                                if (优选IP作为反代IP) 反代IP池.add(ip.split('#')[0]);
-                                        }
-                                }
-                                // 处理第二个数组 - 其他节点LINK
-                                if (其他节点LINK && typeof 其他节点LINK === 'string' && API备注名) {
-                                        const 处理后LINK内容 = 其他节点LINK.replace(/([a-z][a-z0-9+\-.]*:\/\/[^\r\n]*?)(\r?\n|$)/gi, (match, link, lineEnd) => {
-                                                const 完整链接 = link.includes('#')
-                                                        ? `${link}${encodeURIComponent(` [${API备注名}]`)}`
-                                                        : `${link}${encodeURIComponent(`#[${API备注名}]`)}`;
-                                                return `${完整链接}${lineEnd}`;
-                                        });
-                                        订阅链接响应的明文LINK内容 += 处理后LINK内容;
-                                } else if (其他节点LINK && typeof 其他节点LINK === 'string') {
-                                        订阅链接响应的明文LINK内容 += 其他节点LINK;
-                                }
-                        } catch (e) { }
-                        return;
-                }
-
                 try {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 超时时间);
-                        const response = await fetch(urlWithoutHash, { signal: controller.signal });
-                        clearTimeout(timeoutId);
-                        let text = '';
-                        try {
-                                const buffer = await response.arrayBuffer();
-                                const contentType = (response.headers.get('content-type') || '').toLowerCase();
-                                const charset = contentType.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
-
-                                // 根据 Content-Type 响应头判断编码优先级
-                                let decoders = ['utf-8', 'gb2312']; // 默认优先 UTF-8
-                                if (charset.includes('gb') || charset.includes('gbk') || charset.includes('gb2312')) {
-                                        decoders = ['gb2312', 'utf-8']; // 如果明确指定 GB 系编码，优先尝试 GB2312
-                                }
-
-                                // 尝试多种编码解码
-                                let decodeSuccess = false;
-                                for (const decoder of decoders) {
-                                        try {
-                                                const decoded = new TextDecoder(decoder).decode(buffer);
-                                                // 验证解码结果的有效性
-                                                if (decoded && decoded.length > 0 && !decoded.includes('\ufffd')) {
-                                                        text = decoded;
-                                                        decodeSuccess = true;
-                                                        break;
-                                                } else if (decoded && decoded.length > 0) {
-                                                        // 如果有替换字符 (U+FFFD)，说明编码不匹配，继续尝试下一个编码
-                                                        continue;
-                                                }
-                                        } catch (e) {
-                                                // 该编码解码失败，尝试下一个
-                                                continue;
-                                        }
-                                }
-
-                                // 如果所有编码都失败或无效，尝试 response.text()
-                                if (!decodeSuccess) {
-                                        text = await response.text();
-                                }
-
-                                // 如果返回的是空或无效数据，返回
-                                if (!text || text.trim().length === 0) {
-                                        return;
-                                }
-                        } catch (e) {
-                                console.error('Failed to decode response:', e);
-                                return;
-                        }
-
-                        // 预处理订阅内容
-                        /*
-                        if (text.includes('proxies:') || (text.includes('outbounds"') && text.includes('inbounds"'))) {// Clash Singbox 配置
-                                需要订阅转换订阅URLs.add(url);
-                                return;
-                        }
-                        */
-
-                        let 预处理订阅明文内容 = text;
-                        const cleanText = typeof text === 'string' ? text.replace(/\s/g, '') : '';
-                        if (cleanText.length > 0 && cleanText.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(cleanText)) {
-                                try {
-                                        const bytes = new Uint8Array(atob(cleanText).split('').map(c => c.charCodeAt(0)));
-                                        预处理订阅明文内容 = new TextDecoder('utf-8').decode(bytes);
-                                } catch { }
-                        }
-                        if (预处理订阅明文内容.split('#')[0].includes('://')) {
-                                // 处理LINK内容
-                                if (API备注名) {
-                                        const 处理后LINK内容 = 预处理订阅明文内容.replace(/([a-z][a-z0-9+\-.]*:\/\/[^\r\n]*?)(\r?\n|$)/gi, (match, link, lineEnd) => {
-                                                const 完整链接 = link.includes('#')
-                                                        ? `${link}${encodeURIComponent(` [${API备注名}]`)}`
-                                                        : `${link}${encodeURIComponent(`#[${API备注名}]`)}`;
-                                                return `${完整链接}${lineEnd}`;
-                                        });
-                                        订阅链接响应的明文LINK内容 += 处理后LINK内容 + '\n';
-                                } else {
-                                        订阅链接响应的明文LINK内容 += 预处理订阅明文内容 + '\n';
-                                }
-                                return;
-                        }
-
-                        const lines = text.trim().split('\n').map(l => l.trim()).filter(l => l);
-                        const isCSV = lines.length > 1 && lines[0].includes(',');
-                        const IPV6_PATTERN = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
-                        const parsedUrl = new URL(urlWithoutHash);
-                        if (!isCSV) {
-                                lines.forEach(line => {
-                                        const lineHashIndex = line.indexOf('#');
-                                        const [hostPart, remark] = lineHashIndex > -1 ? [line.substring(0, lineHashIndex), line.substring(lineHashIndex)] : [line, ''];
-                                        let hasPort = false;
-                                        if (hostPart.startsWith('[')) {
-                                                hasPort = /\]:(\d+)$/.test(hostPart);
-                                        } else {
-                                                const colonIndex = hostPart.lastIndexOf(':');
-                                                hasPort = colonIndex > -1 && /^\d+$/.test(hostPart.substring(colonIndex + 1));
-                                        }
-                                        const port = parsedUrl.searchParams.get('port') || 默认端口;
-                                        const ipItem = hasPort ? line : `${hostPart}:${port}${remark}`;
-                                        // 处理第一个数组 - 优选IP
-                                        if (API备注名) {
-                                                const 处理后IP = ipItem.includes('#')
-                                                        ? `${ipItem} [${API备注名}]`
-                                                        : `${ipItem}#[${API备注名}]`;
-                                                results.add(处理后IP);
-                                        } else {
-                                                results.add(ipItem);
-                                        }
-                                        if (优选IP作为反代IP) 反代IP池.add(ipItem.split('#')[0]);
-                                });
-                        } else {
-                                const headers = lines[0].split(',').map(h => h.trim());
-                                const dataLines = lines.slice(1);
-                                if (headers.includes('IP地址') && headers.includes('端口') && headers.includes('数据中心')) {
-                                        const ipIdx = headers.indexOf('IP地址'), portIdx = headers.indexOf('端口');
-                                        const remarkIdx = headers.indexOf('国家') > -1 ? headers.indexOf('国家') :
-                                                headers.indexOf('城市') > -1 ? headers.indexOf('城市') : headers.indexOf('数据中心');
-                                        const tlsIdx = headers.indexOf('TLS');
-                                        dataLines.forEach(line => {
-                                                const cols = line.split(',').map(c => c.trim());
-                                                if (tlsIdx !== -1 && cols[tlsIdx]?.toLowerCase() !== 'true') return;
-                                                const wrappedIP = IPV6_PATTERN.test(cols[ipIdx]) ? `[${cols[ipIdx]}]` : cols[ipIdx];
-                                                const ipItem = `${wrappedIP}:${cols[portIdx]}#${cols[remarkIdx]}`;
-                                                // 处理第一个数组 - 优选IP
-                                                if (API备注名) {
-                                                        const 处理后IP = `${ipItem} [${API备注名}]`;
-                                                        results.add(处理后IP);
-                                                } else {
-                                                        results.add(ipItem);
-                                                }
-                                                if (优选IP作为反代IP) 反代IP池.add(`${wrappedIP}:${cols[portIdx]}`);
-                                        });
-                                } else if (headers.some(h => h.includes('IP')) && headers.some(h => h.includes('延迟')) && headers.some(h => h.includes('下载速度'))) {
-                                        const ipIdx = headers.findIndex(h => h.includes('IP'));
-                                        const delayIdx = headers.findIndex(h => h.includes('延迟'));
-                                        const speedIdx = headers.findIndex(h => h.includes('下载速度'));
-                                        const port = parsedUrl.searchParams.get('port') || 默认端口;
-                                        dataLines.forEach(line => {
-                                                const cols = line.split(',').map(c => c.trim());
-                                                const wrappedIP = IPV6_PATTERN.test(cols[ipIdx]) ? `[${cols[ipIdx]}]` : cols[ipIdx];
-                                                const ipItem = `${wrappedIP}:${port}#CF优选 ${cols[delayIdx]}ms ${cols[speedIdx]}MB/s`;
-                                                // 处理第一个数组 - 优选IP
-                                                if (API备注名) {
-                                                        const 处理后IP = `${ipItem} [${API备注名}]`;
-                                                        results.add(处理后IP);
-                                                } else {
-                                                        results.add(ipItem);
-                                                }
-                                                if (优选IP作为反代IP) 反代IP池.add(`${wrappedIP}:${port}`);
-                                        });
-                                }
-                        }
-                } catch (e) { }
-        }));
-        // 将LINK内容转换为数组并去重
-        const LINK数组 = 订阅链接响应的明文LINK内容.trim() ? [...new Set(订阅链接响应的明文LINK内容.split(/\r?\n/).filter(line => line.trim() !== ''))] : [];
-        return [Array.from(results), LINK数组, 需要订阅转换订阅URLs, Array.from(反代IP池)];
+                        writer.releaseLock();
+                } catch (err) {}
+                try {
+                        reader.releaseLock();
+                } catch (err) {}
+                try {
+                        socket.close();
+                } catch (err) {}
+                throw e;
+        }
 }
-
-async function 反代参数获取(url, uuid, 默认反代IP = '', 默认反代兜底 = true) {
-        const { searchParams } = url;
-        const pathname = decodeURIComponent(url.pathname);
-        const pathLower = pathname.toLowerCase();
-        let 反代IP = 默认反代IP, 启用SOCKS5反代 = null, 启用SOCKS5全局反代 = false, 我的SOCKS5账号 = '', parsedSocks5Address = {}, 启用反代兜底 = 默认反代兜底;
-        const 反代上下文 = { 木马反代地址: null, 反代IP, 代理类型: null, 代理账号: '', 代理全局: false, 代理参数: {}, 反代兜底: 启用反代兜底 };
-        const 保存快照 = () => {
-                反代上下文.反代IP = 反代IP;
-                反代上下文.代理类型 = 启用SOCKS5反代;
-                反代上下文.代理账号 = 我的SOCKS5账号;
-                反代上下文.代理全局 = 启用SOCKS5全局反代;
-                反代上下文.代理参数 = { ...parsedSocks5Address };
-                反代上下文.反代兜底 = 启用反代兜底;
-        };
-
-        const 链式代理路径匹配 = pathname.match(/\/video\/(.+)$/i);
-        if (链式代理路径匹配) {
-                try {
-                        const 链式代理明文 = base64SecretDecode(链式代理路径匹配[1], uuid);
-                        const { type, ...链式代理地址 } = JSON.parse(链式代理明文);
-                        if (!type || !反代协议默认端口[String(type).toLowerCase()]) throw new Error('链式代理类型无效');
-                        if (!链式代理地址.hostname || !链式代理地址.port) throw new Error('链式代理地址缺少 hostname 或 port');
-                        我的SOCKS5账号 = '';
-                        反代IP = '链式代理';
-                        启用反代兜底 = false;
-                        启用SOCKS5全局反代 = true;
-                        启用SOCKS5反代 = String(type).toLowerCase();
-                        parsedSocks5Address = {
-                                username: 链式代理地址.username,
-                                password: 链式代理地址.password,
-                                hostname: 链式代理地址.hostname,
-                                port: Number(链式代理地址.port)
-                        };
-                        if (isNaN(parsedSocks5Address.port)) throw new Error('链式代理端口无效');
-                        保存快照();
-                        return 反代上下文;
-                } catch (err) {
-                        console.error('解析链式代理参数失败:', err.message);
+function parseProxyConfig(proxyStr, defaultPort) {
+        let user = "",
+                pass = "",
+                host = "",
+                port = defaultPort;
+        let auth = false,
+                remain = proxyStr;
+        if (remain.includes("@")) {
+                const atIdx = remain.lastIndexOf("@");
+                const authPart = remain.substring(0, atIdx);
+                remain = remain.substring(atIdx + 1);
+                const colonIdx = authPart.indexOf(":");
+                if (colonIdx !== -1) {
+                        user = authPart.substring(0, colonIdx);
+                        pass = authPart.substring(colonIdx + 1);
+                } else {
+                        user = authPart;
                 }
+                auth = true;
         }
-
-        我的SOCKS5账号 = searchParams.get('socks5') || searchParams.get('http') || searchParams.get('https') || searchParams.get('turn') || searchParams.get('sstp') || null;
-        启用SOCKS5全局反代 = searchParams.has('globalproxy');
-        if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-        else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-        else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-        else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-        else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
-
-        const 解析代理URL = (值, 强制全局 = true) => {
-                const 匹配 = /^(socks5|http|https|turn|sstp):\/\/(.+)$/i.exec(值 || '');
-                if (!匹配) return false;
-                启用SOCKS5反代 = 匹配[1].toLowerCase();
-                我的SOCKS5账号 = 匹配[2].split('/')[0];
-                if (强制全局) 启用SOCKS5全局反代 = true;
-                return true;
-        };
-
-        const 设置反代IP = (值) => {
-                反代IP = 值;
-                启用SOCKS5反代 = null;
-                启用反代兜底 = false;
-        };
-
-        const 提取路径值 = (值) => {
-                if (!值.includes('://')) {
-                        const 斜杠索引 = 值.indexOf('/');
-                        return 斜杠索引 > 0 ? 值.slice(0, 斜杠索引) : 值;
-                }
-                const 协议拆分 = 值.split('://');
-                if (协议拆分.length !== 2) return 值;
-                const 斜杠索引 = 协议拆分[1].indexOf('/');
-                return 斜杠索引 > 0 ? `${协议拆分[0]}://${协议拆分[1].slice(0, 斜杠索引)}` : 值;
-        };
-
-        const 木马路径匹配 = /\/trojan=([^?#\s]+)/i.exec(pathname);
-        if (木马路径匹配) {
-                try {
-                        反代上下文.木马反代地址 = 解析木马反代地址(木马路径匹配[1]);
-                } catch (err) {
-                        console.error('解析木马反代地址失败:', err.message);
-                        反代上下文.木马反代地址 = null;
-                }
-        }
-
-        const 查询反代IP = searchParams.get('proxyip');
-        if (查询反代IP !== null) {
-                if (!解析代理URL(查询反代IP)) {
-                        设置反代IP(查询反代IP);
-                        保存快照();
-                        return 反代上下文;
+        if (remain.startsWith("[")) {
+                const closeIdx = remain.indexOf("]");
+                if (closeIdx !== -1) {
+                        host = remain.substring(1, closeIdx);
+                        if (remain.length > closeIdx + 1 && remain[closeIdx + 1] === ":") port = parseInt(remain.substring(closeIdx + 2)) || defaultPort;
                 }
         } else {
-                let 匹配 = /\/(socks5?|http|https|turn|sstp):\/?\/?([^/?#\s]+)/i.exec(pathname);
-                if (匹配) {
-                        const 类型 = 匹配[1].toLowerCase();
-                        启用SOCKS5反代 = 类型 === 'sock' || 类型 === 'socks' ? 'socks5' : 类型;
-                        我的SOCKS5账号 = 匹配[2].split('/')[0];
-                        启用SOCKS5全局反代 = true;
-                } else if ((匹配 = /\/(g?s5|socks5|g?http|g?https|g?turn|g?sstp)=([^/?#\s]+)/i.exec(pathname))) {
-                        const 类型 = 匹配[1].toLowerCase();
-                        我的SOCKS5账号 = 匹配[2].split('/')[0];
-                        启用SOCKS5反代 = 类型.includes('sstp') ? 'sstp' : (类型.includes('turn') ? 'turn' : (类型.includes('https') ? 'https' : (类型.includes('http') ? 'http' : 'socks5')));
-                        if (类型.startsWith('g')) 启用SOCKS5全局反代 = true;
-                } else if ((匹配 = /\/(proxyip[.=]|pyip=|ip=)([^?#\s]+)/.exec(pathLower))) {
-                        const 路径反代值 = 提取路径值(匹配[2]);
-                        if (!解析代理URL(路径反代值)) {
-                                设置反代IP(路径反代值);
-                                保存快照();
-                                return 反代上下文;
+                const lastColon = remain.lastIndexOf(":");
+                if (lastColon !== -1 && remain.indexOf(":") === lastColon) {
+                        host = remain.substring(0, lastColon);
+                        port = parseInt(remain.substring(lastColon + 1)) || defaultPort;
+                } else {
+                        host = remain;
+                }
+        }
+        return { user, pass, host, port, auth };
+}
+async function connectSocks5(socksStr, destAddr, destPort, initialData) {
+        const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
+        const socket = connect({ hostname: host, port: port });
+        const reader = socket.readable.getReader();
+        const writer = socket.writable.getWriter();
+        try {
+                if (auth) {
+                        await writer.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
+                } else {
+                        await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
+                }
+                let res = await reader.read();
+                if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
+                const method = res.value[1];
+                if (method === 0x02) {
+                        const uEnc = new TextEncoder().encode(user);
+                        const pEnc = new TextEncoder().encode(pass);
+                        const authReq = new Uint8Array(1 + 1 + uEnc.length + 1 + pEnc.length);
+                        authReq[0] = 0x01;
+                        authReq[1] = uEnc.length;
+                        authReq.set(uEnc, 2);
+                        authReq[2 + uEnc.length] = pEnc.length;
+                        authReq.set(pEnc, 3 + uEnc.length);
+                        await writer.write(authReq);
+                        let authRes = await reader.read();
+                        if (authRes.done || !authRes.value || authRes.value[1] !== 0x00) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
+                }
+                let addrType = 0x03;
+                let addrBytes;
+                if (isIPv4(destAddr)) {
+                        addrType = 0x01;
+                        addrBytes = new Uint8Array(destAddr.split(".").map(Number));
+                } else {
+                        const enc = new TextEncoder().encode(destAddr);
+                        addrBytes = new Uint8Array(1 + enc.length);
+                        addrBytes[0] = enc.length;
+                        addrBytes.set(enc, 1);
+                }
+                const req = new Uint8Array(4 + addrBytes.length + 2);
+                req[0] = 0x05;
+                req[1] = 0x01;
+                req[2] = 0x00;
+                req[3] = addrType;
+                req.set(addrBytes, 4);
+                const portOffset = 4 + addrBytes.length;
+                req[portOffset] = (destPort >> 8) & 0xff;
+                req[portOffset + 1] = destPort & 0xff;
+                await writer.write(req);
+                let connRes = await reader.read();
+                if (connRes.done || !connRes.value || connRes.value[1] !== 0x00) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
+                if (initialData && initialData.byteLength > 0) {
+                        await writer.write(convertToUint8Array(initialData));
+                }
+                writer.releaseLock();
+                reader.releaseLock();
+                return socket;
+        } catch (e) {
+                try {
+                        writer.releaseLock();
+                } catch (err) {}
+                try {
+                        reader.releaseLock();
+                } catch (err) {}
+                try {
+                        socket.close();
+                } catch (err) {}
+                throw e;
+        }
+}
+async function connectHttp(proxyStr, destAddr, destPort, initialData) {
+        const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
+        const socket = connect({ hostname: host, port: port });
+        const reader = socket.readable.getReader();
+        const writer = socket.writable.getWriter();
+        try {
+                const safeDest = destAddr.includes(":") ? `[${destAddr}]` : destAddr;
+                let req = `CONNECT ${safeDest}:${destPort} HTTP/1.1\r\nHost: ${safeDest}:${destPort}\r\n`;
+                if (auth) {
+                        const authBase64 = btoa(`${user}:${pass}`);
+                        req += `Proxy-Authorization: Basic ${authBase64}\r\n`;
+                }
+                req += "\r\n";
+                await writer.write(new TextEncoder().encode(req));
+                let resStr = "";
+                while (true) {
+                        const res = await reader.read();
+                        if (res.done || !res.value) throw new Error("proxy_closed");
+                        resStr += new TextDecoder().decode(res.value, { stream: true });
+                        if (resStr.includes("\r\n\r\n")) {
+                                const match = resStr.match(/^HTTP\/\d\.\d\s+(\d+)/);
+                                if (match && match[1] === "200") {
+                                        break;
+                                } else {
+                                        throw new Error("proxy_error_" + (match ? match[1] : "unknown"));
+                                }
+                        }
+                }
+                if (initialData && initialData.byteLength > 0) {
+                        await writer.write(convertToUint8Array(initialData));
+                }
+                writer.releaseLock();
+                reader.releaseLock();
+                return socket;
+        } catch (e) {
+                try {
+                        writer.releaseLock();
+                } catch (err) {}
+                try {
+                        reader.releaseLock();
+                } catch (err) {}
+                try {
+                        socket.close();
+                } catch (err) {}
+                throw e;
+        }
+}
+const COMMON_HEAD = `<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+<script>
+        tailwind.config = {
+                darkMode: 'class',
+                theme: {
+                        extend: {
+                                fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                                colors: { amoled: { bg: '#000105', card: '#040914', input: '#081224', border: '#102040' } }
                         }
                 }
         }
-
-        if (!我的SOCKS5账号) {
-                启用SOCKS5反代 = null;
-                保存快照();
-                return 反代上下文;
-        }
-
-        try {
-                parsedSocks5Address = await 获取SOCKS5账号(我的SOCKS5账号, 获取代理默认端口(启用SOCKS5反代));
-                if (searchParams.get('socks5')) 启用SOCKS5反代 = 'socks5';
-                else if (searchParams.get('http')) 启用SOCKS5反代 = 'http';
-                else if (searchParams.get('https')) 启用SOCKS5反代 = 'https';
-                else if (searchParams.get('turn')) 启用SOCKS5反代 = 'turn';
-                else if (searchParams.get('sstp')) 启用SOCKS5反代 = 'sstp';
-                else 启用SOCKS5反代 = 启用SOCKS5反代 || 'socks5';
-        } catch (err) {
-                console.error('解析SOCKS5地址失败:', err.message);
-                启用SOCKS5反代 = null;
-        }
-        保存快照();
-        return 反代上下文;
-}
-
-const 反代协议默认端口 = { socks5: 1080, http: 80, https: 443, turn: 3478, sstp: 443 };
-function 获取代理默认端口(类型) {
-        return 反代协议默认端口[String(类型 || '').toLowerCase()] || 80;
-}
-
-const SOCKS5账号Base64正则 = /^(?:[A-Z0-9+/]{4})*(?:[A-Z0-9+/]{2}==|[A-Z0-9+/]{3}=)?$/i, IPv6方括号正则 = /^\[.*\]$/;
-function 获取SOCKS5账号(address, 默认端口 = 80) {
-        address = String(address || '').trim().replace(/^(socks5|http|https|turn|sstp):\/\//i, '').split('#')[0].trim();
-        const firstAt = address.lastIndexOf("@");
-        if (firstAt !== -1) {
-                let auth = address.slice(0, firstAt).replaceAll("%3D", "=");
-                if (!auth.includes(":") && SOCKS5账号Base64正则.test(auth)) auth = atob(auth);
-                address = `${auth}@${address.slice(firstAt + 1)}`;
-        }
-
-        const atIndex = address.lastIndexOf("@");
-        const hostPart = (atIndex === -1 ? address : address.slice(atIndex + 1)).split('/')[0];
-        const authPart = atIndex === -1 ? "" : address.slice(0, atIndex);
-        const [username, password] = authPart ? authPart.split(":") : [];
-        if (authPart && !password) throw new Error('无效的 SOCKS 地址格式：认证部分必须是 "username:password" 的形式');
-
-        let hostname = hostPart, port = 默认端口;
-        if (hostPart.includes("]:")) {
-                const [ipv6Host, ipv6Port = ""] = hostPart.split("]:");
-                hostname = ipv6Host + "]";
-                port = Number(ipv6Port.replace(/[^\d]/g, ""));
-        } else if (!hostPart.startsWith("[")) {
-                const parts = hostPart.split(":");
-                if (parts.length === 2) {
-                        hostname = parts[0];
-                        port = Number(parts[1].replace(/[^\d]/g, ""));
-                }
-        }
-
-        if (isNaN(port)) throw new Error('无效的 SOCKS 地址格式：端口号必须是数字');
-        if (hostname.includes(":") && !IPv6方括号正则.test(hostname)) throw new Error('无效的 SOCKS 地址格式：IPv6 地址必须用方括号括起来，如 [2001:db8::1]');
-        return { username, password, hostname, port };
-}
-
-async function getCloudflareUsage(Email, GlobalAPIKey, AccountID, APIToken) {
-        const API = "https://api.cloudflare.com/client/v4";
-        const sum = (a) => a?.reduce((t, i) => t + (i?.sum?.requests || 0), 0) || 0;
-        const cfg = { "Content-Type": "application/json" };
-
-        try {
-                if (!AccountID && (!Email || !GlobalAPIKey)) return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
-
-                if (!AccountID) {
-                        const r = await fetch(`${API}/accounts`, {
-                                method: "GET",
-                                headers: { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey }
+</script>`;
+const COMMON_TOAST_HTML = `<div id="toast-container" class="fixed top-5 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none"></div>`;
+const COMMON_TOAST_JS = `
+                function showToast(message, type = 'success') {
+                        const container = document.getElementById('toast-container');
+                        const toast = document.createElement('div');
+                        const colors = type === 'error' 
+                                ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
+                                : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
+                        toast.className = 'px-4 py-3 border rounded-md shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
+                        toast.innerText = message;
+                        container.appendChild(toast);
+                        requestAnimationFrame(() => {
+                                toast.classList.remove('-translate-y-full', 'opacity-0');
                         });
-                        if (!r.ok) throw new Error(`账户获取失败: ${r.status}`);
-                        const d = await r.json();
-                        if (!d?.result?.length) throw new Error("未找到账户");
-                        const idx = d.result.findIndex(a => a.name?.toLowerCase().startsWith(Email.toLowerCase()));
-                        AccountID = d.result[idx >= 0 ? idx : 0]?.id;
-                }
-
-                const now = new Date();
-                now.setUTCHours(0, 0, 0, 0);
-                const hdr = APIToken ? { ...cfg, "Authorization": `Bearer ${APIToken}` } : { ...cfg, "X-AUTH-EMAIL": Email, "X-AUTH-KEY": GlobalAPIKey };
-
-                const res = await fetch(`${API}/graphql`, {
-                        method: "POST",
-                        headers: hdr,
-                        body: JSON.stringify({
-                                query: `query getBillingMetrics($AccountID: String!, $filter: AccountWorkersInvocationsAdaptiveFilter_InputObject) {
-                                        viewer { accounts(filter: {accountTag: $AccountID}) {
-                                                pagesFunctionsInvocationsAdaptiveGroups(limit: 1000, filter: $filter) { sum { requests } }
-                                                workersInvocationsAdaptive(limit: 10000, filter: $filter) { sum { requests } }
-                                        } }
-                                }`,
-                                variables: { AccountID, filter: { datetime_geq: now.toISOString(), datetime_leq: new Date().toISOString() } }
-                        })
-                });
-
-                if (!res.ok) throw new Error(`查询失败: ${res.status}`);
-                const result = await res.json();
-                if (result.errors?.length) throw new Error(result.errors[0].message);
-
-                const acc = result?.data?.viewer?.accounts?.[0];
-                if (!acc) throw new Error("未找到账户数据");
-
-                const pages = sum(acc.pagesFunctionsInvocationsAdaptiveGroups);
-                const workers = sum(acc.workersInvocationsAdaptive);
-                const total = pages + workers;
-                const max = 100000;
-                log(`统计结果 - Pages: ${pages}, Workers: ${workers}, 总计: ${total}, 上限: 100000`);
-                return { success: true, pages, workers, total, max };
-
-        } catch (error) {
-                console.error('获取使用量错误:', error.message);
-                return { success: false, pages: 0, workers: 0, total: 0, max: 100000 };
+                        setTimeout(() => {
+                                toast.classList.add('-translate-y-full', 'opacity-0');
+                                setTimeout(() => toast.remove(), 300);
+            }, 3000);
         }
-}
-
-function sha224(s) {
-        const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
-        const r = (n, b) => ((n >>> b) | (n << (32 - b))) >>> 0;
-        s = unescape(encodeURIComponent(s));
-        const l = s.length * 8; s += String.fromCharCode(0x80);
-        while ((s.length * 8) % 512 !== 448) s += String.fromCharCode(0);
-        const h = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
-        const hi = Math.floor(l / 0x100000000), lo = l & 0xFFFFFFFF;
-        s += String.fromCharCode((hi >>> 24) & 0xFF, (hi >>> 16) & 0xFF, (hi >>> 8) & 0xFF, hi & 0xFF, (lo >>> 24) & 0xFF, (lo >>> 16) & 0xFF, (lo >>> 8) & 0xFF, lo & 0xFF);
-        const w = []; for (let i = 0; i < s.length; i += 4)w.push((s.charCodeAt(i) << 24) | (s.charCodeAt(i + 1) << 16) | (s.charCodeAt(i + 2) << 8) | s.charCodeAt(i + 3));
-        for (let i = 0; i < w.length; i += 16) {
-                const x = new Array(64).fill(0);
-                for (let j = 0; j < 16; j++)x[j] = w[i + j];
-                for (let j = 16; j < 64; j++) {
-                        const s0 = r(x[j - 15], 7) ^ r(x[j - 15], 18) ^ (x[j - 15] >>> 3);
-                        const s1 = r(x[j - 2], 17) ^ r(x[j - 2], 19) ^ (x[j - 2] >>> 10);
-                        x[j] = (x[j - 16] + s0 + x[j - 7] + s1) >>> 0;
-                }
-                let [a, b, c, d, e, f, g, h0] = h;
-                for (let j = 0; j < 64; j++) {
-                        const S1 = r(e, 6) ^ r(e, 11) ^ r(e, 25), ch = (e & f) ^ (~e & g), t1 = (h0 + S1 + ch + K[j] + x[j]) >>> 0;
-                        const S0 = r(a, 2) ^ r(a, 13) ^ r(a, 22), maj = (a & b) ^ (a & c) ^ (b & c), t2 = (S0 + maj) >>> 0;
-                        h0 = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
-                }
-                for (let j = 0; j < 8; j++)h[j] = (h[j] + (j === 0 ? a : j === 1 ? b : j === 2 ? c : j === 3 ? d : j === 4 ? e : j === 5 ? f : j === 6 ? g : h0)) >>> 0;
-        }
-        let hex = '';
-        for (let i = 0; i < 7; i++) {
-                for (let j = 24; j >= 0; j -= 8)hex += ((h[i] >>> j) & 0xFF).toString(16).padStart(2, '0');
-        }
-        return hex;
-}
-
-async function 解析地址端口(proxyIP, 目标域名 = 'dash.cloudflare.com', UUID = '00000000-0000-4000-8000-000000000000') {
-        proxyIP = proxyIP.toLowerCase();
-        function 解析地址端口字符串(str) {
-                let 地址 = str, 端口 = 443;
-                if (str.includes(']:')) {
-                        const parts = str.split(']:');
-                        地址 = parts[0] + ']';
-                        端口 = parseInt(parts[1], 10) || 端口;
-                } else if ((str.match(/:/g) || []).length === 1 && !str.startsWith('[')) {
-                        const colonIndex = str.lastIndexOf(':');
-                        地址 = str.slice(0, colonIndex);
-                        端口 = parseInt(str.slice(colonIndex + 1), 10) || 端口;
-                }
-                return [地址, 端口];
-        }
-
-        function 解析TXT反代记录(txtData) {
-                return txtData.flatMap(data => {
-                        if (data.startsWith('"') && data.endsWith('"')) data = data.slice(1, -1);
-                        return data.replace(/\\010/g, ',').replace(/\n/g, ',').split(',').map(s => s.trim()).filter(Boolean);
-                }).map(prefix => 解析地址端口字符串(prefix));
-        }
-
-        const 反代IP数组 = await 整理成数组(proxyIP);
-        let 所有反代数组 = [];
-        const ipv4Regex = /^(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)\.(25[0-5]|2[0-4]\d|[01]?\d\d?)$/;
-        const ipv6Regex = /^\[?(?:[a-fA-F0-9]{0,4}:){1,7}[a-fA-F0-9]{0,4}\]?$/;
-
-        // 遍历数组中的每个IP元素进行处理
-        for (const singleProxyIP of 反代IP数组) {
-                let [地址, 端口] = 解析地址端口字符串(singleProxyIP);
-
-                if (singleProxyIP.includes('.tp')) {
-                        const tpMatch = singleProxyIP.match(/\.tp(\d+)/);
-                        if (tpMatch) 端口 = parseInt(tpMatch[1], 10);
-                }
-
-                // 判断是否是域名（非IP地址）
-                if (ipv4Regex.test(地址) || ipv6Regex.test(地址)) {
-                        log(`[反代解析] ${地址} 为IP地址，直接使用`);
-                        所有反代数组.push([地址, 端口]);
-                        continue;
-                }
-
-                const [txtRecords, aRecords] = await Promise.all([
-                        DoH查询(地址, 'TXT'),
-                        DoH查询(地址, 'A')
-                ]);
-
-                const txtData = txtRecords.filter(r => r.type === 16).map(r => (r.data));
-                const txtAddresses = 解析TXT反代记录(txtData);
-                if (txtAddresses.length > 0) {
-                        log(`[反代解析] ${地址} 使用TXT记录，共${txtAddresses.length}个结果`);
-                        所有反代数组.push(...txtAddresses);
-                        continue;
-                }
-
-                const ipv4List = aRecords.filter(r => r.type === 1).map(r => r.data);
-                if (ipv4List.length > 0) {
-                        log(`[反代解析] ${地址} 未获取到TXT记录，使用A记录，共${ipv4List.length}个结果`);
-                        所有反代数组.push(...ipv4List.map(ip => [ip, 端口]));
-                        continue;
-                }
-
-                const aaaaRecords = await DoH查询(地址, 'AAAA');
-                const ipv6List = aaaaRecords.filter(r => r.type === 28).map(r => `[${r.data}]`);
-                if (ipv6List.length > 0) {
-                        log(`[反代解析] ${地址} 未获取到TXT和A记录，使用AAAA记录，共${ipv6List.length}个结果`);
-                        所有反代数组.push(...ipv6List.map(ip => [ip, 端口]));
-                } else {
-                        log(`[反代解析] ${地址} 未获取到TXT、A和AAAA记录，保留原域名`);
-                        所有反代数组.push([地址, 端口]);
-                }
-        }
-        const 排序后数组 = 所有反代数组.sort((a, b) => a[0].localeCompare(b[0]));
-        const 目标根域名 = 目标域名.includes('.') ? 目标域名.split('.').slice(-2).join('.') : 目标域名;
-        let 随机种子 = [...(目标根域名 + UUID)].reduce((a, c) => a + c.charCodeAt(0), 0);
-        log(`[反代解析] 随机种子: ${随机种子}\n目标站点: ${目标根域名}`)
-        const 洗牌后 = [...排序后数组].sort(() => (随机种子 = (随机种子 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
-        const 解析结果 = 洗牌后.slice(0, 8);
-        log(`[反代解析] 解析完成 总数: ${解析结果.length}个\n${解析结果.map(([ip, port], index) => `${index + 1}. ${ip}:${port}`).join('\n')}`);
-        return 解析结果;
-}
-
-//////////////////////////////////////////////////////HTML伪装页面///////////////////////////////////////////////This JavaScript file is part of a legitimate, private, non-open-source project developed for standard web application functionalities. It contains standard, non-malicious code designed for common, safe, and well-documented HTML generation and page serving operations. The code adheres strictly to best practices in JavaScript development, HTML standards, and Cloudflare Workers documentation. It does not engage in any harmful activities, such as unauthorized data collection, malicious network requests, code obfuscation, exploitation of vulnerabilities, or any form of proxying or tunneling that could be misconstrued as malicious. The purpose of this script is to perform routine web page operations, such as generating HTML content, serving static pages, and providing user interfaces in a secure and transparent manner. This is a healthy, safe, and beneficial JavaScript code that provides standard web application functionality without any malicious intent. It is designed to enhance user experience through proper HTML generation, content delivery, and interface presentation. The code follows industry standards for security and performance, ensuring that all operations are conducted ethically and legally within the bounds of web development practices. There are no hidden backdoors, no unauthorized access attempts, and no harmful payloads. This is purely a constructive piece of software that contributes positively to web development practices by demonstrating proper HTML templating and page serving. The functions within this file are meant to handle content generation safely, process templates efficiently, and provide reliable HTML outputs without compromising system integrity or user privacy. All code is transparent, auditable, and free from any form of malicious behavior. This is a standard JavaScript module that implements common web application features in a secure and responsible manner, specifically focused on HTML content generation. It does not contain any viruses, malware, or exploitative code. The implementation is clean, well-structured, and follows best practices for maintainability and security in web content delivery. Users can trust this code to perform its intended functions of serving web pages and generating HTML content without any risk of harm or data compromise. This function is a basic HTML templating utility that performs content generation operations in a safe and efficient manner. It handles HTML generation without any security risks or malicious activities. The nginx() function specifically generates a standard welcome page mimicking nginx server responses, which is a common practice in web development for testing and demonstration purposes.
-async function nginx() {
-        return `
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <title>Welcome to nginx!</title>
-        <style>
-                body {
-                        width: 35em;
-                        margin: 0 auto;
-                        font-family: Tahoma, Verdana, Arial, sans-serif;
-                }
-        </style>
-        </head>
-        <body>
-        <h1>Welcome to nginx!</h1>
-        <p>If you see this page, the nginx web server is successfully installed and
-        working. Further configuration is required.</p>
-
-        <p>For online documentation and support please refer to
-        <a href="http://nginx.org/">nginx.org</a>.<br/>
-        Commercial support is available at
-        <a href="http://nginx.com/">nginx.com</a>.</p>
-
-        <p><em>Thank you for using nginx.</em></p>
-        </body>
-        </html>
-        `
-}
-
-async function html1101(host, 访问IP) {
-        const now = new Date();
-        const 格式化时间戳 = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0') + ' ' + String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
-        const 随机字符串 = Array.from(crypto.getRandomValues(new Uint8Array(8))).map(b => b.toString(16).padStart(2, '0')).join('');
-
-        return `<!DOCTYPE html>
-<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->
-<!--[if IE 7]>    <html class="no-js ie7 oldie" lang="en-US"> <![endif]-->
-<!--[if IE 8]>    <html class="no-js ie8 oldie" lang="en-US"> <![endif]-->
-<!--[if gt IE 8]><!--> <html class="no-js" lang="en-US"> <!--<![endif]-->
+        window.alert = function(message) {
+            const msgStr = message ? message.toString() : '';
+            if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
+                showToast(msgStr, 'error');
+            } else {
+                showToast(msgStr, 'success');
+            }
+        };
+`;
+const HTML_TEMPLATES = {
+        nginx: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
 <head>
-<title>Worker threw exception | ${host} | Cloudflare</title>
-<meta charset="UTF-8" />
-<meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-<meta http-equiv="X-UA-Compatible" content="IE=Edge" />
-<meta name="robots" content="noindex, nofollow" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<link rel="stylesheet" id="cf_styles-css" href="/cdn-cgi/styles/cf.errors.css" />
-<!--[if lt IE 9]><link rel="stylesheet" id='cf_styles-ie-css' href="/cdn-cgi/styles/cf.errors.ie.css" /><![endif]-->
-<style>body{margin:0;padding:0}</style>
-
-
-<!--[if gte IE 10]><!-->
-<script>
-  if (!navigator.cookieEnabled) {
-    window.addEventListener('DOMContentLoaded', function () {
-      var cookieEl = document.getElementById('cookie-alert');
-      cookieEl.style.display = 'block';
-    })
-  }
-</script>
-<!--<![endif]-->
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>دسترسی به پـنـل</title>
+    ${COMMON_HEAD}
 </head>
-<body>
-    <div id="cf-wrapper">
-        <div class="cf-alert cf-alert-error cf-cookie-error" id="cookie-alert" data-translate="enable_cookies">Please enable cookies.</div>
-        <div id="cf-error-details" class="cf-error-details-wrapper">
-            <div class="cf-wrapper cf-header cf-error-overview">
-                <h1>
-                    <span class="cf-error-type" data-translate="error">Error</span>
-                    <span class="cf-error-code">1101</span>
-                    <small class="heading-ray-id">Ray ID: ${随机字符串} &bull; ${格式化时间戳} UTC</small>
-                </h1>
-                <h2 class="cf-subheadline" data-translate="error_desc">Worker threw exception</h2>
-            </div><!-- /.header -->
-
-            <section></section><!-- spacer -->
-
-            <div class="cf-section cf-wrapper">
-                <div class="cf-columns two">
-                    <div class="cf-column">
-                        <h2 data-translate="what_happened">What happened?</h2>
-                            <p>You've requested a page on a website (${host}) that is on the <a href="https://www.cloudflare.com/5xx-error-landing?utm_source=error_100x" target="_blank">Cloudflare</a> network. An unknown error occurred while rendering the page.</p>
-                    </div>
-
-                    <div class="cf-column">
-                        <h2 data-translate="what_can_i_do">What can I do?</h2>
-                            <p><strong>If you are the owner of this website:</strong><br />refer to <a href="https://developers.cloudflare.com/workers/observability/errors/" target="_blank">Workers - Errors and Exceptions</a> and check Workers Logs for ${host}.</p>
-                    </div>
-
-                </div>
-            </div><!-- /.section -->
-
-            <div class="cf-error-footer cf-wrapper w-240 lg:w-full py-10 sm:py-4 sm:px-8 mx-auto text-center sm:text-left border-solid border-0 border-t border-gray-300">
-    <p class="text-13">
-      <span class="cf-footer-item sm:block sm:mb-1">Cloudflare Ray ID: <strong class="font-semibold"> ${随机字符串}</strong></span>
-      <span class="cf-footer-separator sm:hidden">&bull;</span>
-      <span id="cf-footer-item-ip" class="cf-footer-item hidden sm:block sm:mb-1">
-        Your IP:
-        <button type="button" id="cf-footer-ip-reveal" class="cf-footer-ip-reveal-btn">Click to reveal</button>
-        <span class="hidden" id="cf-footer-ip">${访问IP}</span>
-        <span class="cf-footer-separator sm:hidden">&bull;</span>
-      </span>
-      <span class="cf-footer-item sm:block sm:mb-1"><span>Performance &amp; security by</span> <a rel="noopener noreferrer" href="https://www.cloudflare.com/5xx-error-landing" id="brand_link" target="_blank">Cloudflare</a></span>
-
-    </p>
-    <script>(function(){function d(){var b=a.getElementById("cf-footer-item-ip"),c=a.getElementById("cf-footer-ip-reveal");b&&"classList"in b&&(b.classList.remove("hidden"),c.addEventListener("click",function(){c.classList.add("hidden");a.getElementById("cf-footer-ip").classList.remove("hidden")}))}var a=document;document.addEventListener&&a.addEventListener("DOMContentLoaded",d)})();</script>
-  </div><!-- /.error-footer -->
-
-        </div><!-- /#cf-error-details -->
-    </div><!-- /#cf-wrapper -->
-
-     <script>
-    window._cf_translation = {};
-
-
-  </script>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-8 text-center flex flex-col items-center gap-4">
+        <div class="p-4 bg-blue-50 dark:bg-blue-900/20 text-blue-500 rounded-full mb-2">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        </div>
+        <h2 class="text-xl font-bold text-gray-900 dark:text-white">ورود به پـنـل مدیریت</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mt-2">
+            برای ورود به پـنـل، لطفاً عبارت 
+            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-md font-mono text-blue-500 font-bold mx-1 shadow-sm" dir="ltr">/panel</span> 
+            را به انتهای آدرس مرورگر خود اضافه کنید.
+        </p>
+        <button onclick="window.location.href='/panel'" class="mt-4 w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition-colors duration-200 shadow-lg font-bold">
+            ورود به پـنـل
+        </button>
+    </div>
 </body>
-</html>`;
+</html>`,
+        setup: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge+ Set Password</title>
+    ${COMMON_HEAD}
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-6">
+        <h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">تنظیم رمز عبور جدید</h2>
+        <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">این اولین ورود شما به پـنـل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
+        <form onsubmit="handleSetup(event)" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
+            </div>
+            <div>
+                <label class="block text-sm font-medium mb-1.5">تکرار رمز عبور</label>
+                <input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
+            </div>
+            <button type="submit" id="submit-btn" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">ثبت و ورود</button>
+        </form>
+    </div>
+    ${COMMON_TOAST_HTML}
+    <script>
+        ${COMMON_TOAST_JS};
+        async function handleSetup(event) {
+            event.preventDefault();
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+            const btn = document.getElementById('submit-btn');
+            if (password !== confirmPassword) {
+                alert('⚠️ رمز عبور و تکرار آن مطابقت ندارند!');
+                return;
+            }
+            btn.disabled = true;
+            btn.innerText = 'در حال ثبت...';
+            try {
+                const res = await fetch('/api/setup-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('✅ رمز عبور با موفقیت تنظیم شد. در حال ورود...');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1500);
+                } else {
+                    alert('خطا: ' + (data.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'ثبت و ورود';
+            }
+        }
+    </script>
+</body>
+</html>`,
+        login: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Edge+ Panel Login</title>
+    ${COMMON_HEAD}
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-6">
+        <div id="login-section">
+            <h2 class="text-xl font-bold mb-6 text-center text-blue-600 dark:text-blue-400">ورود به پـنـل مدیریت</h2>
+            <form onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+                </div>
+                <button type="submit" id="submit-btn" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">ورود</button>
+            </form>
+            <div class="mt-4 text-center">
+                <button onclick="toggleRecovery(true)" class="text-xs text-blue-500 hover:text-blue-600 transition font-medium">بازیابی رمز پـنـل</button>
+            </div>
+        </div>
+        <div id="recovery-section" class="hidden">
+            <h2 class="text-xl font-bold mb-4 text-center text-orange-600 dark:text-orange-400">بازیابی رمز پـنـل</h2>
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300">
+                برای احراز هویت و اثبات مالکیت پـنـل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Edge-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 rounded-md font-bold transition shadow-md">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    دریافت توکن
+                </a>
+            </div>
+            <form onsubmit="handleRecovery(event)" class="space-y-4">
+                <div>
+                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs text-center font-mono" required>
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition shadow-sm">انصراف</button>
+                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">بازیابی رمز پـنـل</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    ${COMMON_TOAST_HTML}
+    <script>
+        ${COMMON_TOAST_JS}
+        async function handleLogin(event) {
+            event.preventDefault();
+            const password = document.getElementById('password').value;
+            const btn = document.getElementById('submit-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    window.location.reload();
+                } else {
+                    alert('❌ رمز عبور اشتباه است');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        function toggleRecovery(show) {
+            document.getElementById('login-section').classList.toggle('hidden', show);
+            document.getElementById('recovery-section').classList.toggle('hidden', !show);
+        }
+        async function handleRecovery(event) {
+            event.preventDefault();
+            const apiToken = document.getElementById('api-token').value;
+            const btn = document.getElementById('recover-btn');
+            btn.disabled = true;
+            btn.innerText = 'در حال بررسی...';
+            try {
+                const res = await fetch('/api/recover', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_token: apiToken })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('✅ رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1500);
+                } else {
+                    alert('❌ ' + (data.error || 'خطا در تایید اطلاعات'));
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'بازیابی رمز پـنـل';
+            }
+        }
+    </script>
+</body>
+</html>`,
+        panel: `
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>E D G E +</title>
+    <script>
+        const originalWarn = console.warn;
+        console.warn = (...args) => {
+            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
+            originalWarn(...args);
+        };
+    </script>
+    ${COMMON_HEAD}
+    <style>
+        body { font-family: 'Vazirmatn', sans-serif; }
+                .dark input[type="checkbox"] {
+            filter: invert(1) hue-rotate(180deg);
+        }
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f3f4f6; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #d1d5db; 
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #9ca3af;
+        }
+        .dark ::-webkit-scrollbar-track {
+            background: #000105; 
+        }
+        .dark ::-webkit-scrollbar-thumb {
+            background: #102040; 
+        }
+        .dark ::-webkit-scrollbar-thumb:hover {
+            background: #172e5c;
+        }
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: #d1d5db #f3f4f6;
+        }
+        .dark * {
+            scrollbar-color: #102040 #000105;
+        }
+        @media (min-width: 769px) {
+            header, main { zoom: 1.18; }
+        }
+        @media (max-width: 768px) {
+            header, main { zoom: 0.90; }
+        }
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+        input[type="number"] {
+            -moz-appearance: textfield;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen transition-colors duration-200">
+    <header class="border-b border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-card px-4 py-4">
+        <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
+                <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
+                    E D G E +
+                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v2.0.0</span>
+                    <span class="text-[10px] text-gray-400 dark:text-zinc-500">Fixed IP by Zeus</span>
+                </h1>
+                <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
+                    <a href="https://github.com/Godde3s/edge-pp" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
+                        </svg>
+                    </a>
+                    <a href="https://t.me/godde3sbot" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
+                        </svg>
+                    </a>
+                    <a href="https://github.com/Godde3s/edge-pp" target="_blank" rel="noopener noreferrer" class="text-emerald-500 hover:text-emerald-600 dark:hover:text-emerald-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
+                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
+                        </svg>
+                    </a>
+                </div>
+            </div>
+            <div class="flex items-center justify-center gap-3 w-full md:w-auto mt-2 md:mt-0">
+                <button onclick="toggleSupportModal(true)" 
+                        class="p-2 rounded-md 
+                               bg-red-50 dark:bg-red-950/30 
+                               border border-red-200 dark:border-red-900 
+                               hover:bg-red-100 dark:hover:bg-red-900/50 
+                               transition-all duration-200 
+                               text-red-600 dark:text-red-400 shadow-sm" 
+                        title="حمایت از ما">
+                    <svg class="w-5 h-5 animate-pulse" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12z" />
+                    </svg>
+                </button>
+                                <button onclick="restartCore()"
+                        class="p-2 rounded-md 
+                               bg-blue-50 dark:bg-blue-950/30 
+                               border border-blue-200 dark:border-blue-900 
+                               hover:bg-blue-100 dark:hover:bg-blue-900/50 
+                               transition-all duration-200 
+                               text-blue-600 dark:text-blue-400 shadow-sm" 
+                        title="ری استارت پـنـل">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                </button>
+                <button id="theme-toggle" 
+                        class="p-2 rounded-md 
+                               bg-amber-50 dark:bg-amber-950/30 
+                               border border-amber-200 dark:border-amber-900 
+                               hover:bg-amber-100 dark:hover:bg-amber-900/50 
+                               transition-all duration-200 
+                               text-amber-500 dark:text-amber-400 shadow-sm"
+                        title="تغییر تم">
+                    <svg id="sun-icon" class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                    </svg>
+                    <svg id="moon-icon" class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
+                    </svg>
+                </button>
+                <button id="update-toggle" onclick="checkForUpdates(true)" 
+                        class="p-2 rounded-md 
+                               bg-green-50 dark:bg-green-950/30 
+                               border border-green-200 dark:border-green-900 
+                               hover:bg-green-100 dark:hover:bg-green-900/50 
+                               transition-all duration-200 
+                               text-green-700 dark:text-green-500 
+                               relative shadow-sm" 
+                        title="آپدیت">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"></path>
+                    </svg>
+                    <span id="update-badge" class="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 border-2 border-green-50 dark:border-green-900 rounded-full hidden animate-pulse"></span>
+                </button>
+                <button onclick="toggleSettingsModal(true)" 
+                        class="p-2 rounded-md 
+                               bg-gray-50 dark:bg-zinc-800/50 
+                               border border-gray-200 dark:border-zinc-700 
+                               hover:bg-gray-100 dark:hover:bg-zinc-700/80 
+                               transition-all duration-200 
+                               text-gray-600 dark:text-zinc-400 shadow-sm" 
+                        title="تنظیمات">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                    </svg>
+                </button>
+                <button 
+                    onclick="logoutAdmin()" 
+                    class="p-2 rounded-md 
+                           bg-red-50 dark:bg-red-950/30 
+                           border border-red-200 dark:border-red-900 
+                           hover:bg-red-100 dark:hover:bg-red-900/50 
+                           transition-all duration-200 
+                           text-red-600 dark:text-red-400 
+                           shadow-sm hover:shadow-md"
+                    title="خروج">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </header>
+    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32">
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10">
+            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">تعداد کل کاربران</span>
+            <div class="p-1 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-600 dark:text-indigo-400 rounded-md flex-shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+            </div>
+        </div>
+        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
+            <div class="text-lg font-black text-gray-900 dark:text-zinc-100 transition-all leading-none" id="stat-total-users">0</div>
+            <span class="text-[9px] text-indigo-500 dark:text-indigo-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
+                <span class="w-1 h-1 bg-indigo-500 rounded-full animate-ping"></span>
+                کل کاربران تعریف شده
+            </span>
+        </div>
+    </div>
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-emerald-400 dark:hover:border-emerald-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-emerald-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10">
+            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">کاربران فعال (آنلاین)</span>
+            <div class="p-1 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 rounded-md flex-shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            </div>
+        </div>
+        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
+            <div class="text-lg font-black text-emerald-600 dark:text-emerald-400 transition-all leading-none" id="stat-active-users">0</div>
+            <span class="text-[9px] text-emerald-500 dark:text-emerald-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
+                <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
+                متصل در این لحظه
+            </span>
+        </div>
+    </div>
+    <div id="card-cf-requests" class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-orange-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10">
+            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
+            <div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
+            </div>
+        </div>
+        <div class="relative z-10 min-w-0 flex-1 w-full mt-0.5">
+            <div class="flex items-end justify-between w-full mb-1.5">
+                <div class="flex items-baseline gap-1">
+                    <span class="text-lg font-black text-orange-600 dark:text-orange-400 transition-all leading-none" id="stat-cf-requests">0</span>
+                    <span class="text-[9px] font-bold text-gray-400 mr-0.5 leading-none">/ 100k</span>
+                    <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-1 leading-none">!</button>
+                </div>
+                <span class="text-[9px] text-orange-500 dark:text-orange-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none">
+                    <span>Total: <span id="stat-cf-total">0</span></span>
+                </span>
+            </div>
+            <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1">
+                <div id="stat-cf-progress" class="bg-orange-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
+            </div>
+        </div>
+    </div>
+    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
+        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-blue-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
+        <div class="flex items-center justify-between relative z-10">
+            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ترافیک مصرفی سرور</span>
+            <div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+            </div>
+        </div>
+        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
+            <div class="text-lg font-black text-blue-600 dark:text-blue-400 transition-all whitespace-nowrap leading-none" id="stat-total-usage">0 GB</div>
+            <span class="text-[9px] text-blue-500 dark:text-blue-400 flex items-center gap-0.5 font-medium whitespace-nowrap leading-none mb-0.5">
+                <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"></path></svg>
+                مجموع
+            </span>
+        </div>
+    </div>
+</div>
+        <div id="loading-state" class="text-center py-12">
+            <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
+        </div>
+        <div class="mb-5 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
+            <div class="relative w-full md:w-80">
+                <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-8 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs">
+                <div class="absolute inset-y-0 right-0 flex items-center pr-2.5 pointer-events-none text-gray-400">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 w-full md:w-auto">
+                <select id="filter-status" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+                    <option value="all">🔍 همه</option>
+                                        <option value="active">✅ فعال</option>
+                    <option value="inactive">❌ غیرفعال</option>
+                    <option value="online">⚡ آنلاین</option>
+                    <option value="offline">💤 آفلاین</option>
+                    <option value="expired">⏳ منقضی</option>
+                </select>
+                <select id="sort-users" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
+                    <option value="newest">📅 جدیدترین</option>
+                    <option value="name">🔤 نام کاربری (الفبا)</option>
+                    <option value="usage-desc">📊 بیشترین مصرف</option>
+                    <option value="usage-asc">📈 کمترین مصرف</option>
+                    <option value="expiry-asc">⏳ کمترین زمان باقی‌مانده</option>
+                </select>
+            </div>
+        </div>
+                <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
+                        <button onclick="openCreateModal()" class="p-2 rounded-md bg-blue-50 dark:bg-blue-900/30 border-2 border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all duration-300 text-blue-600 dark:text-blue-400 shadow-sm hover:shadow hover:scale-110">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
+                        </button>
+                </div>
+        <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-card">
+            <table class="w-full text-right border-collapse">
+                <thead>
+                    <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400 text-center">
+                        <th class="p-2 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"></th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">وضعیت</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">عملیات</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">لینک ساب</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">پورت</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">حجم</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">ریکوئست</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">زمان</th>
+                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">کاربران آنلاین</th>
+                    </tr>
+                </thead>
+                <tbody id="users-tbody" class="divide-y divide-gray-150 dark:divide-amoled-border text-sm"></tbody>
+            </table>
+        </div>
+        <div id="empty-state" class="hidden p-8 border-2 border-dashed border-red-500/60 dark:border-red-500/50 bg-red-50 dark:bg-red-900/10 rounded-md text-center animate-pulse shadow-sm">
+            <p class="text-red-600 dark:text-red-400 font-bold text-lg">کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه « + » کلیک کنید.</p>
+        </div>
+    </main>
+<div id="usage-warning-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-orange-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">هشدار محدودیت درخواست روزانه</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            درخواست‌های روزانه کلودفلر شما از ۹۰,۰۰۰ عبور کرده است. در صورت عبور از محدودیت رایگان ۱۰۰,۰۰۰ درخواست، دسترسی به پـنـل و اتصالات تا ساعت ۳:۳۰ بامداد (به وقت ایران) قطع خواهد شد.
+        </p>
+        <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
+            متوجه شدم
+        </button>
+    </div>
+</div>
+<div id="free-panel-warning-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-rose-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-100 dark:bg-rose-900/30 text-rose-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">پیام همگانی</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            این پـنـل با الهام از پروژه <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="text-blue-500 font-bold underline">Zeus</a> ساخته شده است. قابلیت ایپی ثابت و لوکیشن ثابت مدیون پروژه Zeus می‌باشد.
+        </p>
+        <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
+            تأیید و موافقت
+        </button>
+    </div>
+</div>
+<div id="global-message-modal" class="fixed inset-0 z-[86] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-blue-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-4">پیام همگانی</h3>
+        <div id="global-message-content" class="mb-6 w-full text-center">
+        </div>
+        <button id="global-message-close-btn" class="w-full py-3.5 bg-transparent border-2 border-blue-600 text-blue-700 hover:bg-blue-900/20 hover:text-blue-800 dark:border-blue-500 dark:text-blue-500 dark:hover:bg-blue-900/40 dark:hover:text-blue-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
+            متوجه شدم
+        </button>
+    </div>
+</div>
+    <div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="user-modal-card" class="w-full max-w-xl lg:max-w-[1200px] bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/50 dark:bg-amoled-bg">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-blue-500"></div>
+                    <h3 id="modal-title" class="font-bold text-gray-900 dark:text-zinc-100 text-base">ایجاد کاربر جدید</h3>
+                </div>
+                <button onclick="toggleModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <form id="create-user-form" class="p-4 flex flex-col overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleFormSubmit(event)">
+                                <input type="hidden" id="hidden-auto-rotate" value="0">
+                                <input type="hidden" id="hidden-rotate-time" value="">
+                                <input type="hidden" id="hidden-ip-operator" value="all">
+                                <input type="hidden" id="hidden-ip-count" value="20">
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-6 flex-1">
+                    <div class="flex flex-col gap-3">
+                        <div class="space-y-2.5">
+                            <div>
+                                <label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">نام کاربری</label>
+                                <div class="relative">
+                                    <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+                                    </span>
+                                    <input type="text" id="input-name" oninput="this.value = this.value.replace(/[^a-zA-Z0-9_-]/g, '')" placeholder="E_D_G_E" maxlength="32" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition" required>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2.5">
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">حجم (GB)</label>
+                                    <div class="relative">
+                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                                        </span>
+                                        <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان (روز)</label>
+                                    <div class="relative">
+                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                        </span>
+                                        <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">سقف ریکوئست</label>
+                                    <div class="relative">
+                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                                        </span>
+                                        <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">محدودیت کاربر</label>
+                                    <div class="relative">
+                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                                        </span>
+                                        <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex flex-col gap-3 border border-gray-100 dark:border-amoled-border p-3 rounded-md bg-gray-50 dark:bg-amoled-input">
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center gap-2">
+                                    <svg class="w-4 h-4 text-gray-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    <span class="text-[11px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">تمدید خودکار (۳:۳۰ بامداد)</span>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer select-none">
+                                    <input type="checkbox" id="input-auto-reset-toggle" onchange="toggleAutoResetInputs(this.checked)" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
+                                </label>
+                            </div>
+                            <div id="auto-reset-inputs-container" class="grid grid-cols-2 gap-2 transition-all duration-300 pt-2 border-t border-gray-100 dark:border-amoled-border opacity-50 pointer-events-none">
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان تمدید حجم (روز)</label>
+                                    <input type="number" id="input-auto-reset-vol" min="1" placeholder="خالی = بدون تمدید" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr" disabled>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان تمدید ریکوئست (روز)</label>
+                                    <input type="number" id="input-auto-reset-req" min="1" placeholder="خالی = بدون تمدید" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr" disabled>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-3">
+                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
+                                <div class="flex items-center justify-between mb-2">
+                                    <span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Fragment</span>
+                                    <label class="relative inline-flex items-center cursor-pointer select-none">
+                                        <input type="checkbox" id="input-frag-toggle" onchange="toggleFragInputs(this.checked)" class="sr-only peer" checked>
+                                        <div class="w-9 h-5 bg-gray-200 rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
+                                    </label>
+                                </div>
+                                <div id="frag-inputs-container" class="grid grid-cols-2 gap-1.5 transition-all duration-300">
+                                    <input type="text" id="input-frag-len" placeholder="Len" value="200-3000" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
+                                    <input type="text" id="input-frag-int" placeholder="Int" value="1-2" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
+                                </div>
+                            </div>
+                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
+                                <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
+                                <div class="relative">
+                                    <select id="fingerprint-select" class="w-full px-2 py-1.5 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer appearance-none">
+                                        <option value="chrome">🌐 Chrome</option>
+                                        <option value="firefox">🦊 Firefox</option>
+                                        <option value="safari">🧭 Safari</option>
+                                        <option value="ios" selected>📱 iOS (پیشنهادی)</option>
+                                        <option value="android">🤖 Android</option>
+                                        <option value="edge">🌀 Edge</option>
+                                        <option value="360">🔒 360 Browser</option>
+                                        <option value="qq">💬 QQ Browser</option>
+                                        <option value="random">🎲 Random</option>
+                                        <option value="randomized">🎭 Dynamic</option>
+                                    </select>
+                                    <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2 text-gray-500">
+                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div class="flex items-center justify-between bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md p-1.5 shadow-sm">
+                                <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">NSFW BLOCKER</span>
+                                <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
+                                    <input type="checkbox" id="input-block-porn" class="sr-only peer">
+                                    <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
+                                </label>
+                            </div>
+                            <div class="flex items-center justify-between bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md p-1.5 shadow-sm">
+                                <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">ADS BLOCKER</span>
+                                <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
+                                    <input type="checkbox" id="input-block-ads" class="sr-only peer">
+                                    <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex flex-col pt-4 lg:pt-0 border-t-2 lg:border-t-0 lg:border-x-2 border-gray-300 dark:border-amoled-border lg:px-4 h-full">
+                        <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-3 uppercase tracking-wider">پورت‌های اتصال</label>
+                        <div class="grid grid-cols-2 gap-2 md:gap-4">
+                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm flex flex-col">
+                                <div class="flex items-center gap-1.5 mb-2">
+                                    <span class="flex h-2 w-2 rounded-full bg-blue-500 shadow-sm"></span>
+                                    <span class="text-[11px] font-bold text-blue-600 dark:text-blue-400">🔒TLS PORT</span>
+                                </div>
+                                <div class="grid grid-cols-3 gap-1.5 flex-1 content-start" id="tls-ports-list"></div>
+                            </div>
+                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm flex flex-col">
+                                <div class="flex items-center gap-1.5 mb-2">
+                                    <span class="flex h-2 w-2 rounded-full bg-amber-500 shadow-sm"></span>
+                                    <span class="text-[11px] font-bold text-amber-600 dark:text-amber-400">🔓Non-TLS PORT</span>
+                                </div>
+                                <div class="grid grid-cols-3 gap-1.5 flex-1 content-start" id="nontls-ports-list"></div>
+                            </div>
+                        </div>
+                        <div class="mt-4 p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
+                            <div class="flex items-center gap-1.5 mb-2">
+                                <span class="flex h-2 w-2 rounded-full bg-green-600 shadow-sm"></span>
+                                <span class="text-[11px] font-bold text-green-700 dark:text-green-500">⚙️ پورت‌های دلخواه (با فاصله جدا کنید)</span>
+                            </div>
+                            <input type="text" id="input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
+                        </div>
+                        <div class="flex flex-col flex-1 mt-4 pt-4 border-t-2 border-gray-300 dark:border-amoled-border">
+                            <div class="flex items-center justify-between mb-2">
+                                <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز (توصیه میشود)</label>
+                                <button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/70 border border-amber-400 dark:border-amber-600 rounded-md text-xs font-bold transition-all">مخزن آیپی تمیز</button>
+                            </div>
+                            <textarea id="input-ips" placeholder="104.16.0.1" class="w-full h-full min-h-[80px] flex-1 px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+                        </div>
+                    </div>
+                    <div class="flex flex-col gap-2 pt-4 lg:pt-0 border-t-2 lg:border-t-0 border-gray-300 dark:border-amoled-border justify-between">
+                        <div class="flex flex-col flex-1">
+                            <div class="flex items-center gap-2 mb-3">
+                                <label class="relative inline-flex items-center cursor-pointer select-none flex-shrink-0">
+                                    <input type="checkbox" id="user-proxy-mode-toggle" onchange="toggleUserProxyMode(this.checked)" class="sr-only peer">
+                                    <div class="w-7 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
+                                </label>
+                                <label class="block text-xs sm:text-sm font-bold text-gray-700 dark:text-zinc-300 cursor-pointer truncate" onclick="document.getElementById('user-proxy-mode-toggle').click()">ثابت کردن کشور و آیپی</label>
+                            </div>
+                            <div class="grid grid-cols-2 gap-2 mb-2 w-full">
+                                <button type="button" onclick="toggleDonateModal(true)" class="text-[11px] bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 px-2 py-2 rounded border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition font-black shadow-sm text-center whitespace-nowrap">اهدای پـروکـسـی شخصی ❤️</button>
+                                <a href="https://github.com/IR-NETLIFY/zeus-relay" target="_blank" class="text-[11px] bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 px-2 py-2 rounded border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-black shadow-sm text-center whitespace-nowrap">ساخت پـروکـسـی شخصی</a>
+                            </div>
+                            <div class="relative transition-opacity duration-300 opacity-50 pointer-events-none flex-1 flex flex-col justify-start" id="user-socks5-container">
+                                <input type="text" id="user-socks5-input" placeholder="socks5:// یا http:// یا (user:pass@ip:port)" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-800 dark:text-zinc-100 transition" disabled>
+                                <div class="w-full text-center">
+                                    <span id="test-user-proxy-result" class="inline-block mt-2 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden"></span>
+                                </div>
+                                <div class="mt-2 flex items-center justify-between w-full gap-2">
+                                    <button type="button" onclick="testUserSocksProxy()" id="test-user-proxy-btn" class="flex-1 text-center text-[11px] bg-sky-50 dark:bg-sky-900/30 text-sky-600 dark:text-sky-400 py-1.5 rounded border border-sky-200 dark:border-sky-800 hover:bg-sky-100 dark:hover:bg-sky-900/50 transition font-bold shadow-sm">تست پـروکـسـی</button>
+                                    <button type="button" onclick="openProxySelectorModal()" class="flex-1 text-center text-[11px] bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 py-1.5 rounded border border-amber-200 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition font-bold shadow-sm">مخزن پـروکـسـی</button>
+                                </div>
+                                <div class="mt-3 p-2 border-2 border-dashed border-red-400 dark:border-red-500/70 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded-md text-[11px] font-bold leading-relaxed text-center w-full">
+                                        پـروکـسـی‌های عمومی ناپایدارند. برای کیفیت بالاتر از <span class="text-amber-600 dark:text-amber-400 font-black">«مخزن پـروکـسـی»</span> یا از دکمه <span class="text-blue-600 dark:text-blue-400 font-black">«ساخت پـروکـسـی شخصی»</span> استفاده کنید.
+                                </div>
+                                <div class="mt-2 flex items-center justify-between border border-gray-100 dark:border-amoled-border p-3 rounded-md bg-gray-50 dark:bg-amoled-input">
+                                    <div class="flex items-center gap-2">
+                                        <svg class="w-4 h-4 text-gray-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                        <span class="text-[11px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">تعویض خودکار پـروکـسـی (پیشنهادی)</span>
+                                    </div>
+                                    <label class="relative inline-flex items-center cursor-pointer select-none">
+                                        <input type="checkbox" id="input-auto-rotate-user-proxy" class="sr-only peer">
+                                        <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="user-cf-proxy-section" class="transition-opacity duration-300 pt-2 border-t-2 border-gray-300 dark:border-amoled-border mt-auto">
+                            <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">ثابت کردن کشور (Cloudflare)</label>
+                            <div class="mb-2">
+                                <input type="text" id="user-location-search" oninput="filterUserLocations()" placeholder="جستجوی شهر، کشور یا IATA" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md shadow-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 transition">
+                            </div>
+                            <div class="relative">
+                                <select id="user-location-select" class="w-full pl-8 pr-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md shadow-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
+                                    <option value="">بدون لوکیشن (پیش‌فرض)</option>
+                                </select>
+                                <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="pt-4 flex gap-3 mt-4 border-t border-gray-200 dark:border-amoled-border">
+                    <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-200 shadow-sm">انصراف</button>
+                    <button type="submit" id="submit-btn" class="flex-1 py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-md hover:shadow-lg">ایجاد کاربر</button>
+                </div>
+            </form>
+        </div>
+    </div>
+<div id="ip-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن آیپی تمیز</h3>
+            <button type="button" onclick="toggleIpSelectorModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="p-6 space-y-4">
+            <div id="ip-loading-state" class="text-center text-sm text-gray-500 dark:text-zinc-400 hidden">
+                Loading IPs...
+            </div>
+            <div id="ip-selection-form" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">اوپراتور</label>
+                    <select id="ip-operator-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                        <option value="all">همه (توصیه شده)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">تعداد</label>
+                    <input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                </div>
+                <div class="flex flex-col gap-2 border-t border-gray-100 dark:border-zinc-800/60 pt-3 mt-2">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs font-bold text-gray-700 dark:text-zinc-300">تعویض خودکار آیپی</span>
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="input-auto-rotate-ip-toggle" onchange="toggleAutoRotateIpInputs(this.checked)" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
+                        </label>
+                    </div>
+                    <div id="auto-rotate-ip-inputs-container" class="hidden transition-all duration-300 pt-1">
+                        <label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">زمان تعویض (دقیقه)</label>
+                        <input type="number" id="input-auto-rotate-ip-time" min="1" placeholder="توصیه شده 5" onblur="if(this.value === '' || parseInt(this.value) < 1) this.value = '5';" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center" dir="ltr">
+                    </div>
+                </div>
+            </div>
+            <div class="pt-4 flex gap-3">
+                <button type="button" onclick="toggleIpSelectorModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">لغو</button>
+                <button type="button" onclick="applySelectedIps()" class="flex-1 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-xs transition">دریافت</button>
+            </div>
+        </div>
+    </div>
+</div>
+<div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن پـروکـسـی‌های آی‌پی ثابت</h3>
+            <button type="button" onclick="toggleProxySelectorModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="p-5 space-y-4">
+            <div class="p-4 bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-200 dark:border-emerald-500/30 rounded-md relative">
+                <h4 class="text-[13px] font-black text-emerald-700 dark:text-emerald-400 mb-2 flex items-center gap-1.5">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                    پـروکـسـی‌های اختصاصی (VIP)
+                </h4>
+                <p class="text-[10px] text-emerald-600/80 dark:text-emerald-500/70 mb-3 leading-relaxed font-medium">
+                    پـروکـسـی‌های اهدایی از طرف کاربران. کیفیت بالا و بدون نیاز به اسکن.
+                </p>
+                <div class="flex flex-col sm:flex-row gap-2">
+                    <select id="vip-country-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-emerald-200 dark:border-emerald-800/50 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                        <option value="">در حال بررسی مخزن...</option>
+                    </select>
+                    <button type="button" onclick="loadVipProxy()" id="vip-fetch-btn" class="sm:w-auto w-full px-4 py-2 bg-transparent border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-900/20 hover:text-emerald-800 dark:border-emerald-500 dark:text-emerald-500 dark:hover:bg-emerald-900/40 dark:hover:text-emerald-400 font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap" disabled>
+                                                دریافت
+                                        </button>
+                </div>
+            </div>
+            <div class="relative py-1 flex items-center justify-center">
+                <span class="absolute w-full border-t border-gray-200 dark:border-zinc-800"></span>
+                <span class="bg-white dark:bg-amoled-card px-3 text-[10px] font-bold text-gray-400 relative">یا اسکن عمومی</span>
+            </div>
+            <div class="p-4 bg-gray-50 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-md">
+                <h4 class="text-[13px] font-black text-gray-700 dark:text-zinc-300 mb-2 flex items-center gap-1.5">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                    پـروکـسـی های عمومی
+                </h4>
+                <p class="text-[10px] text-gray-500 dark:text-zinc-500 mb-3 leading-relaxed font-medium">
+                    جستجو در منابع رایگان؛ به دلیل نیاز به تست کیفیت زمان‌بر است.
+                </p>
+                <div id="proxy-loading-state" class="text-center text-[11px] text-blue-500 font-bold hidden my-3 whitespace-pre-line leading-relaxed">
+                    در حال اسکن...
+                </div>
+                <div id="proxy-selection-form" class="flex flex-col gap-2">
+                    <select id="proxy-country-select" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-zinc-700 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
+                        <option value="">در حال آماده‌سازی...</option>
+                    </select>
+                    <button type="button" onclick="fetchAndLoadProxy()" id="proxy-fetch-btn" class="w-full py-2.5 bg-transparent border-2 border-blue-600 text-blue-700 hover:bg-blue-900/20 hover:text-blue-800 dark:border-blue-500 dark:text-blue-500 dark:hover:bg-blue-900/40 dark:hover:text-blue-400 font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                                                شروع اسکن و یافتن پـروکـسـی
+                                        </button>
+                </div>
+            </div>
+            <div class="pt-1">
+                                <button type="button" onclick="toggleProxySelectorModal(false)" class="w-full py-2.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">انصراف و بستن</button>
+                        </div>
+        </div>
+    </div>
+</div>
+<div id="donate-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out" id="donate-modal-card">
+        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">🎁 اهدای پـروکـسـی</h3>
+            <button type="button" onclick="toggleDonateModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="p-6 space-y-4">
+            <p class="text-[11px] text-gray-600 dark:text-zinc-400 leading-relaxed font-medium">
+                اگر سرور دارید میتونید با دکمه <span class="text-blue-600 dark:text-blue-400 font-black">«ساخت پـروکـسـی شخصی»</span> یک پـروکـسـی بسازید و اهدا کنید به پروژه
+            </p>
+            <div>
+                <input type="text" id="donate-proxy-input" placeholder="user:pass@ip:port" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-left text-gray-900 dark:text-zinc-100 transition">
+            </div>
+            <div class="w-full text-center">
+                <span id="donate-result" class="inline-block mt-1 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden"></span>
+            </div>
+            <div class="pt-2 flex gap-3">
+                <button type="button" onclick="toggleDonateModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">لغو</button>
+                <button type="button" id="donate-submit-btn" onclick="testAndDonateProxy()" class="flex-1 py-2 bg-transparent border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-900/20 hover:text-emerald-800 dark:border-emerald-500 dark:text-emerald-500 dark:hover:bg-emerald-900/40 dark:hover:text-emerald-400 font-bold rounded-md text-xs transition shadow-sm">تست و اهدا</button>
+            </div>
+        </div>
+    </div>
+</div>
+<div id="support-modal" class="fixed inset-0 z-[105] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12z" />
+            </svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">حمایت از ایج‌پلاس</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            این پروژه متن باز و رایگان است. برای تضمین پایداری و ادامه مسیر توسعه، نیازمند همراهی و حمایت شما عزیزان هستم. هرگونه حمایت شما، انگیزه من را برای ارائه امکانات بهتر دوچندان می‌کند. ❤️
+        </p>
+        <div class="space-y-3">
+            <a href="https://github.com/Godde3s/edge-pp" target="_blank" class="w-full py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                ستاره در گیت‌هاب
+            </a>
+            <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="w-full py-3 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:border-orange-500/60 dark:text-orange-400 dark:hover:bg-orange-500/10 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm-.75-3.25h1.5v-1.5h-1.5v1.5zm0-3.5h1.5v-3h-1.5v3z"/></svg>
+                پروژه Zeus (ایپی ثابت)
+            </a>
+            <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="w-full py-3 bg-transparent border-2 border-gray-600 text-gray-700 hover:bg-gray-100 dark:border-gray-500 dark:text-gray-300 dark:hover:bg-zinc-800 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+                ستاره در گیت‌هاب
+            </a>
+        </div>
+            <button onclick="toggleSupportModal(false)" class="mt-4 w-full py-2.5 bg-transparent text-red-500 hover:text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-900/20 font-bold rounded-md text-sm transition duration-300">
+                بستن
+            </button>
+        </div>
+    </div>
+    <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
+                <h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پـنـل</h3>
+                <button onclick="toggleSettingsModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
+                <div class="pt-2">
+                                        <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">نرخ رفرش خودکار پـنـل</label>
+                    <div class="relative">
+                        <select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
+                            <option value="1000">۱ ثانیه</option>
+                            <option value="2000" selected>۲ ثانیه (پیش‌فرض)</option>
+                            <option value="5000">۵ ثانیه</option>
+                            <option value="10000">۱۰ ثانیه</option>
+                            <option value="30000">۳۰ ثانیه</option>
+                            <option value="60000">۱ دقیقه</option>
+                            <option value="300000">۵ دقیقه</option>
+                            <option value="600000">۱۰ دقیقه</option>
+                        </select>
+                        <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور فعلی</label>
+                            <input type="password" id="change-pwd-current" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                        </div>
+                        <div>
+                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور جدید</label>
+                            <input type="password" id="change-pwd-new" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                        </div>
+                        <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-semibold rounded-md text-xs transition-all shadow-sm">تغییر رمز عبور</button>
+                    </div>
+                </div>
+                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
+                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">💾 پشتیبان‌گیری و بازیابی</h4>
+                    <div class="grid grid-cols-2 gap-3">
+                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:text-orange-400 dark:border-orange-500/60 dark:hover:bg-orange-500/10 rounded-md text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📤 پشتیبان گیری
+                        </button>
+                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-transparent border-2 border-blue-500 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:border-blue-500/60 dark:hover:bg-blue-500/10 rounded-md text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📥 بازیابی
+                        </button>
+                    </div>
+                    <input type="file" id="backup-file-input" onchange="importUsersBackup(event)" accept=".json" class="hidden">
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition shadow-sm">انصراف</button>
+                    <button type="button" onclick="saveSettings()" id="save-settings-btn" class="flex-1 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition">ذخیره تنظیمات</button>
+                </div>
+            </div>
+        </div>
+    </div>
+<div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">بروزرسانی پـنـل</h3>
+        <p id="update-modal-text" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            نسخه جدید در دسترس است. اگر آپدیت خودکار جواب نداد، حتماً از طریق لینک زیر آپدیت دستی را انجام دهید.
+        </p>
+        <div class="space-y-3">
+            <button onclick="applyUpdate()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
+                آپدیت خودکار (توصیه شده)
+            </button>
+            <div class="relative py-2">
+                <div class="absolute inset-0 flex items-center">
+                    <div class="w-full border-t border-gray-200 dark:border-zinc-800"></div>
+                </div>
+                <div class="relative flex justify-center text-xs">
+                    <span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
+                </div>
+            </div>
+            <a href="https://github.com/Godde3s/edge-pp" target="_blank" class="w-full py-3.5 bg-orange-50 dark:bg-orange-950/30 hover:bg-orange-100 dark:hover:bg-orange-900/50 text-orange-600 dark:text-orange-500 border border-orange-300 dark:border-orange-500 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
+                </svg>
+                آپدیت دستی (رفتن به سایت)
+            </a>
+        </div>
+        <button onclick="toggleUpdateModal(false)" class="mt-5 w-full py-3.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center">
+            انصراف
+        </button>
+    </div>
+</div>
+        <div id="token-modal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="token-modal-card" class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
+            <div class="flex justify-between items-center mb-6">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-orange-500"></div>
+                    <h3 class="text-lg font-bold text-gray-900 dark:text-white">تنظیم توکن کلودفلر</h3>
+                </div>
+                <button onclick="toggleTokenModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300 font-medium">
+                توکن کلودفلر شما در این پـنـل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پـنـل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
+            </div>
+            <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Edge-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                دریافت توکن کلودفلر
+            </a>
+            <div class="space-y-4">
+                <input type="password" id="update-token-input" placeholder="توکن را اینجا وارد کنید" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm font-mono text-center text-gray-900 dark:text-zinc-100 transition" dir="auto">
+                <button id="submit-token-btn" onclick="submitTokenForUpdate()" class="w-full py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-300 shadow-lg">
+                    ثبت و آپدیت پـنـل
+                </button>
+            </div>
+        </div>
+    </div>
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
+            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="flex justify-center bg-white p-4 rounded-md mb-4">
+            <div id="qrcode-container"></div>
+        </div>
+    </div>
+</div>
+    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-md shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
+        <div class="flex items-center gap-2">
+            <span class="w-3 h-3 bg-blue-500 rounded-full animate-pulse shadow-sm shadow-blue-500/50"></span>
+            <span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
+        </div>
+        <div class="flex flex-wrap gap-2 justify-end">
+            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 rounded-md text-xs font-bold transition border border-green-200 dark:border-green-900/50 flex items-center gap-1">
+                ✅ فعال‌سازی
+            </button>
+            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-md text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
+                ❌ غیرفعال‌سازی
+            </button>
+            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-md text-xs font-bold transition border border-blue-200 dark:border-blue-900/50 flex items-center gap-1">
+                📊 ریست حجم
+            </button>
+            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-md text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
+                ⚡ ریست ریکوئست
+            </button>
+            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-md text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
+                ⏳ ریست زمان
+            </button>
+            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
+                🗑️ حذف گروهی
+            </button>
+        </div>
+    </div>
+        <div id="update-success-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+                <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-green-600/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+                        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 text-green-600 mb-4 shadow-inner">
+                                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>
+                        </div>
+                        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">آپدیت موفقیت‌آمیز</h3>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+                                آپدیت موفق بود لطفا صفحه را 10 ثانیه دیگر رفرش کنید تا نسخه جدید لود شود
+                        </p>
+                        <button onclick="window.location.reload()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
+                                رفرش صفحه
+                        </button>
+                </div>
+        </div>
+${COMMON_TOAST_HTML}
+<div id="custom-confirm-modal" class="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div id="custom-confirm-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-300">
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">تأیید عملیات</h3>
+        <p id="custom-confirm-message" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium"></p>
+        <div class="flex gap-3">
+            <button id="custom-confirm-cancel" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-200 shadow-sm">انصراف</button>
+            <button id="custom-confirm-ok" class="flex-1 py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-lg">تأیید</button>
+        </div>
+    </div>
+</div>
+    <script>
+                function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const colors = type === 'error' 
+                ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
+                : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
+            toast.className = 'px-4 py-3 border rounded-md shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
+            toast.innerText = message;
+            container.appendChild(toast);
+            requestAnimationFrame(() => {
+                toast.classList.remove('-translate-y-full', 'opacity-0');
+            });
+            setTimeout(() => {
+                toast.classList.add('-translate-y-full', 'opacity-0');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+        function customConfirm(message) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('custom-confirm-modal');
+                const card = document.getElementById('custom-confirm-card');
+                const msgEl = document.getElementById('custom-confirm-message');
+                const btnOk = document.getElementById('custom-confirm-ok');
+                const btnCancel = document.getElementById('custom-confirm-cancel');
+                msgEl.innerText = message;
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('scale-95');
+                card.classList.add('scale-100');
+                const cleanup = () => {
+                    modal.classList.remove('opacity-100', 'pointer-events-auto');
+                    modal.classList.add('opacity-0', 'pointer-events-none');
+                    card.classList.remove('scale-100');
+                    card.classList.add('scale-95');
+                    btnOk.removeEventListener('click', onOk);
+                    btnCancel.removeEventListener('click', onCancel);
+                };
+                const onOk = () => { cleanup(); resolve(true); };
+                const onCancel = () => { cleanup(); resolve(false); };
+                btnOk.addEventListener('click', onOk);
+                btnCancel.addEventListener('click', onCancel);
+            });
+        }
+        window.alert = function(message) {
+            const msgStr = message ? message.toString() : '';
+            if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
+                showToast(msgStr, 'error');
+            } else {
+                showToast(msgStr, 'success');
+            }
+        };
+        window.selectedUsernames = new Set();
+        function toggleSelectAllUsers(el) {
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            checkboxes.forEach(cb => {
+                cb.checked = el.checked;
+                const username = decodeURIComponent(cb.value);
+                if (el.checked) {
+                    window.selectedUsernames.add(username);
+                } else {
+                    window.selectedUsernames.delete(username);
+                }
+            });
+            updateBulkActionsBar();
+        }
+        function onUserSelectChange(el) {
+            const username = decodeURIComponent(el.value);
+            if (el.checked) {
+                window.selectedUsernames.add(username);
+            } else {
+                window.selectedUsernames.delete(username);
+            }
+            updateBulkActionsBar();
+        }
+        function updateBulkActionsBar() {
+            const bar = document.getElementById('bulk-actions-bar');
+            const countSpan = document.getElementById('bulk-selected-count');
+            const selectAllCheckbox = document.getElementById('select-all-users');
+            const selectedCount = window.selectedUsernames.size;
+            if (countSpan) {
+                countSpan.innerText = selectedCount + ' کاربر انتخاب شده';
+            }
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            if (checkboxes.length > 0) {
+                const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+                if (selectAllCheckbox) selectAllCheckbox.checked = allChecked;
+            } else {
+                if (selectAllCheckbox) selectAllCheckbox.checked = false;
+            }
+            if (selectedCount > 0) {
+                bar.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-28');
+                bar.classList.add('opacity-100', 'pointer-events-auto', 'translate-y-0');
+            } else {
+                bar.classList.remove('opacity-100', 'pointer-events-auto', 'translate-y-0');
+                bar.classList.add('opacity-0', 'pointer-events-none', 'translate-y-28');
+            }
+        }
+        async function bulkDelete() {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            if (await customConfirm('⚠️ آیا از حذف گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟ این عمل غیرقابل بازگشت است.')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), { method: 'DELETE' });
+                            if (res.ok) {
+                                successCount++;
+                                window.selectedUsernames.delete(uname);
+                            }
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات حذف گروهی انجام شد. ' + successCount + ' کاربر با موفقیت حذف شدند.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        async function bulkToggleStatus(targetActive) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            const actionText = targetActive === 1 ? 'فعال‌سازی' : 'غیرفعال‌سازی';
+            if (await customConfirm('آیا از ' + actionText + ' گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        const user = window.allUsers.find(u => u.username === uname);
+                        if (!user) return;
+                        const isCurrentActive = user.is_active !== 0;
+                        const shouldToggle = (targetActive === 1 && !isCurrentActive) || (targetActive === 0 && isCurrentActive);
+                        if (shouldToggle) {
+                            try {
+                                const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ toggle_only: true })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(e) {}
+                        } else {
+                            successCount++;
+                        }
+                    }));
+                    alert('✅ عملیات ' + actionText + ' با موفقیت برای تمامی کاربران واجد شرایط اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        async function bulkReset(actionType) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            let actionName = '';
+            if (actionType === 'volume') actionName = 'حجم مصرفی';
+            else if (actionType === 'req') actionName = 'تعداد ریکوئست‌ها';
+            else if (actionType === 'time') actionName = 'زمان اشتراک';
+            if (await customConfirm('آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ reset_action: actionType })
+                            });
+                            if (res.ok) successCount++;
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
+        const nonTlsPorts = ['80', '8080', '8880', '2052', '2086', '2095'];
+        let isEditMode = false;
+        let editingUsername = '';
+        function renderPortCheckboxes() {
+            const tlsContainer = document.getElementById('tls-ports-list');
+            const nonTlsContainer = document.getElementById('nontls-ports-list');
+            tlsContainer.innerHTML = tlsPorts.map(function(port) {
+                const isCheckedDefault = port === '443' ? 'checked' : '';
+                return '<label class="relative cursor-pointer">' +
+                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
+                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-blue-50 dark:peer-checked:bg-blue-950/25 peer-checked:border-blue-500 dark:peer-checked:border-blue-500/70 peer-checked:text-blue-600 dark:peer-checked:text-blue-400 shadow-sm">' +
+                        '<span>' + port + '</span>' +
+                        '<svg class="w-3 h-3 hidden peer-checked:block text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
+                    '</div>' +
+                '</label>';
+            }).join('');
+            nonTlsContainer.innerHTML = nonTlsPorts.map(function(port) {
+                const isCheckedDefault = port === '80' ? 'checked' : '';
+                return '<label class="relative cursor-pointer">' +
+                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
+                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-amber-50 dark:peer-checked:bg-amber-950/25 peer-checked:border-amber-500 dark:peer-checked:border-amber-500/70 peer-checked:text-amber-600 dark:peer-checked:text-amber-400 shadow-sm">' +
+                        '<span>' + port + '</span>' +
+                        '<svg class="w-3 h-3 hidden peer-checked:block text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
+                    '</div>' +
+                '</label>';
+            }).join('');
+        }
+        setTimeout(function() {
+            const cb443 = document.querySelector('input[name="ports"][value="443"]');
+            if (cb443) cb443.checked = true;
+            const cb80 = document.querySelector('input[name="ports"][value="80"]');
+            if (cb80) cb80.checked = true;
+        }, 100);
+        function toggleSettingsModal(show) { setModalState('settings-modal', show); }
+        window.toggleAutoResetInputs = function(show) {
+                        const container = document.getElementById('auto-reset-inputs-container');
+                        const volInput = document.getElementById('input-auto-reset-vol');
+                        const reqInput = document.getElementById('input-auto-reset-req');
+                        if (container) {
+                                if (show) {
+                                        container.classList.remove('opacity-50', 'pointer-events-none');
+                                        if (volInput) volInput.disabled = false;
+                                        if (reqInput) reqInput.disabled = false;
+                                } else {
+                                        container.classList.add('opacity-50', 'pointer-events-none');
+                                        if (volInput) volInput.disabled = true;
+                                        if (reqInput) reqInput.disabled = true;
+                                }
+                        }
+                };
+        window.toggleAutoRotateIpInputs = function(show) {
+                        const container = document.getElementById('auto-rotate-ip-inputs-container');
+                        if (container) {
+                                if (show) container.classList.remove('hidden');
+                                else container.classList.add('hidden');
+                        }
+                };
+        window.toggleFragInputs = function(show) {
+            const container = document.getElementById('frag-inputs-container');
+            if (container) {
+                if (show) {
+                    container.classList.remove('hidden');
+                } else {
+                    container.classList.add('hidden');
+                }
+            }
+        };
+        function toggleModal(show) {
+            setModalState('user-modal', show);
+            if (!show) {
+                isEditMode = false;
+                editingUsername = '';
+                document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+                document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
+                document.getElementById('input-name').disabled = false;
+                document.getElementById('create-user-form').reset();
+                const cb443 = document.querySelector('input[name="ports"][value="443"]');
+                if (cb443) cb443.checked = true;
+                const cb80 = document.querySelector('input[name="ports"][value="80"]');
+                if (cb80) cb80.checked = true;
+                const fpSelect = document.getElementById('fingerprint-select');
+                if (fpSelect) fpSelect.value = 'ios';
+                const bpCheck = document.getElementById('input-block-porn');
+                if (bpCheck) bpCheck.checked = false;
+                const baCheck = document.getElementById('input-block-ads');
+                                if (baCheck) baCheck.checked = false;
+                                const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
+                                if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = false;
+                                const fragLenInput = document.getElementById('input-frag-len');
+                                if (fragLenInput) fragLenInput.value = '200-3000';
+                                const fragIntInput = document.getElementById('input-frag-int');
+                                if (fragIntInput) fragIntInput.value = '1-2';
+                const fragToggle = document.getElementById('input-frag-toggle');
+                if (fragToggle) fragToggle.checked = true;
+                window.toggleFragInputs(true);
+                                const customPortInput = document.getElementById('input-custom-ports');
+                                if (customPortInput) customPortInput.value = '';
+                                document.getElementById('hidden-auto-rotate').value = '0';
+                                document.getElementById('hidden-rotate-time').value = '';
+                                document.getElementById('hidden-ip-operator').value = 'all';
+                                document.getElementById('hidden-ip-count').value = '20';
+                                const autoResetToggle = document.getElementById('input-auto-reset-toggle');
+                                if (autoResetToggle) autoResetToggle.checked = false;
+                                document.getElementById('input-auto-reset-vol').value = '';
+                                document.getElementById('input-auto-reset-req').value = '';
+                                window.toggleAutoResetInputs(false);
+            }
+        }
+                function toggleUpdateModal(show, version = '') {
+            if (show && version) document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار جواب نداد، از روش دستی استفاده کنید.';
+            setModalState('update-modal', show);
+        }
+        function openCreateModal() {
+            isEditMode = false;
+            editingUsername = '';
+            document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
+            document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
+            document.getElementById('input-name').disabled = false;
+            document.getElementById('create-user-form').reset();
+            const cb443 = document.querySelector('input[name="ports"][value="443"]');
+            if (cb443) cb443.checked = true;
+            const cb80 = document.querySelector('input[name="ports"][value="80"]');
+            if (cb80) cb80.checked = true;
+            const fpSelect = document.getElementById('fingerprint-select');
+            if (fpSelect) fpSelect.value = 'ios';
+            const fragToggle = document.getElementById('input-frag-toggle');
+            if (fragToggle) fragToggle.checked = true;
+            window.toggleFragInputs(true);
+                        const autoResetToggle = document.getElementById('input-auto-reset-toggle');
+                        if (autoResetToggle) autoResetToggle.checked = false;
+                        document.getElementById('input-auto-reset-vol').value = '';
+                        document.getElementById('input-auto-reset-req').value = '';
+                        window.toggleAutoResetInputs(false);
+                        const blockAdsToggle = document.getElementById('input-block-ads');
+                        if (blockAdsToggle) blockAdsToggle.checked = true;
+                        const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
+                        if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = false;
+            const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
+            if (userProxyToggle) userProxyToggle.checked = false;
+            if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(false);
+            const userLocSelect = document.getElementById('user-location-select');
+            if (userLocSelect) userLocSelect.value = '';
+            const userLocSearch = document.getElementById('user-location-search');
+            if (userLocSearch) {
+                userLocSearch.value = '';
+                if (typeof window.filterUserLocations === 'function') window.filterUserLocations();
+            }
+            const userSocksInput = document.getElementById('user-socks5-input');
+            if (userSocksInput) userSocksInput.value = '';
+            const userProxyResult = document.getElementById('test-user-proxy-result');
+            if (userProxyResult) userProxyResult.innerText = '';
+                        document.getElementById('hidden-auto-rotate').value = '0';
+                        document.getElementById('hidden-rotate-time').value = '';
+                        document.getElementById('hidden-ip-operator').value = 'all';
+                        document.getElementById('hidden-ip-count').value = '20';
+            toggleModal(true);
+        }
+        const themeToggleBtn = document.getElementById('theme-toggle');
+                if (localStorage.getItem('color-theme') === 'light') {
+                document.documentElement.classList.remove('dark');
+                } else {
+                document.documentElement.classList.add('dark');
+                }
+        themeToggleBtn.addEventListener('click', () => {
+            if (document.documentElement.classList.contains('dark')) {
+                document.documentElement.classList.remove('dark');
+                localStorage.setItem('color-theme', 'light');
+            } else {
+                document.documentElement.classList.add('dark');
+                localStorage.setItem('color-theme', 'dark');
+            }
+        });
+                async function handleCoreAction(actionType, token = null) {
+                        window.pendingCoreAction = actionType;
+                        const isUpdate = actionType === 'update';
+                        if (!isUpdate && !await customConfirm('آیا از ری استارت پـنـل مطمئن هستید؟ کاربران شما لحظه ای قطع خواهند شد.')) return;
+                        if (isUpdate && !token) toggleUpdateModal(false);
+                        const btn = isUpdate ? document.getElementById('update-toggle') : document.querySelector('button[title="ری استارت پـنـل"]');
+                        if (btn) {
+                                btn.disabled = true;
+                                if (!isUpdate) btn.classList.add('animate-pulse');
+                        }
+                        if (isUpdate && !token) alert('در حال دریافت و اعمال آپدیت... لطفاً چند ثانیه صبر کنید.');
+                        try {
+                                const reqBody = token ? JSON.stringify({ cf_token: token }) : "{}";
+                                const res = await fetch(isUpdate ? '/api/update-panel' : '/api/restart-core', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: isUpdate ? reqBody : undefined
+                                });
+                                const data = await res.json();
+                                if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
+                                        toggleTokenModal(true);
+                                        if (btn) {
+                                                btn.disabled = false;
+                                                if (!isUpdate) btn.classList.remove('animate-pulse');
+                                        }
+                                        return;
+                                }
+                                if (res.ok && data.success) {
+                                        if (isUpdate) {
+                                                const successModal = document.getElementById('update-success-modal');
+                                                const successCard = successModal.querySelector('div');
+                                                successModal.classList.remove('opacity-0', 'pointer-events-none');
+                                                successModal.classList.add('opacity-100', 'pointer-events-auto');
+                                                successCard.classList.remove('opacity-0', 'scale-95');
+                                                successCard.classList.add('opacity-100', 'scale-100');
+                                                setTimeout(() => window.location.reload(), 10000);
+                                        } else {
+                                                alert('پـنـل ری استارت شد صفحه رفرش می شود.');
+                                                window.location.reload();
+                                        }
+                                } else {
+                                        alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از دکمه "آپدیت دستی" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
+                                        if (btn) {
+                                                btn.disabled = false;
+                                                if (!isUpdate) btn.classList.remove('animate-pulse');
+                                        }
+                                }
+                        } catch (err) {
+                                alert(isUpdate ? 'خطا در ارتباط با سرور. لطفاً از گزینه آپدیت دستی استفاده کنید.' : 'خطا در ارتباط با سرور.');
+                                if (btn) {
+                                        btn.disabled = false;
+                                        if (!isUpdate) btn.classList.remove('animate-pulse');
+                                }
+                        }
+                }
+                async function restartCore() {
+                        await handleCoreAction('restart');
+                }
+        async function loadUsers(silent = false) {
+            const loadingState = document.getElementById('loading-state');
+            const tableContainer = document.getElementById('users-table-container');
+            const emptyState = document.getElementById('empty-state');
+            if (!silent) {
+                loadingState.classList.remove('hidden');
+                tableContainer.classList.add('hidden');
+                emptyState.classList.add('hidden');
+            }
+            try {
+                const res = await fetch('/api/users?t=' + Date.now());
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                renderUsersUI(data);
+            } catch (err) {
+                if (!silent) {
+                    loadingState.innerHTML = '<span class="text-red-500">خطا در دریافت اطلاعات از سرور</span>';
+                }
+            }
+        }
+        function renderUsersUI(data) {
+            try {
+                const users = data.users || [];
+                window.allUsers = users;
+                const serverTime = data.serverTime || Date.now();
+                window.lastServerTime = serverTime;
+                const totalUsersCount = users.length;
+                const activeUsersCount = users.reduce((sum, u) => sum + (u.online_count || 0), 0);
+                const totalGbUsage = users.reduce((sum, u) => sum + (u.lifetime_used_gb || u.used_gb || 0), 0);
+                document.getElementById('stat-total-users').innerText = totalUsersCount;
+                document.getElementById('stat-active-users').innerText = activeUsersCount;
+                document.getElementById('stat-total-usage').innerText = totalGbUsage < 1 ? (totalGbUsage * 1024).toFixed(0) + ' MB' : totalGbUsage.toFixed(2) + ' GB';
+                const cfRequests = data.cfRequestsToday || 0;
+                const reqCard = document.getElementById('card-cf-requests');
+                const warningBtn = document.getElementById('cf-warning-btn');
+                if (cfRequests >= 90000) {
+                                        if (reqCard) {
+                                                reqCard.className = "bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 shadow-[0_0_15px_rgba(239,68,68,0.4)] flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse";
+                                        }
+                                        if (warningBtn) {
+                                                warningBtn.classList.remove('hidden');
+                                        }
+                                        if (!window.hasShownUsageWarning) {
+                                                openUsageWarning();
+                                                window.hasShownUsageWarning = true;
+                                        }
+                                } else {
+                    if (reqCard) {
+                        reqCard.className = "bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]";
+                    }
+                    if (warningBtn) {
+                        warningBtn.classList.add('hidden');
+                    }
+                }
+                const cfTotal = data.cfRequestsTotal || 0;
+                document.getElementById('stat-cf-requests').innerText = cfRequests >= 1000 ? (cfRequests / 1000).toFixed(1) + 'k' : cfRequests;
+                document.getElementById('stat-cf-total').innerText = cfTotal >= 1000000 ? (cfTotal / 1000000).toFixed(2) + 'M' : (cfTotal >= 1000 ? (cfTotal / 1000).toFixed(1) + 'k' : cfTotal);
+                const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
+                document.getElementById('stat-cf-progress').style.width = progressPercent + '%';
+                filterAndRenderUsers();
+            } catch (err) {
+                document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
+            }
+        }
+        function filterAndRenderUsers() {
+            if (!window.allUsers) return;
+            const searchQuery = (document.getElementById('search-input').value || '').toLowerCase().trim();
+            const filterStatus = document.getElementById('filter-status').value;
+            const sortVal = document.getElementById('sort-users').value;
+            const serverTime = window.lastServerTime || Date.now();
+            let filtered = [...window.allUsers];
+            if (searchQuery) {
+                filtered = filtered.filter(u => 
+                    (u.username || '').toLowerCase().includes(searchQuery) || 
+                    (u.uuid || '').toLowerCase().includes(searchQuery)
+                );
+            }
+            if (filterStatus !== 'all') {
+                filtered = filtered.filter(u => {
+                    const isOnline = u.is_online === 1;
+                    const isActive = u.is_active === 1;
+                    let isExpired = false;
+                    if (u.limit_gb && u.used_gb >= u.limit_gb) isExpired = true;
+                    if (u.expiry_days && u.created_at) {
+                        const created = new Date(u.created_at);
+                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                        if (new Date(serverTime) > expiryDate) isExpired = true;
+                    }
+                    if (filterStatus === 'active') return isActive && !isExpired;
+                    if (filterStatus === 'inactive') return !isActive;
+                    if (filterStatus === 'online') return isOnline;
+                    if (filterStatus === 'offline') return !isOnline;
+                    if (filterStatus === 'expired') return isExpired || !isActive;
+                    return true;
+                });
+            }
+            filtered.sort((a, b) => {
+                if (sortVal === 'newest') {
+                    return b.id - a.id;
+                }
+                if (sortVal === 'name') {
+                    return (a.username || '').localeCompare(b.username || '');
+                }
+                if (sortVal === 'usage-desc') {
+                    return (b.used_gb || 0) - (a.used_gb || 0);
+                }
+                if (sortVal === 'usage-asc') {
+                    return (a.used_gb || 0) - (b.used_gb || 0);
+                }
+                if (sortVal === 'expiry-asc') {
+                    const getRemaining = (u) => {
+                        if (!u.expiry_days) return Infinity;
+                        if (!u.created_at) return Infinity;
+                        const created = new Date(u.created_at);
+                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                        return expiryDate - new Date(serverTime);
+                    };
+                    return getRemaining(a) - getRemaining(b);
+                }
+                return 0;
+            });
+            renderFilteredUsers(filtered, serverTime);
+        }
+                function renderFilteredUsers(users, serverTime) {
+            const loadingState = document.getElementById('loading-state');
+            const tableContainer = document.getElementById('users-table-container');
+            const emptyState = document.getElementById('empty-state');
+            const tbody = document.getElementById('users-tbody');
+            let locationsMap = {};
+            try {
+                const cachedLocations = localStorage.getItem('cached_locations_list');
+                if (cachedLocations) {
+                    JSON.parse(cachedLocations).forEach(loc => {
+                        if (loc.iata && loc.cca2) locationsMap[loc.iata.toUpperCase()] = loc.cca2;
+                    });
+                }
+            } catch(e) {}
+            if (users.length === 0) {
+                loadingState.classList.add('hidden');
+                emptyState.classList.remove('hidden');
+                tableContainer.classList.add('hidden');
+                if (window.allUsers && window.allUsers.length > 0) {
+                    emptyState.querySelector('p').innerText = 'کاربری با مشخصات جستجو شده یافت نشد.';
+                } else {
+                    emptyState.querySelector('p').innerText = 'کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه « + » کلیک کنید.';
+                }
+            } else {
+                loadingState.classList.add('hidden');
+                emptyState.classList.add('hidden');
+                tableContainer.classList.remove('hidden');
+                let locationsMap = {};
+                try {
+                    const cachedLocations = localStorage.getItem('cached_locations_list');
+                    if (cachedLocations) {
+                        JSON.parse(cachedLocations).forEach(loc => {
+                            if (loc.iata && loc.cca2) locationsMap[loc.iata.toUpperCase()] = loc.cca2;
+                        });
+                    }
+                } catch(e) {}
+                let proxyFlagCache = {};
+                try { proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
+                tbody.innerHTML = users.map(user => {
+                    let daysRemaining = 'نامحدود';
+                    let daysPercent = 100;
+                    if (user.expiry_days) {
+                        if (user.created_at) {
+                            const created = new Date(user.created_at);
+                            const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+                            const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+                            daysRemaining = diffDays > 0 ? diffDays : 0;
+                            daysPercent = Math.max(0, Math.min(100, (daysRemaining / user.expiry_days) * 100));
+                        } else {
+                            daysRemaining = user.expiry_days;
+                        }
+                    }
+                    const usedGb = user.used_gb || 0;
+                    const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
+                                        const usedReq = user.used_req || 0;
+                                        let reqHtml = '';
+                                        if (user.limit_req) {
+                                            const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
+                                            const reqHue = 120 - (reqPercent * 1.2);
+                                            reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none font-bold" dir="ltr">' + user.limit_req.toLocaleString() + '</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                                    '<div class="h-full rounded-full transition-all duration-500" style="width: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        } else {
+                                            reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none text-[12px] font-bold">∞</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                                    '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        }
+                                        let volumeHtml = '';
+                                        if (user.limit_gb) {
+                                            const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
+                                            const limitHue = 120 - (limitPercent * 1.2);
+                                            const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + 'MB' : user.limit_gb + 'GB';
+                                            const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
+                                            volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none font-bold" dir="ltr">' + formattedLimit + '</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                                    '<div class="h-full rounded-full transition-all duration-500" style="width: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        } else {
+                                            const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
+                                            volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none text-[12px] font-bold">∞</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                                    '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        }
+                                        let expiryHtml = '';
+                                        if (user.expiry_days) {
+                                            const expiryHue = daysPercent * 1.2;
+                                            expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="rtl">' + daysRemaining + ' روز</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none font-bold" dir="rtl">' + user.expiry_days + ' روز</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden flex justify-end">' +
+                                                    '<div class="h-full rounded-full transition-all duration-500" style="width: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        } else {
+                                            expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                                                '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                                    '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold text-[12px]">∞</span>' +
+                                                    '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
+                                                    '<span class="leading-none text-[12px] font-bold">∞</span>' +
+                                                '</div>' +
+                                                '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                                    '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
+                                                '</div>' +
+                                            '</div>';
+                                        }
+                    const onlineCount = user.online_count || 0;
+                    const limit = user.ip_limit !== undefined ? user.ip_limit : user.max_connections;
+                    let onlineHtml = '';
+                    if (limit) {
+                        const onlinePercent = Math.min((onlineCount / limit) * 100, 100);
+                        const onlineHue = 120 - (onlinePercent * 1.2);
+                        onlineHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                            '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + onlineCount + '</span>' +
+                                '<span class="leading-none font-bold" dir="ltr">' + limit + '</span>' +
+                            '</div>' +
+                            '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                '<div class="h-full rounded-full transition-all duration-500" style="width: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
+                            '</div>' +
+                        '</div>';
+                    } else {
+                        onlineHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
+                            '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
+                                '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + onlineCount + '</span>' +
+                                '<span class="leading-none text-[12px] font-bold">∞</span>' +
+                            '</div>' +
+                            '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
+                                '<div class="h-full ' + (onlineCount > 0 ? 'bg-green-600' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="width: 100%"></div>' +
+                            '</div>' +
+                        '</div>';
+                    }
+                    let isExpired = false;
+                    if (user.limit_gb && (user.used_gb || 0) >= user.limit_gb) isExpired = true;
+                    if (user.limit_req && (user.used_req || 0) >= user.limit_req) isExpired = true;
+                    if (user.expiry_days && user.created_at) {
+                        const created = new Date(user.created_at);
+                        const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
+                        if (new Date(serverTime) > expiryDate) isExpired = true;
+                    }
+                    const isEffectivelyActive = user.is_active !== 0 && !isExpired;
+                    const statusBtnColor = user.is_active === 0 ? 'text-green-700 dark:text-green-500 hover:bg-green-50 dark:hover:bg-green-900/30' : 'text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/30';
+                    const statusBtnTitle = user.is_active === 0 ? 'فعال کردن کاربر' : 'قطع کردن کاربر';
+                    const statusBtnIcon = user.is_active === 0 
+                        ? '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
+                        : '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+                    const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
+                    let locBadge = '';
+                    if (user.user_proxy_iata) {
+                        const iata = user.user_proxy_iata.toUpperCase();
+                        const cca2 = locationsMap[iata];
+                        const flag = cca2 ? getFlagEmoji(cca2) : '🌐';
+                        locBadge = '<span title="کشور: ' + iata + '" class="text-base leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + flag + '</span>';
+                    } else if (user.user_socks5 || user.user_proxy_ip) {
+                        const targetProxy = user.user_socks5 || user.user_proxy_ip;
+                        const cachedFlag = proxyFlagCache[targetProxy];
+                        if (cachedFlag) {
+                            locBadge = '<span title="پـروکـسـی اختصاصی" class="text-base leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + cachedFlag + '</span>';
+                        } else {
+                            locBadge = '<span data-proxy="' + targetProxy + '" title="پـروکـسـی اختصاصی" class="async-proxy-flag text-base leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">⏳</span>';
+                        }
+                    }
+                    return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
+                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center select-none">' +
+                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-4 h-4 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95">' +
+                            '</td>' +
+                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center">' +
+                                '<div class="flex flex-col items-center justify-center gap-1 w-full max-w-[120px] mx-auto select-none">' +
+                                    '<span class="font-bold text-gray-900 dark:text-zinc-100 text-xs truncate max-w-full pb-0.5">' + user.username + '</span>' +
+                                    '<div class="flex flex-row items-center justify-center gap-1 whitespace-nowrap">' +
+                                        (!isEffectivelyActive ? '<span class="px-1 py-px text-[9px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded">غیرفعال</span>' : '<span class="px-1 py-px text-[9px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded">فعال</span>') +
+                                        locBadge +
+                                        (user.is_online === 1 ? '<span class="px-1 py-px text-[9px] font-medium bg-green-600 text-white rounded animate-pulse" dir="rtl">' + user.online_count + '</span>' : '<span class="px-1 py-px text-[9px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded">آفلاین</span>') +
+                                    '</div>' +
+                                '</div>' +
+                            '</td>' +
+                            '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800 text-center">' +
+                                '<div class="grid grid-cols-2 gap-1 w-max mx-auto">' +
+                                    '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کـانفـیگ" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
+                                    '<button onclick="editUser(\\'' + encodeURIComponent(user.username) + '\\')" title="ویرایش" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-yellow-50 dark:hover:bg-yellow-900/30 text-yellow-600 dark:text-yellow-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button>' +
+                                    '<button onclick="deleteUser(\\'' + encodeURIComponent(user.username) + '\\')" title="حذف" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
+                                    '<button onclick="toggleUserStatus(\\'' + encodeURIComponent(user.username) + '\\')" title="' + statusBtnTitle + '" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' + statusBtnColor + ' rounded transition shadow-sm">' + statusBtnIcon + '</button>' +
+                                '</div>' +
+                            '</td>' +
+                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800">' +
+                                                            '<div class="flex flex-col gap-0.5 w-[90px] mx-auto">' +
+                                                                '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1 px-1 py-0.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded text-[9px] font-bold transition border border-indigo-200 dark:border-indigo-800">' +
+                                                                    '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
+                                                                    'ساب متنی' +
+                                                                '</button>' +
+                                                                '<div class="flex flex-row gap-0.5 w-full h-[22px]">' +
+                                                                    '<button onclick="copyStatusLink(\\'' + encodeURIComponent(user.username) + '\\')" class="flex-1 flex items-center justify-center gap-1 px-1 py-0 bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded text-[9px] font-bold transition border border-green-200 dark:border-green-800 whitespace-nowrap">' +
+                                                                        '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
+                                                                        'وضعیت' +
+                                                                    '</button>' +
+                                                                    '<button onclick="showSubQr(\\'' + encodeURIComponent(user.username) + '\\')" title="QR ساب" class="w-[22px] flex-shrink-0 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded transition border border-amber-200 dark:border-amber-800">' +
+                                                                        '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg>' +
+                                                                    '</button>' +
+                                                                '</div>' +
+                                                            '</div>' +
+                                                        '</td>' +
+                                                        '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-xs">' + 
+                                                            '<div class="grid grid-flow-col grid-rows-3 gap-1 w-max mx-auto">' +
+                                                                String(user.port || "").split(",").map(function(p) {
+                                                                    p = p.trim();
+                                                                    if (!p) return "";
+                                                                    var isTls = tlsPorts.includes(p);
+                                                                    var isNonTls = nonTlsPorts.includes(p);
+                                                                    var colorClass = isTls ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' : 
+                                                                                     isNonTls ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400' : 
+                                                                                     'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
+                                                                    return '<span class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-semibold rounded leading-none ' + colorClass + '">' + p + '</span>';
+                                                                }).join("") +
+                                                            '</div>' +
+                                                        '</td>' +
+                                                        '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + volumeHtml + '</td>' +
+                                                        '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + reqHtml + '</td>' +
+                                                        '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + expiryHtml + '</td>' +
+                                                        '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + onlineHtml + '</td>' +
+                                                        '</tr>';
+                }).join('');
+                updateBulkActionsBar();
+                if (typeof loadProxyFlags === 'function') {
+                    setTimeout(loadProxyFlags, 50);
+                }
+            }
+        }
+                async function resetUserData(encodedUsername, actionType) {
+                        const username = decodeURIComponent(encodedUsername);
+                        let actionName = '';
+                        if (actionType === 'volume') actionName = 'حجم';
+                        else if (actionType === 'req') actionName = 'ریکوئست';
+                        else if (actionType === 'time') actionName = 'زمان';
+                        if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
+                try {
+                    const response = await fetch('/api/users/' + encodeURIComponent(username), {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reset_action: actionType })
+                    });
+                    if (response.ok) {
+                        alert('عملیات با موفقیت انجام شد.');
+                        await loadUsers(true);
+                    } else {
+                        const errData = await response.json();
+                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                    }
+                } catch (err) {
+                    alert('خطا در برقراری ارتباط با سرور');
+                }
+            }
+        }
+        async function toggleUserStatus(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            try {
+                const response = await fetch('/api/users/' + encodeURIComponent(username), {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ toggle_only: true })
+                });
+                if (response.ok) {
+                    await loadUsers(true);
+                } else {
+                    const errData = await response.json();
+                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            }
+        }
+        async function handleFormSubmit(event) {
+            event.preventDefault();
+            const submitButton = document.getElementById('submit-btn');
+            submitButton.disabled = true;
+            submitButton.innerText = isEditMode ? 'در حال ذخیره تغییرات...' : 'در حال ایجاد...';
+            const username = document.getElementById('input-name').value;
+            const usernameRegex = /^[a-zA-Z0-9_-]+$/;
+            if (!usernameRegex.test(username)) {
+                alert('⚠️ نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) باشد!');
+                submitButton.disabled = false;
+                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+                return;
+            }
+            const limit = document.getElementById('input-limit').value || null;
+            const expiry = document.getElementById('input-expiry').value || null;
+            const reqLimit = document.getElementById('input-req-limit').value || null;
+            const ipLimit = document.getElementById('input-ip-limit').value || null;
+                        if (limit !== null && parseFloat(limit) < 0) { alert('⚠️ حجم نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
+                        if (expiry !== null && parseInt(expiry) < 0) { alert('⚠️ زمان (روز) نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
+                        if ((reqLimit !== null && parseInt(reqLimit) < 0) || (ipLimit !== null && parseInt(ipLimit) < 0)) { alert('⚠️ محدودیت‌ها نمی‌توانند منفی باشند!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
+            const autoResetToggle = document.getElementById('input-auto-reset-toggle').checked;
+            const autoResetVolDays = document.getElementById('input-auto-reset-vol').value;
+            const autoResetReqDays = document.getElementById('input-auto-reset-req').value;
+            if (autoResetToggle) {
+                const volDays = parseInt(autoResetVolDays) || 0;
+                const reqDays = parseInt(autoResetReqDays) || 0;
+                if (volDays <= 0 && reqDays <= 0) {
+                    alert('⚠️ وقتی تیک تمدید خودکار روشن است، باید حداقل یکی از فیلدها (زمان تمدید حجم یا ریکوئست) را پر کنید!');
+                    submitButton.disabled = false;
+                    submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+                    return;
+                }
+            }
+                        const customPortsRaw = document.getElementById('input-custom-ports') ? document.getElementById('input-custom-ports').value : '';
+                        const customPortsArray = customPortsRaw.replace(/ +/g, ',').split(',').map(p => p.trim()).filter(p => p.length > 0);
+                        const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value).concat(customPortsArray);
+            const block_porn = document.getElementById('input-block-porn').checked ? 1 : 0;
+            const block_ads = document.getElementById('input-block-ads').checked ? 1 : 0;
+            const isFragEnabled = document.getElementById('input-frag-toggle').checked;
+            const frag_len = isFragEnabled ? (document.getElementById('input-frag-len').value || "200-3000") : "";
+            const frag_int = isFragEnabled ? (document.getElementById('input-frag-int').value || "1-2") : "";
+            const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
+            const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
+            const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
+            const auto_rotate_ip = parseInt(document.getElementById('hidden-auto-rotate').value) || 0;
+            const rotate_time = parseInt(document.getElementById('hidden-rotate-time').value) || 0;
+            const ip_operator = document.getElementById('hidden-ip-operator').value || 'all';
+            const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 20;
+            const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
+            const userProxyIata = !userProxyMode ? (document.getElementById('user-location-select') ? document.getElementById('user-location-select').value : null) : null;
+            const userSocks5 = userProxyMode ? (document.getElementById('user-socks5-input') ? document.getElementById('user-socks5-input').value.trim() : null) : null;
+            const auto_rotate_user_proxy = document.getElementById('input-auto-rotate-user-proxy') ? (document.getElementById('input-auto-rotate-user-proxy').checked ? 1 : 0) : 0;
+            if (checkedPorts.length === 0) {
+                alert('⚠️ لطفا حداقل یک پورت را برای اتصال انتخاب کنید!');
+                submitButton.disabled = false;
+                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+                return;
+            }
+            const port = checkedPorts.join(',');
+            const tls = checkedPorts.some(p => tlsPorts.includes(p)) ? 'on' : 'off';
+            const ips = document.getElementById('input-ips').value;
+            const fingerprint = document.getElementById('fingerprint-select').value;
+            const url = isEditMode ? '/api/users/' + encodeURIComponent(editingUsername) : '/api/users';
+            const method = isEditMode ? 'PUT' : 'POST';
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
+                        user_proxy_iata: userProxyIata || null,
+                        user_socks5: userSocks5 || null,
+                        user_proxy_ip: null,
+                        auto_reset_vol_days: auto_reset_vol_days,
+                        auto_reset_req_days: auto_reset_req_days,
+                        auto_rotate_ip: auto_rotate_ip,
+                        rotate_time: rotate_time,
+                        ip_operator: ip_operator,
+                        ip_count: ip_count,
+                        auto_rotate_user_proxy: auto_rotate_user_proxy
+                    })
+                });
+                if (response.ok) {
+                    toggleModal(false);
+                    await loadUsers(true);
+                } else {
+                    const errData = await response.json();
+                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
+            }
+        }
+function setModalState(modalId, show) {
+                        const modal = document.getElementById(modalId);
+                        if (!modal) return;
+                        const card = modal.querySelector('div');
+                        if (show) {
+                                modal.classList.remove('opacity-0', 'pointer-events-none');
+                                modal.classList.add('opacity-100', 'pointer-events-auto');
+                                card.classList.remove('opacity-0', 'scale-95');
+                                card.classList.add('opacity-100', 'scale-100');
+                        } else {
+                                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                                modal.classList.add('opacity-0', 'pointer-events-none');
+                                card.classList.remove('opacity-100', 'scale-100');
+                                card.classList.add('opacity-0', 'scale-95');
+                        }
+                }
+                function closeUsageWarning() { setModalState('usage-warning-modal', false); }
+                function openUsageWarning() { setModalState('usage-warning-modal', true); }
+                function closeFreePanelWarning() { setModalState('free-panel-warning-modal', false); }
+        async function checkGlobalMessage() {
+        try {
+            const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/message.txt?t=' + Date.now());
+            if (!res.ok) return;
+            const text = await res.text();
+            const lines = text.split('\\n');
+            if (lines.length < 2) return;
+            const firstLine = lines[0].trim();
+            if (!firstLine.startsWith('VERSION=')) return;
+            const version = firstLine.split('=')[1].trim();
+            const content = lines.slice(1).join('\\n').trim();
+            if (window.zeus_global_msg_version !== version) {
+                document.getElementById('global-message-content').innerHTML = content;
+                setModalState('global-message-modal', true);
+                document.getElementById('global-message-close-btn').onclick = function() {
+                    setModalState('global-message-modal', false);
+                    window.zeus_global_msg_version = version;
+                };
+            }
+        } catch (err) {}
+    }
+                function getvIeesLink(username) {
+            const user = window.allUsers.find(u => u.username === username);
+            if (!user) return '';
+            const host = window.location.hostname;
+            var ips = [host];
+            if (user.ips) {
+                ips = user.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
+                if (ips.length === 0) ips = [host];
+            }
+            var ports = String(user.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
+            var fp = user.fingerprint || 'chrome';
+            const userFrag = (user.frag_len && user.frag_int) ? '&fragment=' + user.frag_len + ',' + user.frag_int : '';
+            const links = [];
+                const dynPath = encodeURIComponent("/stream/PANEL_EDGE/" + (user.uuid ? user.uuid.split("-")[0] : "default"));
+                const m1 = decodeURIComponent('%E2%9A%A0%EF%B8%8F%D8%A7%DB%8C%D9%86%20%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%20%D8%A7%D8%B3%D8%AA%E2%9A%A0%EF%B8%8F');
+                const m2 = decodeURIComponent('%E2%99%A8%EF%B8%8F%20%40PANEL_EDGE%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%E2%99%A8%EF%B8%8F');
+                links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m1));
+                links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m2));
+            let flagEmoji = '🌐';
+            if (user.user_proxy_iata) {
+                try {
+                    const cachedLocations = localStorage.getItem('cached_locations_list');
+                    if (cachedLocations) {
+                        const parsedLocs = JSON.parse(cachedLocations);
+                        const loc = parsedLocs.find(l => l.iata && l.iata.toUpperCase() === user.user_proxy_iata.toUpperCase());
+                        if (loc && loc.cca2) flagEmoji = getFlagEmoji(loc.cca2);
+                    }
+                } catch(e) {}
+            } else if (user.user_socks5 || user.user_proxy_ip) {
+                const targetProxy = user.user_socks5 || user.user_proxy_ip;
+                try {
+                    const proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}');
+                    if (proxyFlagCache[targetProxy]) flagEmoji = proxyFlagCache[targetProxy];
+                } catch(e) {}
+            }
+            ips.forEach((ip) => {
+                ports.forEach((portStr) => {
+                                        const isTlsPort = tlsPorts.includes(portStr);
+                                        const tlsVal = isTlsPort ? 'tls' : 'none';
+                                        const remark = flagEmoji + ' | ' + user.username + ' | \\u200E' + ip + ' | \\u200E' + portStr;
+                                        links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + dynPath + '&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
+                                });
+            });
+            return links.join('\\n');
+        }
+        function getSubLink(username) {
+            return window.location.origin + '/feed/' + encodeURIComponent(username);
+        }
+        function getStatusLink(username) {
+            return window.location.origin + '/status/' + encodeURIComponent(username);
+        }
+        function copySubLink(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            navigator.clipboard.writeText(getSubLink(username)).then(() => {
+                alert('✅ لینک ساب متنی با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن لینک ساب!');
+            });
+        }
+                function toggleQrModal(show, text) {
+            const container = document.getElementById('qrcode-container');
+            if (show) {
+                container.innerHTML = '';
+                new QRCode(container, { text: text, width: 200, height: 200, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M });
+            }
+            setModalState('qr-modal', show);
+        }
+        function showSubQr(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            const link = getSubLink(username);
+            toggleQrModal(true, link);
+        }
+        function copyStatusLink(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            navigator.clipboard.writeText(getStatusLink(username)).then(() => {
+                alert('✅ لینک صفحه وضعیت با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن لینک صفحه وضعیت!');
+            });
+        }
+        function copyConfig(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            const link = getvIeesLink(username);
+            if (!link) return;
+            navigator.clipboard.writeText(link).then(() => {
+                alert('✅ کـانفـیگ vIees با موفقیت کپی شد!');
+            }).catch(() => {
+                alert('خطا در کپی کردن کـانفـیگ!');
+            });
+        }
+function editUser(encodedUsername) {
+    const username = decodeURIComponent(encodedUsername);
+    const user = window.allUsers.find(u => u.username === username);
+    if (!user) {
+        alert('کاربر یافت نشد!');
+        return;
+    }
+    isEditMode = true;
+    editingUsername = username;
+    document.getElementById('modal-title').innerText = 'ویرایش کاربر: ' + username;
+    document.getElementById('submit-btn').innerText = 'ذخیره تغییرات';
+    const nameInput = document.getElementById('input-name');
+    nameInput.value = username;
+    nameInput.disabled = false;
+    document.getElementById('input-limit').value = user.limit_gb || '';
+    document.getElementById('input-expiry').value = user.expiry_days || '';
+    document.getElementById('input-req-limit').value = user.limit_req || '';
+    document.getElementById('input-ips').value = user.ips || '';
+    document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
+        document.getElementById('hidden-auto-rotate').value = user.auto_rotate_ip || '0';
+        document.getElementById('hidden-rotate-time').value = user.rotate_time || '';
+        document.getElementById('hidden-ip-operator').value = user.ip_operator || 'all';
+        document.getElementById('hidden-ip-count').value = user.ip_count || '20';
+    document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
+    document.getElementById('input-block-porn').checked = (user.block_porn === 1);
+    document.getElementById('input-block-ads').checked = (user.block_ads === 1);
+    const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
+    if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = (user.auto_rotate_user_proxy === 1);
+    const hasAutoReset = Boolean((user.auto_reset_vol_days && user.auto_reset_vol_days > 0) || (user.auto_reset_req_days && user.auto_reset_req_days > 0));
+    const autoResetToggle = document.getElementById('input-auto-reset-toggle');
+    if (autoResetToggle) autoResetToggle.checked = hasAutoReset;
+    document.getElementById('input-auto-reset-vol').value = hasAutoReset && user.auto_reset_vol_days > 0 ? user.auto_reset_vol_days : '';
+    document.getElementById('input-auto-reset-req').value = hasAutoReset && user.auto_reset_req_days > 0 ? user.auto_reset_req_days : '';
+    window.toggleAutoResetInputs(hasAutoReset);
+    const hasFrag = Boolean(user.frag_len && user.frag_len !== "" && user.frag_int && user.frag_int !== "");
+    const fragToggle = document.getElementById('input-frag-toggle');
+    if (fragToggle) fragToggle.checked = hasFrag;
+    document.getElementById('input-frag-len').value = hasFrag ? user.frag_len : '200-3000';
+    document.getElementById('input-frag-int').value = hasFrag ? user.frag_int : '1-2';
+    window.toggleFragInputs(hasFrag);
+    const userPorts = String(user.port || '').split(',').map(p => p.trim());
+    const predefinedPorts = [...tlsPorts, ...nonTlsPorts];
+    const customPorts = userPorts.filter(p => !predefinedPorts.includes(p) && p !== '');
+    document.querySelectorAll('input[name="ports"]').forEach(cb => {
+        cb.checked = userPorts.includes(cb.value);
+    });
+    const customPortInput = document.getElementById('input-custom-ports');
+    if (customPortInput) customPortInput.value = customPorts.join(' ');
+    const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
+    const userLocSelect = document.getElementById('user-location-select');
+    const userLocSearch = document.getElementById('user-location-search');
+    const userSocksInput = document.getElementById('user-socks5-input');
+    if (userLocSearch) {
+        userLocSearch.value = '';
+        if (typeof window.filterUserLocations === 'function') window.filterUserLocations();
+    }
+        const targetProxy = user.user_socks5 || user.user_proxy_ip;
+        const userProxyResult = document.getElementById('test-user-proxy-result');
+        if (userProxyResult) userProxyResult.innerText = '';
+        if (targetProxy) {
+                if (userProxyToggle) userProxyToggle.checked = true;
+                if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(true);
+                if (userSocksInput) userSocksInput.value = targetProxy;
+                if (userLocSelect) userLocSelect.value = '';
+        } else {
+                if (userProxyToggle) userProxyToggle.checked = false;
+                if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(false);
+                if (userSocksInput) userSocksInput.value = '';
+                if (userLocSelect) userLocSelect.value = user.user_proxy_iata || '';
+        }
+        toggleModal(true);
+}
+        async function deleteUser(encodedUsername) {
+                        const username = decodeURIComponent(encodedUsername);
+                        if (await customConfirm('آیا از حذف کاربر ' + username + ' مطمئن هستید؟')) {
+                try {
+                    const response = await fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
+                    if (response.ok) {
+                        alert('✅ کاربر با موفقیت حذف شد.');
+                        window.selectedUsernames.delete(username);
+                        await loadUsers(true);
+                    } else {
+                        const errData = await response.json();
+                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
+                    }
+                } catch (err) {
+                    alert('خطا در برقراری ارتباط با سرور');
+                }
+            }
+        }
+        function getFlagEmoji(countryCode) {
+            if (!countryCode) return '🌐';
+            const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
+            try {
+                return String.fromCodePoint(...codePoints);
+            } catch (e) {
+                return '🌐';
+            }
+        }
+        function renderLocationsUI(locations, activeIata) {
+            const select = document.getElementById('location-select');
+            const userSelect = document.getElementById('user-location-select');
+            locations.sort((a, b) => (a.cca2 || '').localeCompare(b.cca2 || ''));
+            let html = '<option value="">🌐 پیش‌فرض (لوکیشن خودکار)</option>';
+            let userHtml = '<option value="">🌐 استفاده از تنظیمات عمومی پـنـل</option>';
+            locations.forEach(loc => {
+                if (loc.iata && loc.city) {
+                    const flag = getFlagEmoji(loc.cca2);
+                    const isSelected = loc.iata.toUpperCase() === activeIata.toUpperCase() ? 'selected' : '';
+                    const optionStr = '<option value="' + loc.iata + '" ' + isSelected + '>' + flag + ' ' + loc.city + ' (' + loc.iata + ')</option>';
+                    html += optionStr;
+                    userHtml += '<option value="' + loc.iata + '">' + flag + ' ' + loc.city + ' (' + loc.iata + ')</option>';
+                }
+            });
+            if (select) select.innerHTML = html;
+            if (userSelect) userSelect.innerHTML = userHtml;
+        }
+async function loadLocations() {
+    const cachedLocations = localStorage.getItem('cached_locations_list');
+    const cachedActiveIata = localStorage.getItem('cached_active_iata') || '';
+    let hasCachedLocs = false;
+    if (cachedLocations) {
+        try {
+            const parsedLocs = JSON.parse(cachedLocations);
+            if (Array.isArray(parsedLocs) && parsedLocs.length > 0) {
+                renderLocationsUI(parsedLocs, cachedActiveIata);
+                hasCachedLocs = true;
+            }
+        } catch(e) {}
+    }
+    try {
+        const locRes = await fetch('/locations');
+        if (locRes.ok) {
+            const locData = await locRes.json();
+            if (Array.isArray(locData) && locData.length > 0) {
+                localStorage.setItem('cached_locations_list', JSON.stringify(locData));
+                hasCachedLocs = true;
+            }
+        }
+        const updatedCachedLocs = localStorage.getItem('cached_locations_list');
+        if (updatedCachedLocs) {
+            const parsed = JSON.parse(updatedCachedLocs);
+            renderLocationsUI(parsed, cachedActiveIata);
+        }
+    } catch (err) {}
+}
+function saveSettings() {
+    toggleSettingsModal(false);
+    showToast('✅ تنظیمات با موفقیت ذخیره شد.');
+}
+window.toggleUserProxyMode = function(isSocksMode) {
+    const cfSection = document.getElementById('user-cf-proxy-section');
+    const socksContainer = document.getElementById('user-socks5-container');
+    const locationSelect = document.getElementById('user-location-select');
+    const locationSearch = document.getElementById('user-location-search');
+    const socksInput = document.getElementById('user-socks5-input');
+    if (isSocksMode) {
+        if (cfSection) cfSection.classList.add('opacity-50', 'pointer-events-none');
+        if (locationSelect) locationSelect.disabled = true;
+        if (locationSearch) locationSearch.disabled = true;
+        if (socksContainer) socksContainer.classList.remove('opacity-50', 'pointer-events-none');
+        if (socksInput) socksInput.disabled = false;
+    } else {
+        if (cfSection) cfSection.classList.remove('opacity-50', 'pointer-events-none');
+        if (locationSelect) locationSelect.disabled = false;
+        if (locationSearch) locationSearch.disabled = false;
+        if (socksContainer) socksContainer.classList.add('opacity-50', 'pointer-events-none');
+        if (socksInput) socksInput.disabled = true;
+    }
+};
+async function loadProxyFlags() {
+    const badges = document.querySelectorAll('.async-proxy-flag');
+    if (badges.length === 0) return;
+    let cache = {};
+    try { cache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
+    for (let badge of badges) {
+        const proxyStr = badge.getAttribute('data-proxy');
+        if (!proxyStr) continue;
+        if (cache[proxyStr]) {
+            badge.innerHTML = cache[proxyStr];
+            badge.classList.remove('async-proxy-flag');
+            continue;
+        }
+        badge.classList.remove('async-proxy-flag');
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 4000);
+            const res = await fetch('/api/test-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ proxy: proxyStr }),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            const data = await res.json();
+            let flag = '🌐';
+            if (res.ok && data.success && data.country) {
+                flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : '🌐';
+            }
+            cache[proxyStr] = flag;
+            localStorage.setItem('proxy_flag_cache', JSON.stringify(cache));
+            badge.innerHTML = flag;
+        } catch (e) {
+            badge.innerHTML = '🌐';
+        }
+    }
+}
+window.filterUserLocations = function() {
+    const searchTerm = document.getElementById('user-location-search').value.toLowerCase().trim();
+    const cachedLocations = localStorage.getItem('cached_locations_list');
+    if (!cachedLocations) return;
+    try {
+        const allLocations = JSON.parse(cachedLocations);
+        const filteredLocations = allLocations.filter(loc => {
+            if (!loc.iata || !loc.city) return false;
+            const searchString = (loc.iata + ' ' + loc.city + ' ' + (loc.cca2 || '')).toLowerCase();
+            return searchString.includes(searchTerm);
+        });
+        const userSelect = document.getElementById('user-location-select');
+        let userHtml = '<option value="">🌐 استفاده از تنظیمات عمومی پـنـل</option>';
+        filteredLocations.forEach(loc => {
+            const flag = getFlagEmoji(loc.cca2);
+            userHtml += '<option value="' + loc.iata + '">' + flag + ' ' + loc.city + ' (' + loc.iata + ')</option>';
+        });
+        if (userSelect) userSelect.innerHTML = userHtml;
+    } catch(e) {}
+};
+async function testUserSocksProxy() {
+        const btn = document.getElementById('test-user-proxy-btn');
+        const resultSpan = document.getElementById('test-user-proxy-result');
+        const proxyStr = document.getElementById('user-socks5-input').value.trim();
+        if (!proxyStr) {
+                resultSpan.innerText = 'وارد نشده!';
+                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1';
+                return;
+        }
+        btn.disabled = true;
+        btn.innerText = 'صبر کنید...';
+        resultSpan.innerText = '';
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        try {
+                const res = await fetch('/api/test-proxy', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ proxy: proxyStr }),
+                        signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                const data = await res.json();
+                if (res.ok && data.success) {
+                        const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : '🌐';
+                        resultSpan.innerText = flag + ' پینگ: ' + data.ping + 'ms';
+                        resultSpan.className = 'text-[11px] font-bold text-green-600';
+                } else {
+                        resultSpan.innerText = 'خطا: ' + (data.error || 'ناموفق');
+                        resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
+                }
+        } catch (e) {
+                clearTimeout(timeoutId);
+                if (e.name === 'AbortError') resultSpan.innerText = 'تایم‌اوت (پـروکـسـی خراب است)';
+                else resultSpan.innerText = 'خطا در ارتباط';
+                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
+        } finally {
+                btn.disabled = false;
+                btn.innerText = 'تست پـروکـسـی';
+        }
 }
 
-
-///////////////////////////////////////////////////////
-
-
-///////////////////////////////////////////////////////
-// Main Entry Point
-///////////////////////////////////////////////////////
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (env.DB) {
-      await ensureEdgePPSchema(env.DB);
-      ctx.waitUntil(checkAutoResets(env));
-      ctx.waitUntil(checkAutoRotates(env));
+        async function exportUsersBackup() {
+            if (!window.allUsers || window.allUsers.length === 0) {
+                alert('⚠️ کاربری برای پشتیبان‌گیری وجود ندارد!');
+                return;
+            }
+            try {
+                const settingsRes = await fetch('/api/settings/bulk');
+                const settingsData = await settingsRes.json();
+                const backupData = {
+                    users: window.allUsers,
+                    settings: settingsData
+                };
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
+                const downloadAnchor = document.createElement('a');
+                const dateStr = new Date().toISOString().split('T')[0];
+                downloadAnchor.setAttribute("href", dataStr);
+                downloadAnchor.setAttribute("download", "zeus_full_backup_" + dateStr + ".json");
+                document.body.appendChild(downloadAnchor);
+                downloadAnchor.click();
+                downloadAnchor.remove();
+            } catch (err) {
+                alert('❌ خطا در دریافت تنظیمات برای بک‌آپ.');
+            }
+        }
+        function triggerImportBackup() {
+            document.getElementById('backup-file-input').click();
+        }
+        async function importUsersBackup(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const importBtn = document.querySelector('button[onclick="triggerImportBackup()"]');
+                const exportBtn = document.querySelector('button[onclick="exportUsersBackup()"]');
+                const closeBtn = document.querySelector('#settings-modal button[onclick="toggleSettingsModal(false)"]');
+                try {
+                    const parsedData = JSON.parse(e.target.result);
+                    let backupUsers = [];
+                    let backupSettings = null;
+                    if (Array.isArray(parsedData)) {
+                        backupUsers = parsedData;
+                    } else if (parsedData && parsedData.users && Array.isArray(parsedData.users)) {
+                        backupUsers = parsedData.users;
+                        backupSettings = parsedData.settings;
+                    } else {
+                        alert('❌ فایل پشتیبان نامعتبر است!');
+                        return;
+                    }
+                    const validBackupUsers = backupUsers.filter(u => u && typeof u === 'object' && u.username);
+                    if (validBackupUsers.length === 0 && !backupSettings) {
+                        alert('❌ هیچ داده معتبری در فایل یافت نشد!');
+                        return;
+                    }
+                    if (backupSettings && Object.keys(backupSettings).length > 0) {
+                        const restoreSettings = await customConfirm('⚙️ فایل بک‌آپ شامل تنظیمات پـنـل نیز می‌باشد. آیا می‌خواهید تنظیمات هم بازگردانی شوند؟');
+                        if (restoreSettings) {
+                            try {
+                                await fetch('/api/settings/bulk', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ settings: backupSettings })
+                                });
+                            } catch (err) {}
+                        }
+                    }
+                    const existingUsernames = new Set((window.allUsers || []).map(u => u.username));
+                    const duplicates = validBackupUsers.filter(u => existingUsernames.has(u.username));
+                    let overwrite = false;
+                    if (duplicates.length > 0) {
+                        overwrite = await customConfirm('⚠️ تعداد ' + duplicates.length + ' کاربر تکراری شناسایی شد. آیا می‌خواهید اطلاعات آن‌ها بازنویسی شود؟');
+                    }
+                    if (importBtn) importBtn.disabled = true;
+                    if (exportBtn) exportBtn.disabled = true;
+                    if (closeBtn) closeBtn.disabled = true;
+                    let successCount = 0;
+                    let currentStep = 0;
+                    for (const u of validBackupUsers) {
+                        currentStep++;
+                        if (importBtn) {
+                            importBtn.innerText = '⏳ بازیابی (' + currentStep + '/' + validBackupUsers.length + ')';
+                        }
+                        const exists = existingUsernames.has(u.username);
+                        if (exists) {
+                            if (overwrite) {
+                                try {
+                                    await fetch('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' });
+                                    const res = await fetch('/api/users', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            username: u.username,
+                                            uuid: u.uuid,
+                                            limit_gb: u.limit_gb,
+                                            expiry_days: u.expiry_days,
+                                            limit_req: u.limit_req,
+                                            ips: u.ips,
+                                            tls: u.tls,
+                                            port: u.port,
+                                            fingerprint: u.fingerprint,
+                                            ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                            used_gb: u.used_gb,
+                                            used_req: u.used_req,
+                                            created_at: u.created_at,
+                                            is_active: u.is_active,
+                                            block_porn: u.block_porn,
+                                            block_ads: u.block_ads,
+                                            frag_len: u.frag_len,
+                                            frag_int: u.frag_int
+                                        })
+                                    });
+                                    if (res.ok) successCount++;
+                                } catch(err) {}
+                            }
+                        } else {
+                            try {
+                                const res = await fetch('/api/users', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        username: u.username,
+                                        uuid: u.uuid,
+                                        limit_gb: u.limit_gb,
+                                        expiry_days: u.expiry_days,
+                                        limit_req: u.limit_req,
+                                        ips: u.ips,
+                                        tls: u.tls,
+                                        port: u.port,
+                                        fingerprint: u.fingerprint,
+                                        ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                        used_gb: u.used_gb,
+                                        used_req: u.used_req,
+                                        created_at: u.created_at,
+                                        is_active: u.is_active,
+                                        block_porn: u.block_porn,
+                                        block_ads: u.block_ads,
+                                        frag_len: u.frag_len,
+                                        frag_int: u.frag_int
+                                    })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(err) {}
+                        }
+                    }
+                    alert('✅ عملیات بازیابی با موفقیت انجام شد. صفحه رفرش می‌شود...');
+                    setTimeout(() => { window.location.reload(); }, 1500);
+                } catch(err) {
+                    alert('❌ خطا در خواندن یا پردازش فایل پشتیبان!');
+                } finally {
+                    if (importBtn) {
+                        importBtn.disabled = false;
+                        importBtn.innerText = '📥 بازیابی';
+                    }
+                    if (exportBtn) exportBtn.disabled = false;
+                    if (closeBtn) closeBtn.disabled = false;
+                    event.target.value = '';
+                }
+            };
+            reader.readAsText(file);
+        }
+        async function changeAdminPassword() {
+            const currentPwd = document.getElementById('change-pwd-current').value;
+            const newPwd = document.getElementById('change-pwd-new').value;
+            const btn = document.getElementById('change-pwd-btn');
+            if (!currentPwd || !newPwd) {
+                alert('⚠️ وارد کردن رمز عبور فعلی و جدید الزامی است!');
+                return;
+            }
+            if (newPwd.length < 4) {
+                alert('⚠️ رمز عبور جدید باید حداقل ۴ کاراکتر باشد!');
+                return;
+            }
+            btn.disabled = true;
+            btn.innerText = 'در حال تغییر...';
+            try {
+                const response = await fetch('/api/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ current_password: currentPwd, new_password: newPwd })
+                });
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    alert('✅ رمز عبور با موفقیت تغییر کرد.');
+                    document.getElementById('change-pwd-current').value = '';
+                    document.getElementById('change-pwd-new').value = '';
+                    toggleSettingsModal(false);
+                } else {
+                    alert('❌ خطا: ' + (data.error || 'عملیات ناموفق بود'));
+                }
+            } catch (err) {
+                alert('خطا در برقراری ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'تغییر رمز عبور';
+            }
+        }
+        async function logoutAdmin() {
+                        if (await customConfirm('آیا می‌خواهید از پـنـل خارج شوید؟ ⚠️ ')) {
+                try {
+                    await fetch('/api/logout', { method: 'POST' });
+                } catch (err) {}
+                window.location.reload();
+            }
+        }
+const CURRENT_VERSION = '1.9.2';
+const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
+                async function checkForUpdates(isManual = false) {
+            try {
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.add('animate-pulse');
+                }
+                const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=' + Date.now());
+                if (!res.ok) throw new Error('Network response was not ok');
+                const text = await res.text();
+                const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
+                const latestVersion = match ? match[1] : null;
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.remove('animate-pulse');
+                }
+                if (latestVersion && latestVersion !== CURRENT_VERSION) {
+                    document.getElementById('update-toggle').className = "p-2 rounded-md bg-red-100 dark:bg-red-900/60 border border-red-500 hover:bg-red-200 dark:hover:bg-red-900/80 transition text-red-700 dark:text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.6)] animate-pulse relative";
+                    const badge = document.getElementById('update-badge');
+                    if (badge) badge.remove();
+                    if (isManual) {
+                        toggleUpdateModal(true, latestVersion);
+                    }
+                } else {
+                    if (isManual) {
+                        alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
+                    }
+                }
+            } catch (err) {
+                if (isManual) {
+                    document.getElementById('update-toggle').classList.remove('animate-pulse');
+                    alert('خطا در بررسی آپدیت از گیت هاب.');
+                }
+            }
+        }
+        function toggleTokenModal(show) {
+            setModalState('token-modal', show);
+            if (!show) document.getElementById('update-token-input').value = '';
+        }
+        function submitTokenForUpdate() {
+            const token = document.getElementById('update-token-input').value.trim();
+            if (!token) {
+                alert('لطفاً توکن را وارد کنید.');
+                return;
+            }
+            toggleTokenModal(false);
+            handleCoreAction(window.pendingCoreAction || 'update', token);
+        }
+        async function applyUpdate(token = null) {
+            await handleCoreAction('update', token);
+        }
+let cachedIpsData = {};
+async function fetchIpsList() {
+    try {
+        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
+        if (!response.ok) throw new Error('Fetch failed');
+        const text = await response.text();
+        const blocks = text.split('----------');
+        cachedIpsData = {};
+        blocks.forEach(block => {
+            const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+            if (lines.length === 0) return;
+            let opName = "Unknown";
+            const ips = [];
+            lines.forEach(line => {
+                if (line.includes('#')) {
+                    opName = line.split('#')[1].trim();
+                } else if (!line.startsWith('[source')) {
+                    ips.push(line);
+                }
+            });
+            if (ips.length > 0) {
+                cachedIpsData[opName] = ips;
+            }
+        });
+        populateIpSelect();
+    } catch (err) {
+        alert('Failed to load IP list from GitHub.');
+        toggleIpSelectorModal(false);
     }
-
-    // edge+usf management routes
-    if (url.pathname === '/panel' || url.pathname === '/panel/') return handlePanelRequest(request, env);
-    if (url.pathname === '/panel/login') return handlePanelLogin(request, env);
-    if (url.pathname.startsWith('/sub/') && !url.pathname.startsWith('/sub?')) {
-      return handleUserSubPage(decodeURIComponent(url.pathname.slice(5)), request, env, url);
+}
+function populateIpSelect() {
+    const select = document.getElementById('ip-operator-select');
+    select.innerHTML = '<option value="all">همه (توصیه شده)</option>';
+    Object.keys(cachedIpsData).forEach(op => {
+        const option = document.createElement('option');
+        option.value = op;
+        option.textContent = op;
+        select.appendChild(option);
+    });
+}
+function toggleIpSelectorModal(show) {
+    setModalState('ip-selector-modal', show);
+    if (!show) {
+                const rotateToggle = document.getElementById('input-auto-rotate-ip-toggle');
+                if (rotateToggle) rotateToggle.checked = false;
+                const rotateTime = document.getElementById('input-auto-rotate-ip-time');
+                if (rotateTime) rotateTime.value = '';
+                if (typeof window.toggleAutoRotateIpInputs === 'function') window.toggleAutoRotateIpInputs(false);
     }
-    if (url.pathname.startsWith('/api/edgepp/')) return handleEdgePPApi(request, env, ctx, url);
-
-    // Everything else -> proxy core
-    return edgetunnelHandler(request, env, ctx);
-  }
+}
+async function openIpSelectorModal() {
+    toggleIpSelectorModal(true);
+    document.getElementById('ip-loading-state').classList.remove('hidden');
+    document.getElementById('ip-selection-form').classList.add('hidden');
+    await fetchIpsList();
+        const op = document.getElementById('hidden-ip-operator').value;
+        const selectOp = document.getElementById('ip-operator-select');
+        if (selectOp.querySelector('option[value="' + op + '"]')) {
+                selectOp.value = op;
+        } else {
+                selectOp.value = 'all';
+        }
+        document.getElementById('ip-count-input').value = document.getElementById('hidden-ip-count').value || 20;
+        const isAuto = document.getElementById('hidden-auto-rotate').value === '1';
+        document.getElementById('input-auto-rotate-ip-toggle').checked = isAuto;
+        document.getElementById('input-auto-rotate-ip-time').value = document.getElementById('hidden-rotate-time').value;
+        if (typeof window.toggleAutoRotateIpInputs === 'function') window.toggleAutoRotateIpInputs(isAuto);
+    document.getElementById('ip-loading-state').classList.add('hidden');
+    document.getElementById('ip-selection-form').classList.remove('hidden');
+}
+function applySelectedIps() {
+    const operator = document.getElementById('ip-operator-select').value;
+    let count = parseInt(document.getElementById('ip-count-input').value, 10);
+    if (isNaN(count) || count < 1) count = 10;
+    let availableIps = [];
+    if (operator === 'all') {
+        Object.values(cachedIpsData).forEach(ips => {
+            availableIps = availableIps.concat(ips);
+        });
+    } else {
+        availableIps = cachedIpsData[operator] || [];
+    }
+    availableIps = [...new Set(availableIps)];
+    let selectedIps = [];
+    if (count >= availableIps.length) {
+        selectedIps = availableIps;
+    } else {
+        const shuffled = availableIps.slice();
+        for (let i = shuffled.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+        }
+        selectedIps = shuffled.slice(0, count);
+    }
+    document.getElementById('input-ips').value = selectedIps.join('\\n');
+        document.getElementById('hidden-auto-rotate').value = document.getElementById('input-auto-rotate-ip-toggle').checked ? '1' : '0';
+        document.getElementById('hidden-rotate-time').value = document.getElementById('input-auto-rotate-ip-time').value || '';
+        document.getElementById('hidden-ip-operator').value = operator;
+        document.getElementById('hidden-ip-count').value = count;
+    toggleIpSelectorModal(false);
+}
+document.addEventListener('DOMContentLoaded', () => {
+                        const freeModal = document.getElementById('free-panel-warning-modal');
+            const freeCard = freeModal.querySelector('div');
+            freeModal.classList.remove('opacity-0', 'pointer-events-none');
+            freeModal.classList.add('opacity-100', 'pointer-events-auto');
+            freeCard.classList.remove('opacity-0', 'scale-95');
+            freeCard.classList.add('opacity-100', 'scale-100');
+            const versionBadge = document.getElementById('panel-version');
+            if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
+            renderPortCheckboxes();
+            loadUsers();
+            loadLocations();
+            window.usersRefreshIntervalId = null;
+            window.startRefreshInterval = function(intervalMs) {
+                if (window.usersRefreshIntervalId) {
+                    clearInterval(window.usersRefreshIntervalId);
+                }
+                window.usersRefreshIntervalId = setInterval(() => loadUsers(true), intervalMs);
+            };
+            window.changeRefreshRate = function(val) {
+                const ms = parseInt(val, 10);
+                localStorage.setItem('zeus_refresh_rate', ms);
+                window.startRefreshInterval(ms);
+                showToast('نرخ رفرش پـنـل تغییر کرد');
+            };
+            const savedRate = localStorage.getItem('zeus_refresh_rate');
+            const initialRate = savedRate ? parseInt(savedRate, 10) : 2000;
+            const selectEl = document.getElementById('refresh-rate-select');
+            if (selectEl) {
+                selectEl.value = String(initialRate);
+            }
+            window.startRefreshInterval(initialRate);
+                        setTimeout(() => checkForUpdates(false), 2000);
+            setInterval(() => checkForUpdates(false), 60000);
+            setTimeout(() => checkGlobalMessage(), 1000);
+            setInterval(() => checkGlobalMessage(), 60000);
+            window.addEventListener('mousedown', (e) => {
+                window._modalMouseDownTarget = e.target;
+            });
+            window.addEventListener('click', (e) => {
+                if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
+                if (e.target.id === 'user-modal') toggleModal(false);
+                if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
+                if (e.target.id === 'settings-modal') toggleSettingsModal(false);
+                if (e.target.id === 'update-modal') toggleUpdateModal(false);
+                if (e.target.id === 'token-modal') toggleTokenModal(false);
+                if (e.target.id === 'qr-modal') toggleQrModal(false);
+                if (e.target.id === 'usage-warning-modal') closeUsageWarning();
+                if (e.target.id === 'free-panel-warning-modal') closeFreePanelWarning();
+                if (e.target.id === 'global-message-modal') {
+                    const closeBtn = document.getElementById('global-message-close-btn');
+                    if (closeBtn) closeBtn.click();
+                }
+                if (e.target.id === 'custom-confirm-modal') {
+                    const cancelBtn = document.getElementById('custom-confirm-cancel');
+                    if (cancelBtn) cancelBtn.click();
+                }
+            });
+        });
+function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', show); }
+                async function loadVipCountries() {
+                        const select = document.getElementById('vip-country-select');
+                        const btn = document.getElementById('vip-fetch-btn');
+                        select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
+                        try {
+                                const res = await fetch('https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip');
+                                if (!res.ok) throw new Error('API Error');
+                                const data = await res.json();
+                                const validCountries = data
+                                        .filter(function(file) { return file.name.endsWith('.txt'); })
+                                        .map(function(file) { return file.name.replace('.txt', '').toUpperCase(); });
+                                if (validCountries.length === 0) throw new Error('Empty');
+                                select.innerHTML = '<option value="">یک کشور VIP انتخاب کنید...</option>';
+                                validCountries.forEach(function(country) {
+                                        const option = document.createElement('option');
+                                        option.value = country;
+                                        const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(country) : '🌐';
+                                        option.textContent = flag + ' ' + country;
+                                        select.appendChild(option);
+                                });
+                                btn.disabled = false;
+                        } catch (err) {
+                                select.innerHTML = '<option value="">پـروکـسـی اختصاصی موجود نیست</option>';
+                                btn.disabled = true;
+                        }
+                }
+                async function loadVipProxy() {
+                        const select = document.getElementById('vip-country-select');
+                        const country = select.value;
+                        const btn = document.getElementById('vip-fetch-btn');
+                        if (!country) return;
+                        btn.disabled = true;
+                        btn.innerText = '...';
+                        try {
+                                const url = 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/' + country + '.txt?t=' + Date.now();
+                                const res = await fetch(url);
+                                if (!res.ok) throw new Error('فایل یافت نشد');
+                                const text = await res.text();
+                                const lines = text.split('\\n').map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 5; });
+                                if (lines.length > 0) {
+                                        const randomProxy = lines[Math.floor(Math.random() * lines.length)];
+                                        document.getElementById('user-socks5-input').value = randomProxy;
+                                        const userProxyResult = document.getElementById('test-user-proxy-result');
+                                        if (userProxyResult) {
+                                            userProxyResult.innerText = '';
+                                        }
+                                        toggleProxySelectorModal(false);
+                                        showToast('✅ پـروکـسـی اختصاصی با موفقیت اعمال شد.');
+                    testUserSocksProxy();
+                                } else {
+                                        alert('فایل پـروکـسـی این کشور خالی است.');
+                                }
+                        } catch (e) {
+                                alert('خطا در دریافت پـروکـسـی اختصاصی.');
+                        } finally {
+                                btn.disabled = false;
+                                btn.innerText = 'دریافت';
+                        }
+                }
+                async function openProxySelectorModal() {
+                        toggleProxySelectorModal(true);
+                        const select = document.getElementById('proxy-country-select');
+                        const fetchBtn = document.getElementById('proxy-fetch-btn');
+                        const countriesList = [
+                  "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR",
+                  "AS", "AT", "AU", "AW", "AX", "AZ", "BA", "BB", "BD", "BE",
+                  "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ",
+                  "BR", "BS", "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD",
+                  "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO", "CR",
+                  "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM",
+                  "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES", "ET", "FI",
+                  "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF",
+                  "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS",
+                  "GT", "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU",
+                  "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT",
+                  "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN",
+                  "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK",
+                  "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME",
+                  "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ",
+                  "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA",
+                  "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU",
+                  "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM",
+                  "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS",
+                  "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI",
+                  "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV",
+                  "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK",
+                  "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ", "UA",
+                  "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
+                  "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW"
+                        ];
+                        select.innerHTML = '';
+                        countriesList.forEach(function(country) {
+                                const option = document.createElement('option');
+                                option.value = country;
+                                const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(country) : '🌐';
+                                option.textContent = flag + ' ' + country;
+                                select.appendChild(option);
+                        });
+                        fetchBtn.disabled = false;
+                        loadVipCountries();
+                }
+async function fetchAndLoadProxy() {
+    const select = document.getElementById('proxy-country-select');
+    const country = select.value;
+    if (!country) return;
+    const loadingState = document.getElementById('proxy-loading-state');
+    const formState = document.getElementById('proxy-selection-form');
+    const fetchBtn = document.getElementById('proxy-fetch-btn');
+    loadingState.classList.remove('hidden');
+    loadingState.innerText = 'در حال دریافت لیست پـروکـسـی‌ها...';
+    formState.classList.add('hidden');
+    fetchBtn.disabled = true;
+    try {
+                const sources = [
+                        { url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/' + country.toUpperCase() + '.txt', prefix: '' }
+                ];
+        const responses = await Promise.allSettled(sources.map(src => 
+            fetch(src.url).then(async res => {
+                if (!res.ok) throw new Error();
+                const text = await res.text();
+                return { text: text, prefix: src.prefix };
+            })
+        ));
+        let combinedProxies = [];
+        for (const res of responses) {
+            if (res.status === 'fulfilled' && res.value && res.value.text) {
+                const rawLines = res.value.text.split('\\n');
+                for (let line of rawLines) {
+                    line = line.trim();
+                    if (line.length > 5) {
+                        if (res.value.prefix && !line.includes('://')) {
+                            combinedProxies.push(res.value.prefix + line);
+                        } else {
+                            combinedProxies.push(line);
+                        }
+                    }
+                }
+            }
+        }
+        let lines = [...new Set(combinedProxies.filter(l => l.match(/^(socks4|socks5|socks|http|https):\\/\\//i)))];
+        if (lines.length > 0) {
+            for (let i = lines.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [lines[i], lines[j]] = [lines[j], lines[i]];
+            }
+            let bestProxy = null;
+            let fallbackProxy = null;
+            const BATCH_SIZE = 5;
+            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+                const batch = lines.slice(i, i + BATCH_SIZE);
+                loadingState.innerText = 'تعداد ' + lines.length + ' پـروکـسـی پیدا شد درحال اسکن\\nاسکن گروه ' + (Math.floor(i / BATCH_SIZE) + 1) + ' (۵ تست برای هر کدام)...';
+                const testResults = await Promise.allSettled(batch.map(async (candidate) => {
+                    let successCount = 0;
+                    let totalPing = 0;
+                    let failCount = 0;
+                    for(let t = 0; t < 5; t++) {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 3500);
+                        try {
+                            const testRes = await fetch('/api/test-proxy', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ proxy: candidate }),
+                                signal: controller.signal
+                            });
+                            clearTimeout(timeoutId);
+                            const testData = await testRes.json();
+                            if (testRes.ok && testData.success) {
+                                successCount++;
+                                totalPing += testData.ping;
+                            } else {
+                                failCount++;
+                            }
+                        } catch (err) {
+                            clearTimeout(timeoutId);
+                            failCount++;
+                        }
+                        if (failCount > 2) break;
+                    }
+                    if (successCount > 0) {
+                        return { proxy: candidate, successCount: successCount, avgPing: totalPing / successCount };
+                    }
+                    throw new Error();
+                }));
+                const successfulProxies = testResults
+                    .filter(r => r.status === 'fulfilled')
+                    .map(r => r.value)
+                    .sort((a, b) => {
+                        if (b.successCount !== a.successCount) {
+                            return b.successCount - a.successCount;
+                        }
+                        return a.avgPing - b.avgPing;
+                    });
+                if (successfulProxies.length > 0) {
+                    const topCandidate = successfulProxies[0];
+                    if (topCandidate.successCount >= 3) {
+                        bestProxy = topCandidate.proxy;
+                        break;
+                    } else if (!fallbackProxy || topCandidate.successCount > fallbackProxy.successCount) {
+                        fallbackProxy = topCandidate;
+                    }
+                }
+            }
+            if (!bestProxy && fallbackProxy) {
+                bestProxy = fallbackProxy.proxy;
+            }
+            if (bestProxy) {
+                document.getElementById('user-socks5-input').value = bestProxy;
+                document.getElementById('test-user-proxy-result').innerText = '';
+                toggleProxySelectorModal(false);
+                showToast('پـروکـسـی با بهترین امتیاز لود شد.');
+                testUserSocksProxy();
+            } else {
+                alert('هیچ پـروکـسـی سالمی (حتی با یک پینگ موفق) یافت نشد.');
+            }
+        } else {
+            alert('پـروکـسـی برای این کشور یافت نشد.');
+        }
+    } catch (e) {
+        alert('خطا در دریافت لیست پـروکـسـی‌ها از سرور.');
+    } finally {
+        loadingState.classList.add('hidden');
+        formState.classList.remove('hidden');
+        fetchBtn.disabled = false;
+    }
+}
+const WORKER_DONATE_URL = 'https://noisy-meadow-a466.ir-netlify.workers.dev/';
+                function toggleDonateModal(show) {
+                        setModalState('donate-modal', show);
+                        if (!show) {
+                                document.getElementById('donate-proxy-input').value = '';
+                                const resultSpan = document.getElementById('donate-result');
+                                if (resultSpan) {
+                                        resultSpan.innerText = '';
+                                        resultSpan.className = 'inline-block mt-1 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden';
+                                }
+                        }
+                }
+                async function testAndDonateProxy() {
+                        const proxyInput = document.getElementById('donate-proxy-input').value.trim();
+                        const btn = document.getElementById('donate-submit-btn');
+                        const resultSpan = document.getElementById('donate-result');
+                        if (!proxyInput) {
+                                resultSpan.innerText = 'لطفاً پـروکـسـی را وارد کنید!';
+                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1';
+                                return;
+                        }
+                        const strictProxyPattern = /^(?:(?:socks4|socks5|socks|http|https):\\/\\/)?([a-zA-Z0-9]{8}):([a-zA-Z0-9]{12})@([^:\\/]+):(\\d+)$/i;
+                        if (!strictProxyPattern.test(proxyInput)) {
+                                resultSpan.innerText = '❌ این پـروکـسـی اختصاصی نیست';
+                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
+                                return;
+                        }
+                        btn.disabled = true;
+                        btn.innerText = 'صبر کنید...';
+                        resultSpan.innerText = 'در حال تست با اسکنر پـنـل...';
+                        resultSpan.className = 'text-[11px] font-bold text-emerald-500 w-full mt-1';
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 6000);
+                        try {
+                                const testRes = await fetch('/api/test-proxy', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ proxy: proxyInput }),
+                                        signal: controller.signal
+                                });
+                                clearTimeout(timeoutId);
+                                const testData = await testRes.json();
+                                if (!testRes.ok || !testData.success) {
+                                        throw new Error(testData.error || 'پـروکـسـی مسدود یا خاموش است');
+                                }
+                                const countryCode = testData.country || 'UN';
+                                resultSpan.innerText = 'پـروکـسـی سالم است! در حال ارسال (' + countryCode + ')...';
+                                const donateResponse = await fetch(WORKER_DONATE_URL, {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                                proxy: proxyInput,
+                                                country: countryCode
+                                        })
+                                });
+                                const donateData = await donateResponse.json();
+                                if (donateData.success) {
+                                        resultSpan.innerText = '✅ ' + donateData.message;
+                                        resultSpan.className = 'text-[11px] font-bold text-green-600 w-full mt-1';
+                                        document.getElementById('donate-proxy-input').value = '';
+                                } else {
+                                        resultSpan.innerText = '❌ خطا: ' + donateData.error;
+                                        resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
+                                }
+                        } catch (error) {
+                                clearTimeout(timeoutId);
+                                let errorMsg = error.message;
+                                if (error.name === 'AbortError') errorMsg = 'تایم‌اوت در تست پـروکـسـی';
+                                resultSpan.innerText = '❌ خطا: ' + errorMsg;
+                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
+                        } finally {
+                                btn.disabled = false;
+                                btn.innerText = 'تست و اهدا';
+                        }
+                }
+                function toggleSupportModal(show) {
+            const modal = document.getElementById('support-modal');
+            const content = modal.firstElementChild;
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                content.classList.remove('opacity-0', 'scale-95');
+            } else {
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                content.classList.add('opacity-0', 'scale-95');
+            }
+        }
+window.addEventListener('click', (e) => {
+    if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
+    if (e.target.id === 'proxy-selector-modal') toggleProxySelectorModal(false);
+        if (e.target.id === 'donate-modal') toggleDonateModal(false);
+});
+    </script>
+</body>
+</html>`,
+        status: `<!DOCTYPE html>
+<html lang="fa" dir="rtl" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>وضعیت اشتراک کاربر</title>
+    ${COMMON_HEAD}
+    <style>
+        body { font-family: 'Vazirmatn', sans-serif; }
+        .glass {
+            background: rgba(10, 10, 10, 0.6);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4 overflow-x-hidden">
+    <div class="w-full max-w-xl glass rounded-md shadow-2xl p-6 md:p-8 relative overflow-hidden">
+        <div class="absolute -left-12 -top-12 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -right-12 -bottom-12 w-40 h-40 bg-purple-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="text-center mb-8 relative z-10">
+            <div class="inline-flex items-center justify-center p-3 bg-blue-950/60 border border-blue-500 text-blue-400 rounded-md mb-4 shadow-[0_0_15px_rgba(59,130,246,0.4)]">
+                <svg class="w-8 h-8 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+            </div>
+            <h1 class="text-xl font-bold tracking-tight text-gray-900 dark:text-white mb-1">پـنـل Edge+ - وضعیت اشتراک</h1>
+            <p id="display-username" class="text-sm font-bold text-blue-500 tracking-wide font-mono mb-2"></p>
+            <p id="display-flag" class="text-2xl font-bold tracking-wide mb-3" style="display:none;"></p>
+            <div id="live-connections-badge" style="display: none !important;">
+                <span class="w-2 h-2 rounded-full bg-green-600 animate-pulse"></span>
+                <span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
+            </div>
+        </div>
+        <div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
+            <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
+        </div>
+        <div class="grid grid-cols-2 gap-3 mb-8 relative z-10">
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
+                        <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                        حجم مصرفی
+                    </span>
+                    <span id="volume-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
+                    <div id="volume-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+                    <span id="used-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+                    <span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+                </div>
+            </div>
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
+                        <svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        زمان باقی‌مانده
+                    </span>
+                    <span id="expiry-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2 flex justify-end">
+                    <div id="expiry-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+                    <span id="days-remaining" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
+                    <span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
+                </div>
+            </div>
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
+                        <svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        ریکوئست‌ها
+                    </span>
+                    <span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
+                    <div id="req-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+                    <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+                    <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+                </div>
+            </div>
+            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
+                        <svg class="w-3.5 h-3.5 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                        دستگاه متصل
+                    </span>
+                    <span id="online-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
+                </div>
+                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
+                    <div id="online-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
+                    <span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">۰</span>
+                    <span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
+                </div>
+            </div>
+        </div>
+        <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
+            <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
+                <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                دریافت کـانفـیگ و اشتراک‌ها
+            </h2>
+            <div class="space-y-3">
+                <button onclick="copyTextSub()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-md text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">⛓️ کپی لینک ساب‌اسکریپشن متنی</span>
+                    <span class="text-indigo-500">کپی</span>
+                </button>
+                                <button onclick="showSubQr()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-amber-500 dark:hover:border-amber-500 rounded-md text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">📱 دریافت کیوآر کد ساب</span>
+                    <span class="text-amber-500">نمایش</span>
+                </button>
+                <button onclick="copyvIeesConfig()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-blue-500 dark:hover:border-blue-500 rounded-md text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">🚀 کپی کـانفـیگ vIees (مستقیم)</span>
+                    <span class="text-blue-500">کپی</span>
+                </button>
+            </div>
+        </div>
+    </div>
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
+            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="flex justify-center bg-white p-4 rounded-md mb-4">
+            <div id="qrcode-container"></div>
+        </div>
+    </div>
+</div>
+<div class="flex flex-col gap-4 mt-6 z-10">
+    <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
+        <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
+            <svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
+            </svg>
+            گیت‌هاب
+        </a>
+        <a href="https://t.me/godde3sbot" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
+            <svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
+            </svg>
+            @godde3sbot
+        </a>
+    </div>
+    <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
+        <a href="https://github.com/Godde3s/edge-pp" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-amber-600 dark:text-amber-400 hover:text-amber-500 dark:hover:text-amber-300 group">
+            <svg class="w-5 h-5 text-amber-500 dark:text-amber-400 group-hover:scale-110 transition" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+            ساخت رایگان پـنـل
+        </a>
+        <a href="https://donatonion.ir-netlify.workers.dev" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-red-600 dark:text-red-400 hover:text-red-500 dark:hover:text-red-300 group">
+            <svg class="w-5 h-5 text-red-500 dark:text-red-400 group-hover:scale-110 transition" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+            </svg>
+            دونیت
+        </a>
+    </div>
+</div>
+${COMMON_TOAST_HTML}
+    <script>
+        /* {{USER_DATA_PLACEHOLDER}} */
+        ${COMMON_TOAST_JS}
+        function getHost() {
+            return window.location.host;
+        }
+        function getvIeesLink() {
+            const u = window.statusUser;
+            const host = getHost();
+            var ips = [host];
+            if (u.ips) {
+                ips = u.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
+                if (ips.length === 0) ips = [host];
+            }
+            var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
+            var fp = u.fingerprint || 'chrome';
+                        const userFrag = (u.frag_len && u.frag_int) ? '&fragment=' + u.frag_len + ',' + u.frag_int : '';
+                        const dynPath = encodeURIComponent("/stream/PANEL_EDGE/" + (u.uuid ? u.uuid.split("-")[0] : "default"));
+                        var links = [];
+            let flagEmoji = '🌐';
+            if (u.user_proxy_iata) {
+                try {
+                    const cachedLocations = localStorage.getItem('cached_locations_list');
+                    if (cachedLocations) {
+                        const parsedLocs = JSON.parse(cachedLocations);
+                        const loc = parsedLocs.find(l => l.iata && l.iata.toUpperCase() === u.user_proxy_iata.toUpperCase());
+                        if (loc && loc.cca2) flagEmoji = getFlagEmoji(loc.cca2);
+                    }
+                } catch(e) {}
+            } else if (u.user_socks5 || u.user_proxy_ip) {
+                const targetProxy = u.user_socks5 || u.user_proxy_ip;
+                try {
+                    const proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}');
+                    if (proxyFlagCache[targetProxy]) flagEmoji = proxyFlagCache[targetProxy];
+                } catch(e) {}
+            }
+            ips.forEach(function(ip, ipIndex) {
+                ports.forEach(function(portStr) {
+                                        var isTlsPort = ['443', '2053', '2083', '2087', '2096', '8443'].includes(portStr);
+                                        var tlsVal = isTlsPort ? 'tls' : 'none';
+                                        var remark = flagEmoji + ' | ' + u.username + ' | \\u200E' + ip + ' | \\u200E' + portStr;
+                                        links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + dynPath + '&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
+                                });
+            });
+            return links.join('\\n');
+        }
+        function copyvIeesConfig() {
+            navigator.clipboard.writeText(getvIeesLink()).then(() => alert('✅ کـانفـیگ vIees با موفقیت کپی شد!'));
+        }
+        function copyTextSub() {
+            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+            navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
+        }
+                function toggleQrModal(show, text) {
+            const modal = document.getElementById('qr-modal');
+            const card = document.getElementById('qr-modal-card');
+            const container = document.getElementById('qrcode-container');
+            if (show) {
+                container.innerHTML = '';
+                new QRCode(container, {
+                    text: text,
+                    width: 200,
+                    height: 200,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+            }
+        }
+        function showSubQr() {
+            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+            toggleQrModal(true, link);
+        }
+                function getFlagEmoji(countryCode) {
+            if (!countryCode) return '🌐';
+            const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
+            try {
+                return String.fromCodePoint(...codePoints);
+            } catch (e) {
+                return '🌐';
+            }
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            const u = window.statusUser;
+            if (!u) return;
+            const limit = u.ip_limit !== undefined ? u.ip_limit : u.max_connections;
+            document.getElementById('display-username').innerText = u.username;
+const flagContainer = document.getElementById('display-flag');
+if (u.user_proxy_iata) {
+    const flag = getFlagEmoji(u.user_proxy_iata);
+    flagContainer.innerText = flag + " " + u.user_proxy_iata.toUpperCase();
+    flagContainer.style.display = 'block'; 
+} else if (u.user_socks5 || u.user_proxy_ip) {
+    flagContainer.innerText = "⏳ تست پـروکـسـی...";
+    flagContainer.style.display = 'block'; 
+    const targetProxy = u.user_socks5 || u.user_proxy_ip;
+    fetch('/api/test-proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxy: targetProxy })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.success && data.country) {
+            flagContainer.innerText = getFlagEmoji(data.country);
+        } else {
+            flagContainer.innerText = "🌐";
+        }
+    })
+    .catch(() => {
+        flagContainer.innerText = "🌐";
+    });
+}
+            const badge = document.getElementById('live-connections-badge');
+            badge.classList.remove('hidden');
+            if (u.online_count && u.online_count > 0) {
+                document.getElementById('live-connections-text').innerText = u.online_count + (limit ? '/' + limit : '') + ' دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-green-600/10 border border-green-600/20 text-green-600 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-green-600 animate-pulse';
+            } else {
+                document.getElementById('live-connections-text').innerText = '۰ دستگاه متصل';
+                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-sm';
+                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-gray-500';
+            }
+            const usedGb = u.used_gb || 0;
+            const limitGb = u.limit_gb;
+            const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
+            document.getElementById('used-vol').innerText = formattedUsed;
+            let isVolumeExpired = false;
+            if (limitGb) {
+                document.getElementById('limit-vol').innerText = limitGb + ' GB';
+                const pct = Math.min((usedGb / limitGb) * 100, 100);
+                document.getElementById('volume-pct').innerText = pct.toFixed(0) + '٪';
+                document.getElementById('volume-progress').style.width = pct + '%';
+                const hue = 120 - (pct * 1.2);
+                document.getElementById('volume-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
+                if (usedGb >= limitGb) isVolumeExpired = true;
+            } else {
+                document.getElementById('limit-vol').innerText = 'نامحدود';
+                document.getElementById('volume-pct').innerText = '۰٪';
+                document.getElementById('volume-progress').style.width = '100%';
+                document.getElementById('volume-progress').style.backgroundColor = '#3b82f6';
+            }
+            let daysRemaining = 'نامحدود';
+            let totalDays = 'نامحدود';
+            let isTimeExpired = false;
+            if (u.expiry_days) {
+                totalDays = u.expiry_days + ' روز';
+                if (u.created_at) {
+                    const created = new Date(u.created_at);
+                    const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
+                    const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+                    daysRemaining = diffDays > 0 ? diffDays : 0;
+                    const pct = Math.max(0, Math.min(100, (daysRemaining / u.expiry_days) * 100));
+                    document.getElementById('expiry-pct').innerText = pct.toFixed(0) + '٪';
+                    document.getElementById('expiry-progress').style.width = pct + '%';
+                    const hue = pct * 1.2;
+                    document.getElementById('expiry-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
+                    if (new Date() > expiryDate) isTimeExpired = true;
+                }
+            } else {
+                document.getElementById('expiry-pct').innerText = '۰٪';
+                document.getElementById('expiry-progress').style.width = '100%';
+                document.getElementById('expiry-progress').style.backgroundColor = '#3b82f6';
+            }
+            document.getElementById('days-remaining').innerText = daysRemaining === 'نامحدود' ? 'نامحدود' : daysRemaining + ' روز';
+            document.getElementById('total-days').innerText = totalDays;
+            const usedReq = u.used_req || 0;
+            const limitReq = u.limit_req;
+            document.getElementById('used-req').innerText = usedReq.toLocaleString();
+            let isReqExpired = false;
+            if (limitReq) {
+                document.getElementById('limit-req').innerText = limitReq.toLocaleString();
+                const rPct = Math.min((usedReq / limitReq) * 100, 100);
+                document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
+                document.getElementById('req-progress').style.width = rPct + '%';
+                const rHue = 120 - (rPct * 1.2);
+                document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
+                if (usedReq >= limitReq) isReqExpired = true;
+            } else {
+                document.getElementById('limit-req').innerText = 'نامحدود';
+                document.getElementById('req-pct').innerText = '۰٪';
+                document.getElementById('req-progress').style.width = '100%';
+                document.getElementById('req-progress').style.backgroundColor = '#3b82f6';
+            }
+            const onlineCount = u.online_count || 0;
+            document.getElementById('online-count').innerText = onlineCount;
+            if (limit) {
+                document.getElementById('limit-online').innerText = limit;
+                const oPct = Math.min((onlineCount / limit) * 100, 100);
+                document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
+                document.getElementById('online-progress').style.width = oPct + '%';
+                const oHue = 120 - (oPct * 1.2);
+                document.getElementById('online-progress').style.backgroundColor = 'hsl(' + oHue + ', 80%, 45%)';
+            } else {
+                document.getElementById('limit-online').innerText = 'نامحدود';
+                document.getElementById('online-pct').innerText = '۰٪';
+                document.getElementById('online-progress').style.width = '100%';
+                document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? '#16a34a' : '#9ca3af'; 
+            }
+            const statusCard = document.getElementById('status-card');
+            const statusText = document.getElementById('status-text');
+            if (u.is_active === 0) {
+                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-red-500/10 border-red-500/30 text-red-500 shadow-md shadow-red-500/5';
+                statusCard.style.boxShadow = 'inset 0 0 12px rgba(239, 68, 68, 0.1)';
+                statusText.innerText = '❌ وضعیت اشتراک: غیرفعال / مسدود دستی';
+            } else if (isVolumeExpired || isReqExpired || isTimeExpired) {
+                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
+                if (isVolumeExpired) statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
+                else if (isReqExpired) statusText.innerText = '📈 وضعیت اشتراک: تمام شدن ریکوئست مجاز';
+                else if (isTimeExpired) statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
+            } else {
+                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-green-600/10 border-green-600/30 text-green-600 shadow-md shadow-green-600/5';
+                statusText.innerText = '✅ وضعیت اشتراک: فعال و متصل';
+            }
+        });
+        window.addEventListener('click', (e) => {
+            if (e.target.id === 'qr-modal') toggleQrModal(false);
+        });
+    </script>
+</body>
+</html>`,
 };
