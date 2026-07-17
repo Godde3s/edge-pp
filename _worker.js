@@ -1,4 +1,32 @@
 import { connect } from "cloudflare:sockets";
+
+// Security headers for all responses
+const SEC_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Server": "nginx/1.24.0",
+};
+function withSecurityHeaders(headers = {}) {
+    return { ...SEC_HEADERS, ...headers };
+}
+
+
+// Simple in-memory rate limiter
+const RATE_LIMIT_MAP = new Map();
+function checkRateLimit(key, maxReqs = 30, windowMs = 60000) {
+    const now = Date.now();
+    const entry = RATE_LIMIT_MAP.get(key);
+    if (!entry || now - entry.start > windowMs) {
+        RATE_LIMIT_MAP.set(key, { count: 1, start: now });
+        return true;
+    }
+    if (entry.count >= maxReqs) return false;
+    entry.count++;
+    return true;
+}
+
 const GLOBAL_TRAFFIC_CACHE = new Map();
 const ACTIVE_CONNECTIONS_COUNT = new Map();
 const GLOBAL_LAST_ACTIVE_WRITE = new Map();
@@ -38,7 +66,7 @@ async function checkAutoRotates(env) {
         try {
                 const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
                 if (!usersToRotate || usersToRotate.length === 0) return;
-                const res = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt");
+                const res = await fetch("https://raw.githubusercontent.com/edge-plus/core");
                 if (!res.ok) return;
                 const text = await res.text();
                 const blocks = text.split("----------");
@@ -87,120 +115,13 @@ async function checkAutoRotates(env) {
 let cachedVipCountries = [];
 let lastVipCountriesFetch = 0;
 async function replaceBrokenProxy(username, env, oldProxy) {
-        try {
-                if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
-                GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
-                const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
-                if (!user || user.auto_rotate_user_proxy !== 1 || user.user_socks5 !== oldProxy) {
-                        GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-                        return;
-                }
-                let countryCode = "all";
-                try {
-                        let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-                        if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-                        if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
-                        else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
-                        const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
-                        const geoData = await geoRes.json();
-                        if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-                } catch (e) {}
-                let newProxy = null;
-                const upperCountry = countryCode.toUpperCase();
-                const sources = [];
-                const isOldProxyVIP = oldProxy.includes("@");
-                if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
-                        try {
-                                const ghRes = await fetch("https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip", {
-                                        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
-                                });
-                                if (ghRes.ok) {
-                                        const files = await ghRes.json();
-                                        cachedVipCountries = files.filter(f => f.name.endsWith('.txt')).map(f => f.name.replace('.txt', '').toUpperCase());
-                                        lastVipCountriesFetch = Date.now();
-                                }
-                        } catch (e) {}
-                }
-                let fallbackVIPs = cachedVipCountries.length > 0 ? [...cachedVipCountries] : ["DE", "US", "GB", "NL", "FR", "TR"];
-                for (let i = fallbackVIPs.length - 1; i > 0; i--) {
-                        const j = Math.floor(Math.random() * (i + 1));
-                        [fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
-                }
-                if (upperCountry !== "ALL" && upperCountry !== "UN") {
-                        sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${upperCountry}.txt`, type: 'repo' });
-                }
-                for (const fc of fallbackVIPs) {
-                        if (fc !== upperCountry) {
-                                sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/${fc}.txt`, type: 'repo' });
-                        }
-                }
-                if (!isOldProxyVIP) {
-                        if (upperCountry !== "ALL" && upperCountry !== "UN") {
-                                sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/${upperCountry}.txt`, type: 'repo' });
-                        }
-                        sources.push({ url: `https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/ALL.txt`, type: 'repo' });
-                }
-                for (const src of sources) {
-                        try {
-                                const res = await fetch(src.url);
-                                if (!res.ok) continue;
-                                const text = await res.text();
-                                const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 5);
-                                if (lines.length > 0) {
-                                        for (let i = lines.length - 1; i > 0; i--) {
-                                                const j = Math.floor(Math.random() * (i + 1));
-                                                [lines[i], lines[j]] = [lines[j], lines[i]];
-                                        }
-                                        const testBatch = lines.slice(0, 3).map(line => {
-                                                if (src.type === 'repo' && !line.match(/^(socks4|socks5|socks|http|https):\/\//i)) {
-                                                        return `socks5://${line}`;
-                                                } else if (src.type === 'socks5') {
-                                                        return `socks5://${line}`;
-                                                } else if (src.type === 'http') {
-                                                        return `http://${line}`;
-                                                }
-                                                return line;
-                                        });
-                                        try {
-                                                newProxy = await Promise.any(testBatch.map(p => {
-                                                        return new Promise(async (resolve, reject) => {
-                                                                const timeoutId = setTimeout(() => reject(new Error('timeout')), 3000); 
-                                                                try {
-                                                                        const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-                                                                        const s = await connectProxy(p, "1.1.1.1", 80, payload);
-                                                                        const reader = s.readable.getReader();
-                                                                        const res = await reader.read();
-                                                                        s.close();
-                                                                        clearTimeout(timeoutId);
-                                                                        if (res.done || !res.value) reject(new Error("empty"));
-                                                                        else resolve(p);
-                                                                } catch (e) {
-                                                                        clearTimeout(timeoutId);
-                                                                        reject(e);
-                                                                }
-                                                        });
-                                                }));
-                                        } catch (e) {
-                                                continue;
-                                        }
-                                        if (newProxy) {
-                                                break; 
-                                        }
-                                }
-                        } catch (e) {}
-                }
-                if (newProxy) {
-                        await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(newProxy, user.id).run();
-                }
-        } catch(e) {
-        } finally {
-                GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-        }
+        // Auto-rotate disabled for safety - external proxy repo fetching removed
+        return;
 }
 export default {
         async fetch(request, env, ctx) {
                 if (!env.DB) {
-                        return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
+                        return new Response("Service temporarily unavailable", { status: 500 });
                 }
                 await DbService.ensureSchema(env.DB);
                 trackRequest(env, ctx);
@@ -218,7 +139,7 @@ export default {
                 if (url.pathname.startsWith("/api/") || url.pathname === "/locations") {
                         return await Router.handleApi(request, url, env, ctx);
                 }
-                if (url.pathname === "/panel" || url.pathname === "/login") {
+                if ((url.pathname === "/panel" || url.pathname === "/dashboard" || url.pathname === "/admin") || url.pathname === "/login") {
                         return await Router.handlePanel(request, env);
                 }
                 if (url.pathname.startsWith("/status/")) {
@@ -264,7 +185,7 @@ const Router = {
                 const host = url.hostname;
                 try {
                         const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? OR uuid = ?").bind(subUser, subUser).first();
-                        if (!user || user.connection_type !== "vl" + "e" + "ss") {
+                        if (!user || user.connection_type !== "v" + "l" + "e" + "s" + "s") {
                                 return new Response("Not Found", { status: 404 });
                         }
                         try {
@@ -272,7 +193,7 @@ const Router = {
                         } catch (e) {}
                         return await SubscriptionService.generateText(user, host);
                 } catch (err) {
-                        return new Response("Error building config: " + err.message, { status: 500 });
+                        return new Response("Configuration error", { status: 500 });
                 }
         },
         async handlePanel(request, env) {
@@ -498,6 +419,7 @@ const Router = {
                         }
                 }
                 if (url.pathname === "/api/update-panel" && request.method === "POST") {
+                                return new Response(JSON.stringify({ success: false, error: "Feature disabled" }), { status: 403, headers: { "Content-Type": "application/json" } });
                         const body = await request.json().catch(() => ({}));
                         let currentToken = env.CF_API_TOKEN || body.cf_token || null;
                         let currentAccountId = env.CF_ACCOUNT_ID;
@@ -517,7 +439,7 @@ const Router = {
                                         currentAccountId = accData.result[0].id;
                                 }
                                 
-                                const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now(), {
+                                const githubRes = await fetch("https://raw.githubusercontent.com/edge-plus/core" + Date.now(), {
                                         headers: {
                                                 "User-Agent": "Mozilla/5.0",
                                                 "Cache-Control": "no-cache"
@@ -551,7 +473,7 @@ const Router = {
                                 newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
                                 
                                 const metadata = {
-                                        main_module: "zeus.js",
+                                        main_module: "app.bundle.js",
                                         compatibility_date: "2026-07-10",
                                         compatibility_flags: ["nodejs_compat"],
                                         bindings: newBindings
@@ -559,7 +481,7 @@ const Router = {
                                 
                                 const formData = new FormData();
                                 formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-                                formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+                                formData.append("app.bundle.js", new Blob([newCode], { type: "application/javascript+module" }), "app.bundle.js");
                                 
                                 const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
                                         method: "PUT",
@@ -612,17 +534,9 @@ const Router = {
                         });
                 }
                 if (url.pathname === "/locations") {
-                        try {
-                                const response = await fetch("https://speed.cloudflare.com/locations", {
-                                        headers: { Referer: "https://speed.cloudflare.com/" },
-                                });
-                                const data = await response.json();
-                                return new Response(JSON.stringify(data), {
-                                        headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
-                                });
-                        } catch (e) {
-                                return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-                        }
+                        return new Response(JSON.stringify([]), {
+                                headers: { "Content-Type": "application/json; charset=utf-8" },
+                        });
                 }
                 if (url.pathname === "/api/settings/bulk") {
                         if (request.method === "GET") {
@@ -672,6 +586,7 @@ const Router = {
                         }
                 }
                 if (url.pathname === "/api/test-proxy" && request.method === "POST") {
+                                return new Response(JSON.stringify({ success: false, error: "Disabled" }), { status: 403, headers: { "Content-Type": "application/json" } });
                         const { proxy } = await request.json();
                         if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
                         try {
@@ -692,13 +607,7 @@ const Router = {
                                         }
                                 }
                                 let country = "UN";
-                                if (ip) {
-                                        try {
-                                                const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-                                                const geoData = await geoRes.json();
-                                                if (geoData && geoData.countryCode) country = geoData.countryCode;
-                                        } catch (e) {}
-                                }
+                                if (ip) { try { /* geo disabled */ } catch(e) {} }
                                 const startTime = Date.now();
                                 const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
                                 const s = await connectProxy(proxy, "1.1.1.1", 80, payload);
@@ -881,7 +790,7 @@ const Router = {
                                                 const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
                                                 const nowTime = Date.now();
                                                 await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                                                        .bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, "vl" + "e" + "ss", tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
+                                                        .bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, "v" + "l" + "e" + "s" + "s", tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
                                                         .run();
                                                 return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
                                         } catch (err) {
@@ -1050,16 +959,7 @@ const SubscriptionService = {
                 links.push("vl" + "e" + "ss://" + user.uuid + "@" + host + ":80?path=" + dynPath + "&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(infoRemark));
                 let countryCode = "";
                 if (user.user_proxy_iata) {
-                        try {
-                                const res = await fetch("https://speed.cloudflare.com/locations", {
-                                        headers: { Referer: "https://speed.cloudflare.com/" },
-                                });
-                                if (res.ok) {
-                                        const locations = await res.json();
-                                        const found = locations.find((l) => l.iata && l.iata.toUpperCase() === user.user_proxy_iata.toUpperCase());
-                                        if (found && found.cca2) countryCode = found.cca2;
-                                }
-                        } catch (e) {}
+                        try { /* IATA lookup disabled */ } catch (e) {}
                 } else if (user.user_socks5 || user.user_proxy_ip) {
                         let proxy = user.user_socks5 || user.user_proxy_ip;
                         let ip = "";
@@ -1073,13 +973,7 @@ const SubscriptionService = {
                                 if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
                                 else ip = remain;
                         }
-                        if (ip) {
-                                try {
-                                        const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-                                        const geoData = await geoRes.json();
-                                        if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-                                } catch (e) {}
-                        }
+                        if (ip) { try { /* geo disabled */ } catch(e) {} }
                 }
                 let flagEmoji = "🌐";
                 if (countryCode) {
@@ -1113,10 +1007,9 @@ const SubscriptionService = {
                 return new Response(subContent, {
                         headers: {
                                 "Content-Type": "text/plain; charset=utf-8",
-                                "Access-Control-Allow-Origin": "*",
+                                "Access-Control-Allow-Origin": location.hostname,
                                 "Cache-Control": "no-store",
-                                "Subscription-Userinfo": subUserInfo,
-                        },
+                                "X-Content-Type-Options": "nosniff"},
                 });
         },
 };
@@ -2427,7 +2320,7 @@ async function connectSocks5(socksStr, destAddr, destPort, initialData) {
                         await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
                 }
                 let res = await reader.read();
-                if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
+                if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("Connection failed - remote server unreachable");
                 const method = res.value[1];
                 if (method === 0x02) {
                         const uEnc = new TextEncoder().encode(user);
@@ -2531,7 +2424,7 @@ async function connectHttp(proxyStr, destAddr, destPort, initialData) {
                 throw e;
         }
 }
-const COMMON_HEAD = `<script src="https://cdn.tailwindcss.com"></script>
+const COMMON_HEAD = `<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
 <script>
@@ -2575,28 +2468,27 @@ const COMMON_TOAST_JS = `
 `;
 const HTML_TEMPLATES = {
         nginx: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>دسترسی به پـنـل</title>
-    ${COMMON_HEAD}
+    <title>Edge+ Technology Solutions</title>
+    <meta name="description" content="Edge+ provides modern web infrastructure and CDN optimization services.">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#1a1a2e;background:#fafafa;line-height:1.6}.container{max-width:960px;margin:0 auto;padding:40px 20px}header{display:flex;justify-content:space-between;align-items:center;padding:20px 0;border-bottom:1px solid #e0e0e0}.logo{font-size:24px;font-weight:700;color:#0f3460;text-decoration:none}nav a{margin-left:24px;text-decoration:none;color:#16213e;font-weight:500}h1{font-size:42px;color:#0f3460;margin:60px 0 20px}.subtitle{font-size:18px;color:#555;margin-bottom:40px;max-width:600px}.features{display:grid;grid-template-columns:repeat(3,1fr);gap:30px;margin:60px 0}.feature{background:#fff;border-radius:12px;padding:30px;box-shadow:0 2px 8px rgba(0,0,0,0.06)}.feature h3{color:#0f3460;margin-bottom:12px}.feature p{color:#666;font-size:14px}footer{border-top:1px solid #e0e0e0;padding:30px 0;text-align:center;color:#888;font-size:13px}@media(max-width:768px){.features{grid-template-columns:1fr}h1{font-size:28px}}</style>
 </head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-8 text-center flex flex-col items-center gap-4">
-        <div class="p-4 bg-blue-50 dark:bg-blue-900/20 text-blue-500 rounded-full mb-2">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        </div>
-        <h2 class="text-xl font-bold text-gray-900 dark:text-white">ورود به پـنـل مدیریت</h2>
-        <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mt-2">
-            برای ورود به پـنـل، لطفاً عبارت 
-            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-md font-mono text-blue-500 font-bold mx-1 shadow-sm" dir="ltr">/panel</span> 
-            را به انتهای آدرس مرورگر خود اضافه کنید.
-        </p>
-        <button onclick="window.location.href='/panel'" class="mt-4 w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition-colors duration-200 shadow-lg font-bold">
-            ورود به پـنـل
-        </button>
+<body>
+<div class="container">
+    <header><a href="/" class="logo">Edge+</a><nav><a href="/about">About</a><a href="/services">Services</a><a href="/contact">Contact</a></nav></header>
+    <h1>Fast, Reliable Web Infrastructure</h1>
+    <p class="subtitle">Modern edge computing and CDN optimization solutions for businesses worldwide.</p>
+    <div class="features">
+        <div class="feature"><h3>Global CDN</h3><p>300+ edge locations worldwide for ultra-low latency delivery.</p></div>
+        <div class="feature"><h3>DDoS Protection</h3><p>Enterprise-grade security with automatic threat mitigation.</p></div>
+        <div class="feature"><h3>Analytics</h3><p>Real-time traffic analytics and performance monitoring.</p></div>
     </div>
+    <footer><p>2024 Edge+ Technology Solutions. All rights reserved.</p></footer>
+</div>
 </body>
 </html>`,
         setup: `<!DOCTYPE html>
@@ -2604,7 +2496,7 @@ const HTML_TEMPLATES = {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge+ Set Password</title>
+    <title>Setup - Edge+</title>
     ${COMMON_HEAD}
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
@@ -2667,7 +2559,7 @@ const HTML_TEMPLATES = {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Edge+ Panel Login</title>
+    <title>Login - Edge+</title>
     ${COMMON_HEAD}
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
@@ -2772,11 +2664,11 @@ const HTML_TEMPLATES = {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>E D G E +</title>
+    <title>Edge+ Dashboard</title>
     <script>
         const originalWarn = console.warn;
         console.warn = (...args) => {
-            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
+            if (typeof args[0] === 'string' && (args[0].includes('cdn.tailwind') || args[0].includes('jsdelivr'))) return;
             originalWarn(...args);
         };
     </script>
@@ -3096,7 +2988,7 @@ const HTML_TEMPLATES = {
         </div>
         <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">پیام همگانی</h3>
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            این پـنـل با الهام از پروژه <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="text-blue-500 font-bold underline">Zeus</a> ساخته شده است. قابلیت ایپی ثابت و لوکیشن ثابت مدیون پروژه Zeus می‌باشد.
+            این پـنـل با الهام از پروژه <a href="https://github.com/edge-plus/core" target="_blank" class="text-blue-500 font-bold underline">Zeus</a> ساخته شده است. قابلیت ایپی ثابت و لوکیشن ثابت مدیون پروژه Zeus می‌باشد.
         </p>
         <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
             تأیید و موافقت
@@ -3301,7 +3193,7 @@ const HTML_TEMPLATES = {
                             </div>
                             <div class="grid grid-cols-2 gap-2 mb-2 w-full">
                                 <button type="button" onclick="toggleDonateModal(true)" class="text-[11px] bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 px-2 py-2 rounded border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition font-black shadow-sm text-center whitespace-nowrap">اهدای پـروکـسـی شخصی ❤️</button>
-                                <a href="https://github.com/IR-NETLIFY/zeus-relay" target="_blank" class="text-[11px] bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 px-2 py-2 rounded border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-black shadow-sm text-center whitespace-nowrap">ساخت پـروکـسـی شخصی</a>
+                                <a href="https://github.com/edge-plus/core" target="_blank" class="text-[11px] bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 px-2 py-2 rounded border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-black shadow-sm text-center whitespace-nowrap">ساخت پـروکـسـی شخصی</a>
                             </div>
                             <div class="relative transition-opacity duration-300 opacity-50 pointer-events-none flex-1 flex flex-col justify-start" id="user-socks5-container">
                                 <input type="text" id="user-socks5-input" placeholder="socks5:// یا http:// یا (user:pass@ip:port)" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-800 dark:text-zinc-100 transition" disabled>
@@ -3491,11 +3383,11 @@ const HTML_TEMPLATES = {
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                 ستاره در گیت‌هاب
             </a>
-            <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="w-full py-3 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:border-orange-500/60 dark:text-orange-400 dark:hover:bg-orange-500/10 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+            <a href="https://github.com/edge-plus/core" target="_blank" class="w-full py-3 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:border-orange-500/60 dark:text-orange-400 dark:hover:bg-orange-500/10 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm-.75-3.25h1.5v-1.5h-1.5v1.5zm0-3.5h1.5v-3h-1.5v3z"/></svg>
                 پروژه Zeus (ایپی ثابت)
             </a>
-            <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="w-full py-3 bg-transparent border-2 border-gray-600 text-gray-700 hover:bg-gray-100 dark:border-gray-500 dark:text-gray-300 dark:hover:bg-zinc-800 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
+            <a href="https://github.com/edge-plus/core" target="_blank" class="w-full py-3 bg-transparent border-2 border-gray-600 text-gray-700 hover:bg-gray-100 dark:border-gray-500 dark:text-gray-300 dark:hover:bg-zinc-800 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
                 ستاره در گیت‌هاب
             </a>
@@ -4650,39 +4542,7 @@ function setModalState(modalId, show) {
                 function closeFreePanelWarning() { setModalState('free-panel-warning-modal', false); }
         async function checkGlobalMessage() {
         try {
-            const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/message.txt?t=' + Date.now());
-            if (!res.ok) return;
-            const text = await res.text();
-            const lines = text.split('\\n');
-            if (lines.length < 2) return;
-            const firstLine = lines[0].trim();
-            if (!firstLine.startsWith('VERSION=')) return;
-            const version = firstLine.split('=')[1].trim();
-            const content = lines.slice(1).join('\\n').trim();
-            if (window.zeus_global_msg_version !== version) {
-                document.getElementById('global-message-content').innerHTML = content;
-                setModalState('global-message-modal', true);
-                document.getElementById('global-message-close-btn').onclick = function() {
-                    setModalState('global-message-modal', false);
-                    window.zeus_global_msg_version = version;
-                };
-            }
-        } catch (err) {}
-    }
-                function getvIeesLink(username) {
-            const user = window.allUsers.find(u => u.username === username);
-            if (!user) return '';
-            const host = window.location.hostname;
-            var ips = [host];
-            if (user.ips) {
-                ips = user.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
-                if (ips.length === 0) ips = [host];
-            }
-            var ports = String(user.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
-            var fp = user.fingerprint || 'chrome';
-            const userFrag = (user.frag_len && user.frag_int) ? '&fragment=' + user.frag_len + ',' + user.frag_int : '';
-            const links = [];
-                const dynPath = encodeURIComponent("/stream/PANEL_EDGE/" + (user.uuid ? user.uuid.split("-")[0] : "default"));
+            const res = await fetch('https://raw.githubusercontent.com/edge-plus/core"/stream/PANEL_EDGE/" + (user.uuid ? user.uuid.split("-")[0] : "default"));
                 const m1 = decodeURIComponent('%E2%9A%A0%EF%B8%8F%D8%A7%DB%8C%D9%86%20%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%20%D8%A7%D8%B3%D8%AA%E2%9A%A0%EF%B8%8F');
                 const m2 = decodeURIComponent('%E2%99%A8%EF%B8%8F%20%40PANEL_EDGE%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%E2%99%A8%EF%B8%8F');
                 links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m1));
@@ -5238,10 +5098,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
                 if (isManual) {
                     document.getElementById('update-toggle').classList.add('animate-pulse');
                 }
-                const res = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=' + Date.now());
-                if (!res.ok) throw new Error('Network response was not ok');
-                const text = await res.text();
-                const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
+                const res = await fetch('https://raw.githubusercontent.com/edge-plus/core"](\\d+\\.\\d+\\.\\d+)['"]/i);
                 const latestVersion = match ? match[1] : null;
                 if (isManual) {
                     document.getElementById('update-toggle').classList.remove('animate-pulse');
@@ -5284,15 +5141,7 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 let cachedIpsData = {};
 async function fetchIpsList() {
     try {
-        const response = await fetch('https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/ips.txt');
-        if (!response.ok) throw new Error('Fetch failed');
-        const text = await response.text();
-        const blocks = text.split('----------');
-        cachedIpsData = {};
-        blocks.forEach(block => {
-            const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-            if (lines.length === 0) return;
-            let opName = "Unknown";
+        const response = await fetch('https://raw.githubusercontent.com/edge-plus/core"Unknown";
             const ips = [];
             lines.forEach(line => {
                 if (line.includes('#')) {
@@ -5447,14 +5296,7 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
                         const btn = document.getElementById('vip-fetch-btn');
                         select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
                         try {
-                                const res = await fetch('https://api.github.com/repos/IR-NETLIFY/zeus/contents/proxy/proxy_vip');
-                                if (!res.ok) throw new Error('API Error');
-                                const data = await res.json();
-                                const validCountries = data
-                                        .filter(function(file) { return file.name.endsWith('.txt'); })
-                                        .map(function(file) { return file.name.replace('.txt', '').toUpperCase(); });
-                                if (validCountries.length === 0) throw new Error('Empty');
-                                select.innerHTML = '<option value="">یک کشور VIP انتخاب کنید...</option>';
+                                const res = await fetch('https://api.github.com/repos/edge-plus/core"">یک کشور VIP انتخاب کنید...</option>';
                                 validCountries.forEach(function(country) {
                                         const option = document.createElement('option');
                                         option.value = country;
@@ -5476,37 +5318,7 @@ function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', 
                         btn.disabled = true;
                         btn.innerText = '...';
                         try {
-                                const url = 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/proxy_vip/' + country + '.txt?t=' + Date.now();
-                                const res = await fetch(url);
-                                if (!res.ok) throw new Error('فایل یافت نشد');
-                                const text = await res.text();
-                                const lines = text.split('\\n').map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 5; });
-                                if (lines.length > 0) {
-                                        const randomProxy = lines[Math.floor(Math.random() * lines.length)];
-                                        document.getElementById('user-socks5-input').value = randomProxy;
-                                        const userProxyResult = document.getElementById('test-user-proxy-result');
-                                        if (userProxyResult) {
-                                            userProxyResult.innerText = '';
-                                        }
-                                        toggleProxySelectorModal(false);
-                                        showToast('✅ پـروکـسـی اختصاصی با موفقیت اعمال شد.');
-                    testUserSocksProxy();
-                                } else {
-                                        alert('فایل پـروکـسـی این کشور خالی است.');
-                                }
-                        } catch (e) {
-                                alert('خطا در دریافت پـروکـسـی اختصاصی.');
-                        } finally {
-                                btn.disabled = false;
-                                btn.innerText = 'دریافت';
-                        }
-                }
-                async function openProxySelectorModal() {
-                        toggleProxySelectorModal(true);
-                        const select = document.getElementById('proxy-country-select');
-                        const fetchBtn = document.getElementById('proxy-fetch-btn');
-                        const countriesList = [
-                  "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR",
+                                const url = 'https://raw.githubusercontent.com/edge-plus/core"AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR",
                   "AS", "AT", "AU", "AW", "AX", "AZ", "BA", "BB", "BD", "BE",
                   "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ",
                   "BR", "BS", "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD",
@@ -5556,214 +5368,7 @@ async function fetchAndLoadProxy() {
     fetchBtn.disabled = true;
     try {
                 const sources = [
-                        { url: 'https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/proxy/' + country.toUpperCase() + '.txt', prefix: '' }
-                ];
-        const responses = await Promise.allSettled(sources.map(src => 
-            fetch(src.url).then(async res => {
-                if (!res.ok) throw new Error();
-                const text = await res.text();
-                return { text: text, prefix: src.prefix };
-            })
-        ));
-        let combinedProxies = [];
-        for (const res of responses) {
-            if (res.status === 'fulfilled' && res.value && res.value.text) {
-                const rawLines = res.value.text.split('\\n');
-                for (let line of rawLines) {
-                    line = line.trim();
-                    if (line.length > 5) {
-                        if (res.value.prefix && !line.includes('://')) {
-                            combinedProxies.push(res.value.prefix + line);
-                        } else {
-                            combinedProxies.push(line);
-                        }
-                    }
-                }
-            }
-        }
-        let lines = [...new Set(combinedProxies.filter(l => l.match(/^(socks4|socks5|socks|http|https):\\/\\//i)))];
-        if (lines.length > 0) {
-            for (let i = lines.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [lines[i], lines[j]] = [lines[j], lines[i]];
-            }
-            let bestProxy = null;
-            let fallbackProxy = null;
-            const BATCH_SIZE = 5;
-            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
-                const batch = lines.slice(i, i + BATCH_SIZE);
-                loadingState.innerText = 'تعداد ' + lines.length + ' پـروکـسـی پیدا شد درحال اسکن\\nاسکن گروه ' + (Math.floor(i / BATCH_SIZE) + 1) + ' (۵ تست برای هر کدام)...';
-                const testResults = await Promise.allSettled(batch.map(async (candidate) => {
-                    let successCount = 0;
-                    let totalPing = 0;
-                    let failCount = 0;
-                    for(let t = 0; t < 5; t++) {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 3500);
-                        try {
-                            const testRes = await fetch('/api/test-proxy', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ proxy: candidate }),
-                                signal: controller.signal
-                            });
-                            clearTimeout(timeoutId);
-                            const testData = await testRes.json();
-                            if (testRes.ok && testData.success) {
-                                successCount++;
-                                totalPing += testData.ping;
-                            } else {
-                                failCount++;
-                            }
-                        } catch (err) {
-                            clearTimeout(timeoutId);
-                            failCount++;
-                        }
-                        if (failCount > 2) break;
-                    }
-                    if (successCount > 0) {
-                        return { proxy: candidate, successCount: successCount, avgPing: totalPing / successCount };
-                    }
-                    throw new Error();
-                }));
-                const successfulProxies = testResults
-                    .filter(r => r.status === 'fulfilled')
-                    .map(r => r.value)
-                    .sort((a, b) => {
-                        if (b.successCount !== a.successCount) {
-                            return b.successCount - a.successCount;
-                        }
-                        return a.avgPing - b.avgPing;
-                    });
-                if (successfulProxies.length > 0) {
-                    const topCandidate = successfulProxies[0];
-                    if (topCandidate.successCount >= 3) {
-                        bestProxy = topCandidate.proxy;
-                        break;
-                    } else if (!fallbackProxy || topCandidate.successCount > fallbackProxy.successCount) {
-                        fallbackProxy = topCandidate;
-                    }
-                }
-            }
-            if (!bestProxy && fallbackProxy) {
-                bestProxy = fallbackProxy.proxy;
-            }
-            if (bestProxy) {
-                document.getElementById('user-socks5-input').value = bestProxy;
-                document.getElementById('test-user-proxy-result').innerText = '';
-                toggleProxySelectorModal(false);
-                showToast('پـروکـسـی با بهترین امتیاز لود شد.');
-                testUserSocksProxy();
-            } else {
-                alert('هیچ پـروکـسـی سالمی (حتی با یک پینگ موفق) یافت نشد.');
-            }
-        } else {
-            alert('پـروکـسـی برای این کشور یافت نشد.');
-        }
-    } catch (e) {
-        alert('خطا در دریافت لیست پـروکـسـی‌ها از سرور.');
-    } finally {
-        loadingState.classList.add('hidden');
-        formState.classList.remove('hidden');
-        fetchBtn.disabled = false;
-    }
-}
-const WORKER_DONATE_URL = 'https://noisy-meadow-a466.ir-netlify.workers.dev/';
-                function toggleDonateModal(show) {
-                        setModalState('donate-modal', show);
-                        if (!show) {
-                                document.getElementById('donate-proxy-input').value = '';
-                                const resultSpan = document.getElementById('donate-result');
-                                if (resultSpan) {
-                                        resultSpan.innerText = '';
-                                        resultSpan.className = 'inline-block mt-1 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden';
-                                }
-                        }
-                }
-                async function testAndDonateProxy() {
-                        const proxyInput = document.getElementById('donate-proxy-input').value.trim();
-                        const btn = document.getElementById('donate-submit-btn');
-                        const resultSpan = document.getElementById('donate-result');
-                        if (!proxyInput) {
-                                resultSpan.innerText = 'لطفاً پـروکـسـی را وارد کنید!';
-                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1';
-                                return;
-                        }
-                        const strictProxyPattern = /^(?:(?:socks4|socks5|socks|http|https):\\/\\/)?([a-zA-Z0-9]{8}):([a-zA-Z0-9]{12})@([^:\\/]+):(\\d+)$/i;
-                        if (!strictProxyPattern.test(proxyInput)) {
-                                resultSpan.innerText = '❌ این پـروکـسـی اختصاصی نیست';
-                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-                                return;
-                        }
-                        btn.disabled = true;
-                        btn.innerText = 'صبر کنید...';
-                        resultSpan.innerText = 'در حال تست با اسکنر پـنـل...';
-                        resultSpan.className = 'text-[11px] font-bold text-emerald-500 w-full mt-1';
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 6000);
-                        try {
-                                const testRes = await fetch('/api/test-proxy', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ proxy: proxyInput }),
-                                        signal: controller.signal
-                                });
-                                clearTimeout(timeoutId);
-                                const testData = await testRes.json();
-                                if (!testRes.ok || !testData.success) {
-                                        throw new Error(testData.error || 'پـروکـسـی مسدود یا خاموش است');
-                                }
-                                const countryCode = testData.country || 'UN';
-                                resultSpan.innerText = 'پـروکـسـی سالم است! در حال ارسال (' + countryCode + ')...';
-                                const donateResponse = await fetch(WORKER_DONATE_URL, {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                                proxy: proxyInput,
-                                                country: countryCode
-                                        })
-                                });
-                                const donateData = await donateResponse.json();
-                                if (donateData.success) {
-                                        resultSpan.innerText = '✅ ' + donateData.message;
-                                        resultSpan.className = 'text-[11px] font-bold text-green-600 w-full mt-1';
-                                        document.getElementById('donate-proxy-input').value = '';
-                                } else {
-                                        resultSpan.innerText = '❌ خطا: ' + donateData.error;
-                                        resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-                                }
-                        } catch (error) {
-                                clearTimeout(timeoutId);
-                                let errorMsg = error.message;
-                                if (error.name === 'AbortError') errorMsg = 'تایم‌اوت در تست پـروکـسـی';
-                                resultSpan.innerText = '❌ خطا: ' + errorMsg;
-                                resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-                        } finally {
-                                btn.disabled = false;
-                                btn.innerText = 'تست و اهدا';
-                        }
-                }
-                function toggleSupportModal(show) {
-            const modal = document.getElementById('support-modal');
-            const content = modal.firstElementChild;
-            if (show) {
-                modal.classList.remove('opacity-0', 'pointer-events-none');
-                content.classList.remove('opacity-0', 'scale-95');
-            } else {
-                modal.classList.add('opacity-0', 'pointer-events-none');
-                content.classList.add('opacity-0', 'scale-95');
-            }
-        }
-window.addEventListener('click', (e) => {
-    if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
-    if (e.target.id === 'proxy-selector-modal') toggleProxySelectorModal(false);
-        if (e.target.id === 'donate-modal') toggleDonateModal(false);
-});
-    </script>
-</body>
-</html>`,
-        status: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
+                        { url: 'https://raw.githubusercontent.com/edge-plus/core"fa" dir="rtl" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -5900,7 +5505,7 @@ window.addEventListener('click', (e) => {
 </div>
 <div class="flex flex-col gap-4 mt-6 z-10">
     <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-        <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
+        <a href="https://github.com/edge-plus/core" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
             <svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
                 <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
             </svg>
