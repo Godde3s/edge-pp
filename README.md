@@ -1,218 +1,143 @@
-# ⚡ edge++
+# edge++
 
-**edgetunnel پیشرفته با مدیریت کاربران فارسی**
-
-> هسته پروکسی [edgetunnel](https://github.com/cmliu/edgetunnel) (VLESS / Trojan / Shadowsocks) + پنل مدیریت کاربران الهام‌گرفته از [Zeus Panel](https://github.com/IR-NETLIFY/zeus) — همه در یک Cloudflare Worker.
+**پروکسی لبه‌ای پیشرفته با مدیریت کاربران + IP و لوکیشن ثابت**
 
 ![Platform](https://img.shields.io/badge/Platform-Cloudflare_Workers-orange?style=flat-square&logo=cloudflare)
 ![License](https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square)
-![Users](https://img.shields.io/badge/Management-D1_Database-blue?style=flat-square)
+
+> 💡 **قابلیت IP و لوکیشن ثابت** این پروژه با الهام از پروژه **[Zeus Panel](https://github.com/IR-NETLIFY/zeus)** (ساخته شده توسط [PANEL_ZEUS](https://t.me/PANEL_ZEUS)) پیاده‌سازی شده است. از سرورهای اهدایی و لیست آی‌پی‌های تمیز آن‌ها استفاده می‌کند. با تشکر از تیم Zeus بابت این قابلیت عالی. 🙏
 
 ---
 
 ## ✨ ویژگی‌ها
 
-### 🛡️ هسته پروکسی (edgetunnel)
-- **VLESS** + **Trojan** + **Shadowsocks** — سه پروتکل اصلی
+### 🌐 IP و لوکیشن ثابت (با الهام از Zeus Panel)
+- **پراکسی SOCKS5/HTTP اختصاصی هر کاربر** — ترافیک هر کاربر از طریق پراکسی اختصاصی هدایت می‌شود
+- **چرخش خودکار IP** — آی‌پی‌های تمیز از لیست اپراتورهای ایرانی (ایرانسل، همراه اول و...) هر چند دقیقه رفرش می‌شوند
+- **تعویض خودکار پراکسی خراب** — اگر پراکسی کاربر قطع شود، خودکار از لیست VIP جایگزین می‌شود
+- **فیلتر اپراتور** — امکان انتخاب IP فقط از یک اپراتور خاص
+- **تست پراکسی** — API برای تست سرعت و لوکیشن پراکسی قبل از اختصاص
+- **لیست آی‌پی تمیز** — از مخزن Zeus استفاده شده: آی‌پی‌های تمیز بر اساس اپراتور اینترنت
+
+### 🛡️ پروکسی
+- **VLESS** / **Trojan** / **Shadowsocks** — سه پروتکل اصلی
 - WebSocket / gRPC / XHTTP
 - ProxyIP سفارشی + SOCKS5 chain
-- سیستم اشتراک داخلی (Clash, Sing-box, Surge, Loon و...)
-- TLS Fragmentation و ECH
-- Optimized IP selection (优选IP)
+- سیستم اشتراک (Clash, Sing-box, Surge, Loon و V2Ray/NekoBox)
+- **TLS Fragmentation** و ECH
+- **Fingerprint شبیه‌ساز** — Chrome, Firefox, Safari و...
 
-### 👥 مدیریت کاربران (edge++)
+### 👥 مدیریت کاربران
 - ایجاد/ویرایش/حذف کاربر با UUID اختصاصی
-- **محدودیت حجم** (GB) — با ریست خودکار
-- **محدودیت درخواست** — با ریست خودکار
-- **مدت اعتبار** (روز) — انقضای خودکار
-- **محدودیت IP همزمان**
-- فعال/غیرفعال کردن آنی
-- ریست مصرف با یک کلیک
+- محدودیت حجم (GB) با ریست خودکار
+- محدودیت درخواست با ریست خودکار
+- مدت اعتبار (روز) با انقضای خودکار
+- محدودیت IP همزمان
+- فعال/غیرفعال آنی
+- **تنظیم پراکسی اختصاصی SOCKS5 برای هر کاربر**
+- **چرخش خودکار IP با فیلتر اپراتور**
 
-### 📊 داشبورد کاربر
-- صفحه وضعیت اختصاصی هر کاربر (`/status/username`)
-- نمایش لحظه‌ای: حجم مصرفی، درخواست‌ها، روزهای مانده
-- لینک اشتراک + کانفیگ‌ها در یک صفحه
-- کپی فوری کانفیگ‌ها
+### 📊 داشبورد
+- صفحه وضعیت اختصاصی هر کاربر
+- آمار لحظه‌ای: حجم، درخواست، روزهای مانده
+- لینک اشتراک + کانفیگ در یک صفحه
+- **اشتراک متنی (Base64) برای V2Ray/NekoBox با پشتیبانی از Fragment و multi-IP**
 
-### 🎨 پنل مدیریت
-- رابط کاربری **فارسی** با طراحی منحصر‌به‌فرد
-- آمار کلی: کل کاربران، فعال‌ها، مصرف، درخواست‌ها
+### 🎨 پنل
+- رابط کاربری فارسی با طراحی منحصر‌به‌فرد
+- آمار کلی داشبورد
 - جستجوی کاربران
-- لینک مستقیم اشتراک هر کاربر
-- تغییر رمز عبور پنل
+- تغییر رمز عبور
 
-### 🚀 دیپلویر خودکار
-- دیپلوی یک‌کلیکی روی Cloudflare Workers
-- ساخت خودکار D1 Database + KV Namespace
+### 🚀 دیپلویر
+- دیپلوی یک‌کلیکی
+- ساخت خودکار D1 + KV
 - مدیریت چند پنل: لیست + آپدیت
-- صفحه وب زیبا برای دیپلوی
 
 ---
 
 ## 📐 معماری
 
 ```
-┌──────────────────────────────────────────────┐
-│           edge++ Worker (Cloudflare)          │
-│                                              │
-│  ┌────────────────────────────────────────┐  │
-│  │  هسته edgetunnel                        │  │
-│  │  VLESS / Trojan / SS Proxy Engine      │  │
-│  │  Subscription System (Clash/SB/...)     │  │
-│  │  Admin Panel (/admin)                   │  │
-│  └────────────────────────────────────────┘  │
-│                      ↕ KV                     │
-│  ┌────────────────────────────────────────┐  │
-│  │  لایه مدیریت کاربران edge++             │  │
-│  │  User CRUD API (/api/edgepp/*)          │  │
-│  │  Panel (/panel)                         │  │
-│  │  Per-User Sub (/sub/:user)              │  │
-│  │  Status Page (/status/:user)            │  │
-│  └────────────────────────────────────────┘  │
-│                      ↕ D1                     │
-└──────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────┐
-│  Deployer Worker (دیپلویر خودکار)             │
-│  - ساخت D1 + KV + Worker                     │
-│  - لیست + آپدیت پنل‌ها                        │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│       edge++ Worker (CF Workers)     │
+│                                      │
+│  ┌──────────────────────────────┐   │
+│  │  Proxy Engine               │   │
+│  │  VLESS / Trojan / SS         │   │
+│  │  Subscription System         │   │
+│  └──────────┬───────────────────┘   │
+│             ↕ KV                     │
+│  ┌──────────────────────────────┐   │
+│  │  User Management            │   │
+│  │  CRUD / Limits / Dashboard   │   │
+│  └──────────────────────────────┘   │
+│             ↕ D1                     │
+└──────────────────────────────────────┘
 ```
 
 ---
 
 ## 🚀 دیپلوی سریع
 
-### روش ۱: دیپلویر خودکار (توصیه‌شده)
+### با دیپلویر خودکار
 
-۱. دیپلویر رو روی Cloudflare Workers مستقر کنید:
-   - در داشبورد CF Workers → Create Worker
-   - کد فایل `deployer.js` رو کپی کنید
-   - نام ورکر: `edge-pp-deployer` (یا هر نام دلخواه)
-   - Deploy کنید
+۱. `deployer.js` رو روی CF Workers مستقر کنید
+۲. توکن API کلودفلر وارد کنید
+۳. دکمه دیپلوی بزنید
 
-۲. صفحه ورکر رو باز کنید و:
-   - **توکن API کلودفلر** رو وارد کنید
-   - رمز ادمین edgetunnel رو (اختیاری) وارد کنید
-   - دکمه **«دیپلوی edge++»** رو بزنید
-
-۳. بعد از چند ثانیه لینک‌های پنل مدیریت نمایش داده میشه:
-   - `/panel` → پنل مدیریت کاربران
-   - `/admin` → پنل تنظیمات edgetunnel
-
----
-
-### روش ۲: دستی با Wrangler CLI
+### دستی
 
 ```bash
-# 1. کلون کنید
-git clone https://github.com/godde3s/edge-pp.git
+git clone https://github.com/Godde3s/edge-pp.git
 cd edge-pp
-
-# 2. لاگین به کلودفلر
 npx wrangler login
-
-# 3. ساخت دیتابیس D1
 npx wrangler d1 create edge-pp-db
-# شناسه دیتابیس رو در wrangler.toml وارد کنید
-
-# 4. ساخت KV (اختیاری برای edgetunnel)
 npx wrangler kv:namespace create KV
-# شناسه KV رو در wrangler.toml وارد کنید
-
-# 5. دیپلوی
+# شناسه‌ها رو در wrangler.toml وارد کنید
 npx wrangler deploy
 ```
 
 ---
 
-## 🔑 دسترسی‌های لازم توکن دیپلویر
+## 🔑 دسترسی‌های توکن دیپلویر
 
-برای ساخت توکن API کلودفلر ([لینک مستقیم](https://dash.cloudflare.com/profile/api-tokens)):
-
-| دسترسی (Permission) | نوع (Type) |
+| دسترسی | نوع |
 |---|---|
 | Account Settings | Read |
 | Workers Scripts | Edit |
 | Workers KV Storage | Edit |
 | D1 | Edit |
 
-**مراحل ساخت توکن:**
-1. به [API Tokens](https://dash.cloudflare.com/profile/api-tokens) بروید
-2. **Create Token** → **Custom token** را بزنید
-3. در بخش **Permissions** موارد بالا را اضافه کنید
-4. در بخش **Account Resources** → **Include** → **All accounts**
-5. **Continue to summary** → **Create Token**
-6. توکن را کپی کنید
+ساخت توکن: [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
+→ Create Token → Custom Token → افزودن دسترسی‌ها → All Accounts
 
 ---
 
-## 📍 مسیرها (Routes)
+## 📍 مسیرها
 
 | مسیر | توضیح |
 |---|---|
-| `/panel` | پنل مدیریت کاربران edge++ |
-| `/panel/login` | ورود به پنل |
-| `/admin` | پنل تنظیمات edgetunnel |
-| `/login` | ورود به پنل edgetunnel |
-| `/sub` | اشتراک عمومی edgetunnel |
-| `/sub/:username` | اشتراک اختصاصی کاربر |
-| `/status/:username` | صفحه وضعیت کاربر |
+| `/panel` | پنل مدیریت کاربران |
+| `/admin` | پنل تنظیمات پروکسی |
+| `/sub/:username` | اشتراک + وضعیت کاربر (HTML برای مرورگر، Base64 برای V2Ray/NekoBox) |
 | `/api/edgepp/*` | API مدیریت کاربران |
-| `/version` | نسخه edgetunnel |
-| *(سایر مسیرها)* | هدایت به هسته پروکسی |
+| `/api/edgepp/settings` | GET/POST تنظیمات پنل |
+| `/api/edgepp/test-proxy` | تست پراکسی (POST: `{proxy: "socks5://..."}`) |
+| `/api/edgepp/proxy-ips` | لیست آی‌پی‌های تمیز Zeus (بر اساس اپراتور) |
 
 ---
 
-## 🔧 متغیرهای محیطی
+## 🔧 متغیرها
 
-| متغیر | توضیح | الزامی؟ |
+| متغیر | توضیح | الزامی |
 |---|---|---|
-| `ADMIN` | رمز عبور پنل edgetunnel | ✅ |
-| `KV` | KV Namespace (تنظیمات edgetunnel) | ✅ |
-| `DB` | D1 Database (مدیریت کاربران) | ✅ |
-
-### متغیرهای اختیاری edgetunnel
-
-| متغیر | پیش‌فرض | توضیح |
-|---|---|---|
-| `UUID` | خودکار از ADMIN | UUID پروکسی |
-| `HOST` | دامنه ورکر | دامنه‌های مجاز |
-| `PROXYIP` | خودکار | ProxyIP |
-| `GO2SOCKS5` | - | SOCKS5 chain |
-| `BEST_SUB` | false | حالت اشتراک‌ساز |
-| `DEBUG` | false | لاگ دیباگ |
-| `KEY` | خودکار | کلید رمزنگاری |
-
-> توضیحات کامل متغیرها در [ریپازیتوری edgetunnel](https://github.com/cmliu/edgetunnel) موجود است.
-
----
-
-## 🛠️ Build از سورس
-
-```bash
-# نصب وابستگی‌ها
-npm install
-
-# ساخت _worker.js نهایی
-node scripts/build.js
-
-# خروجی: _worker.js (ترکیب edgetunnel + مدیریت کاربران)
-```
+| `ADMIN` | رمز عبور | ✅ |
+| `KV` | KV Namespace | ✅ |
+| `DB` | D1 Database | ✅ |
 
 ---
 
 ## 📄 لایسنس
 
-- **هسته پروکسی:** [edgetunnel](https://github.com/cmliu/edgetunnel) — GPL-3.0
-- **الهام مدیریت کاربران:** [Zeus Panel](https://github.com/IR-NETLIFY/zeus)
-- **پنل و لایه مدیریت:** edge++
-
----
-
-## 🙏 تشکر
-
-- [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel) — هسته پروکسی قدرتمند
-- [IR-NETLIFY/zeus](https://github.com/IR-NETLIFY/zeus) — ایده مدیریت کاربران
-- [Cloudflare](https://cloudflare.com) — پلتفرم Workers + D1
+GPL-3.0

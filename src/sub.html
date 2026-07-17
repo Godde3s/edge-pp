@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>edge+usf — Subscription</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--ok:#06b6d4;--ok2:#22d3ee;--warn:#f59e0b;--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--tx3:#71717a;--r:12px;--rs:8px}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 25% 15%,rgba(124,58,237,.07),transparent 50%);pointer-events:none}
+.w{position:relative;z-index:1;max-width:560px;margin:0 auto;padding:20px 14px}
+.hd{text-align:center;margin-bottom:20px;padding:24px 18px;background:var(--s);border:1px solid var(--bd);border-radius:var(--r)}
+.hd .icon{display:inline-flex;width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,var(--ac),#a78bfa);align-items:center;justify-content:center;font-size:18px;color:#fff;font-weight:800;box-shadow:0 4px 20px var(--glow)}
+.hd h1{font-size:18px;font-weight:800;margin-top:10px;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hd .un{font-size:13px;color:var(--tx2);margin-top:3px}
+.sb{display:inline-flex;align-items:center;gap:5px;padding:5px 14px;border-radius:16px;font-size:11px;font-weight:600;margin-top:10px}
+.sb.ac{background:rgba(6,182,212,.1);color:var(--ok2);border:1px solid rgba(6,182,212,.15)}
+.sb.in{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
+.sb .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.cd{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px}
+.cd .l{font-size:10px;color:var(--tx3);font-weight:600;margin-bottom:4px;text-transform:uppercase;letter-spacing:.3px}
+.cd .v{font-size:17px;font-weight:800}
+.cd .v.c{color:var(--ok2)}.cd .v.p{color:var(--ac2)}.cd .v.y{color:var(--warn)}
+.pb{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px;margin-bottom:14px}
+.pb .t{font-size:10px;color:var(--tx3);margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
+.bar{height:6px;background:var(--s2);border-radius:3px;overflow:hidden;margin-bottom:5px}
+.bar .fill{height:100%;border-radius:3px;transition:width .4s}
+.bar .fill.g{background:linear-gradient(90deg,var(--ok),#67e8f9)}
+.bar .fill.y{background:linear-gradient(90deg,var(--warn),#fde68a)}
+.bar .fill.r{background:linear-gradient(90deg,var(--err),#fca5a5)}
+.pi{display:flex;justify-content:space-between;font-size:10px;color:var(--tx3)}
+.ss{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:14px 12px}
+.ss .st{font-size:10px;color:var(--tx3);margin-bottom:10px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;display:flex;align-items:center;justify-content:space-between}
+.ss .st button{padding:3px 10px;border-radius:5px;border:1px solid var(--bd);background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s}
+.ss .st button:hover{border-color:var(--ac);color:var(--tx)}
+.ci{background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);padding:8px 10px;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.ci .pr{font-size:10px;font-weight:700;padding:2px 7px;border-radius:3px;min-width:50px;text-align:center;flex-shrink:0}
+.pr.vless{background:rgba(124,58,237,.15);color:var(--ac2)}
+.pr.trojan{background:rgba(6,182,212,.15);color:var(--ok2)}
+.pr.ss{background:rgba(245,158,11,.15);color:var(--warn)}
+.ci .lk{flex:1;font-size:10px;color:var(--tx2);font-family:'SF Mono',Monaco,monospace;direction:ltr;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cb{padding:3px 8px;border-radius:5px;border:1px solid var(--bd);background:transparent;color:var(--tx2);font-size:10px;cursor:pointer;font-family:inherit;transition:all .15s;flex-shrink:0}
+.cb:hover{border-color:var(--ac);color:var(--ac2)}
+.raw{margin-top:8px;padding:8px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);font-size:10px;color:var(--tx3);word-break:break-all;direction:ltr}
+.raw code{color:var(--ac2)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--s2);border:1px solid var(--ac);color:var(--ac2);padding:8px 16px;border-radius:var(--rs);font-size:12px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
+.toast.show{opacity:1}
+@media(max-width:480px){.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="w">
+<div class="hd">
+  <div class="icon">E+</div>
+  <h1>edge+usf</h1>
+  <div class="un" id="u_n">-</div>
+  <div class="sb ac" id="u_s"><span class="dot"></span><span id="u_st">Active</span></div>
+</div>
+<div class="cards">
+  <div class="cd"><div class="l">Data Used</div><div class="v c" id="c_v">-</div></div>
+  <div class="cd"><div class="l">Requests</div><div class="v p" id="c_r">-</div></div>
+  <div class="cd"><div class="l">Days Left</div><div class="v y" id="c_e">-</div></div>
+  <div class="cd"><div class="l">Active IPs</div><div class="v c" id="c_o">-</div></div>
+</div>
+<div class="pb" id="vp">
+  <div class="t">Data Usage</div>
+  <div class="bar"><div class="fill g" id="vf" style="width:0%"></div></div>
+  <div class="pi"><span id="vu">0 GB</span><span id="vt">Unlimited</span></div>
+</div>
+<div class="ss">
+  <div class="st"><span>Connection Configs</span><button id="cp-sub-btn">Copy Sub Link</button></div>
+  <div id="cf"></div>
+  <div class="raw">Subscription URL: <code id="sl"></code></div>
+</div>
+</div>
+<div class="toast" id="tt">Copied!</div>
+<script>
+/*__DATA__*/
+(function(){
+  var d=window.__d;
+  if(!d)return;
+  document.getElementById('u_n').textContent='@'+d.username;
+  var sb=document.getElementById('u_s'),st=document.getElementById('u_st');
+  if(d.status&&d.status.allowed){sb.className='sb ac';st.textContent=d.is_active?'Active':'Disabled'}
+  else{sb.className='sb in';st.textContent=d.status?d.status.reason:'Disabled'}
+  document.getElementById('c_v').textContent=(d.used_gb||0).toFixed(2)+' GB';
+  document.getElementById('c_r').textContent=d.limit_req?(d.used_req||0)+' / '+d.limit_req:String(d.used_req||0);
+  document.getElementById('c_e').textContent=d.days_left!=null?d.days_left+' days':(d.expiry_days?d.expiry_days+' days':'Unlimited');
+  document.getElementById('c_o').textContent=d.online_count||0;
+  var vp=document.getElementById('vp');
+  if(d.limit_gb){
+    var pct=Math.min(100,((d.used_gb||0)/d.limit_gb)*100),fl=document.getElementById('vf');
+    fl.style.width=pct+'%';fl.className='fill '+(pct>85?'r':pct>60?'y':'g');
+    document.getElementById('vu').textContent=(d.used_gb||0).toFixed(2)+' GB';
+    document.getElementById('vt').textContent=d.limit_gb+' GB';
+  }else{vp.style.display='none'}
+  var cf=document.getElementById('cf');
+  for(var i=0;i<d.configs.length;i++){
+    var c=d.configs[i];
+    var div=document.createElement('div');div.className='ci';
+    var sp=document.createElement('span');sp.className='pr '+c.cls;sp.textContent=c.proto;
+    var lk=document.createElement('span');lk.className='lk';lk.textContent=c.link;lk.title=c.link;
+    var btn=document.createElement('button');btn.className='cb';btn.textContent='Copy';
+    (function(link){btn.addEventListener('click',function(){cpTxt(link)})})(c.link);
+    div.appendChild(sp);div.appendChild(lk);div.appendChild(btn);cf.appendChild(div);
+  }
+  document.getElementById('sl').textContent=d.sub_url;
+  document.getElementById('cp-sub-btn').addEventListener('click',function(){cpTxt(d.sub_url)});
+  function cpTxt(t){
+    if(navigator.clipboard){navigator.clipboard.writeText(t).then(showT).catch(function(){fallback(t)})}
+    else{fallback(t)}
+  }
+  function fallback(t){var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;opacity:0';document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();showT()}
+  function showT(){var t=document.getElementById('tt');t.classList.add('show');setTimeout(function(){t.classList.remove('show')},1200)}
+})();
+</script>
+</body>
+</html>

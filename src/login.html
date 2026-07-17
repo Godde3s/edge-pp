@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>edge+usf — Login</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#09090b;--s:#111114;--s2:#1a1a1f;--bd:#2a2a32;--ac:#7c3aed;--ac2:#a78bfa;--glow:rgba(124,58,237,.2);--err:#ef4444;--tx:#f4f4f5;--tx2:#a1a1aa;--r:14px;--rs:8px}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);min-height:100vh;display:flex;align-items:center;justify-content:center;color:var(--tx)}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 30% 20%,rgba(124,58,237,.08),transparent 55%);pointer-events:none}
+.w{position:relative;z-index:1;width:380px;max-width:90vw;padding:20px}
+.logo{text-align:center;margin-bottom:28px}
+.logo .icon{width:56px;height:56px;margin:0 auto 12px;border-radius:16px;background:linear-gradient(135deg,var(--ac),#a78bfa);display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff;font-weight:800;box-shadow:0 4px 24px var(--glow)}
+.logo h1{font-size:22px;font-weight:800;background:linear-gradient(135deg,#fff,var(--ac2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo p{color:var(--tx2);font-size:13px;margin-top:4px}
+.card{background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:28px 24px}
+.fld{margin-bottom:16px}
+.fld label{display:block;font-size:11px;color:var(--tx2);margin-bottom:5px;font-weight:600}
+.fld input{width:100%;padding:11px 14px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--s2);color:var(--tx);font-size:14px;outline:none;font-family:inherit;transition:all .15s}
+.fld input:focus{border-color:var(--ac);box-shadow:0 0 0 3px var(--glow)}
+.btn{width:100%;padding:12px;border:none;border-radius:var(--rs);background:linear-gradient(135deg,var(--ac),#a78bfa);color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s;margin-top:4px}
+.btn:hover{box-shadow:0 4px 20px var(--glow);transform:translateY(-1px)}
+.msg{margin-top:12px;padding:10px;border-radius:var(--rs);font-size:12px;display:none;text-align:center;background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.15)}
+</style>
+</head>
+<body>
+<div class="w">
+  <div class="logo">
+    <div class="icon">E+</div>
+    <h1>edge+usf</h1>
+    <p>Admin panel login</p>
+  </div>
+  <div class="card">
+    <form id="login-form">
+      <div class="fld"><label>Password</label><input type="password" id="inp-pwd" placeholder="Enter password" required></div>
+      <button class="btn" type="submit" id="btn-submit">Sign In</button>
+    </form>
+    <div class="msg" id="msg-box"></div>
+  </div>
+</div>
+<script>
+(function(){
+  var btn=document.getElementById('btn-submit');
+  var msg=document.getElementById('msg-box');
+  document.getElementById('login-form').onsubmit=function(e){
+    e.preventDefault();
+    btn.disabled=true;btn.textContent='Please wait...';
+    fetch('/panel/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password:document.getElementById('inp-pwd').value})
+    }).then(function(r){
+      if(r.ok){location.href='/panel';return null}
+      return r.json();
+    }).then(function(d){
+      if(d&&d.error){
+        msg.textContent=d.error;msg.style.display='block';
+        btn.disabled=false;btn.textContent='Sign In';
+      }
+    }).catch(function(){
+      msg.textContent='Connection error';msg.style.display='block';
+      btn.disabled=false;btn.textContent='Sign In';
+    });
+  };
+})();
+</script>
+</body>
+</html>
